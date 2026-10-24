@@ -6,7 +6,9 @@ sing-box 一键管理脚本 · **虫虫版** · 当前 **v1.0**（三脚本版�
 
 
 ## 一键安装
-
+```前置
+apk update && apk add curl wget net-tools procps bash
+```
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/install.sh)
 ```
