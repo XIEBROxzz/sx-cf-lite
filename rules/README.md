@@ -6,3 +6,6 @@
 ```规则集 URL：
 https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing.json
 ```
+```规则集 URL：
+https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing-v2.json
+```
