@@ -2465,6 +2465,136 @@ _view_relays() {
     read -p "  按回车键继续..."
 }
 
+# --- 4b. 分流规则管理 (SX新增: 免删重建, 全局/AI/自定义 一键切换) ---
+_relay_route_manage() {
+    echo -e "\n  ${CYAN}【分流规则管理】${NC}"
+
+    local CONFIG_FILE="$RELAY_CONFIG_FILE"
+    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
+    if [ ! -f "$CONFIG_FILE" ]; then _error "配置文件不存在。"; return; fi
+
+    local rules=$(jq -c '.route.rules[] | select(.inbound != null and .outbound != null and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE" 2>/dev/null)
+    if [ -z "$rules" ]; then
+        echo -e "    ${YELLOW}暂无活跃中转链路，请先创建中转${NC}"
+        read -p "  按回车键继续..."
+        return
+    fi
+
+    # SX: 聚合所有链路规则引用的规则集 tag, 反推当前分流模式
+    local link_num cur_rs cur_mode
+    link_num=$(echo "$rules" | grep -c .)
+    cur_rs=$(jq -r '[.route.rules[]? | select(((.outbound? // "") | startswith("relay-out-"))) | (.rule_set // [])[]] | unique | join(" ")' "$CONFIG_FILE" 2>/dev/null)
+    if [ -z "$cur_rs" ]; then
+        cur_mode="全局落地 (所有流量走落地, 未启用分流)"
+    elif [ "$cur_rs" == "geosite-openai geosite-google-gemini geosite-anthropic" ]; then
+        cur_mode="解锁 AI (geosite 三件套: OpenAI/Gemini/Claude)"
+    else
+        cur_mode="自定义规则集分流 (${cur_rs})"
+    fi
+
+    echo ""
+    echo -e "  当前分流模式: ${GREEN}${cur_mode}${NC}"
+    echo -e "  链路数量: ${CYAN}${link_num}${NC} 条 (本次切换应用于全部链路)"
+    echo ""
+    echo -e "    ${GREEN}[1]${NC} 全局落地 (所有流量走落地)"
+    echo -e "    ${GREEN}[2]${NC} 解锁 AI (OpenAI/Gemini/Claude, geosite 上游自动维护)"
+    echo -e "    ${GREEN}[3]${NC} 自定义规则集 (.srs/.json URL 分流)"
+    echo -e "    ${YELLOW}[0]${NC} 返回"
+    echo ""
+    read -p "  请选择分流模式 [0-3]: " mode_choice
+    case "$mode_choice" in
+        1|2|3) : ;;
+        0|"") return ;;
+        *) _error "无效选择"; sleep 1; return ;;
+    esac
+
+    local relay_mode="all" rs_arr="" tags_csv="" rs_filter=""
+    case "$mode_choice" in
+        2)
+            relay_mode="ai-split"
+            # SX: geosite 远程规则集, 与创建流程 (ai-split) 保持同一组 URL/格式
+            rs_arr='{type:"remote",tag:"geosite-openai",format:"binary",url:"https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs",download_detour:"direct"},{type:"remote",tag:"geosite-google-gemini",format:"binary",url:"https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google-gemini.srs",download_detour:"direct"},{type:"remote",tag:"geosite-anthropic",format:"binary",url:"https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-anthropic.srs",download_detour:"direct"}'
+            tags_csv="\"geosite-openai\",\"geosite-google-gemini\",\"geosite-anthropic\""
+            ;;
+        3)
+            relay_mode="custom-split"
+            local _default_rs="https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing.json"
+            echo -e "  ${CYAN}回车 = 默认落地规则 (仓库 rules/landing.json, GitHub 网页可随时改)${NC}"
+            local custom_rs_urls
+            read -p "  规则集 .srs/.json 直链 URL (多个用空格分隔): " custom_rs_urls
+            custom_rs_urls=$(printf '%s' "$custom_rs_urls" | xargs)
+            # SX: 空输入 → 仓库内置默认落地规则
+            [ -z "$custom_rs_urls" ] && custom_rs_urls="$_default_rs"
+            local _u _t _fmt _first=true
+            for _u in $custom_rs_urls; do
+                if ! [[ "$_u" =~ ^https?://.+\.(srs|json)$ ]]; then
+                    _warn "忽略无效条目: $_u (须为 http(s) 开头、.srs/.json 结尾)"
+                    continue
+                fi
+                _t=$(basename "$_u" | sed -E 's/\.(srs|json)$//')
+                [ -z "$_t" ] && continue
+                _fmt="binary"; [[ "$_u" == *.json ]] && _fmt="source"
+                [ "$_first" = true ] && _first=false || rs_arr="${rs_arr},"
+                rs_arr="${rs_arr}{type:\"remote\",tag:\"${_t}\",format:\"${_fmt}\",url:\"${_u}\",download_detour:\"direct\"}"
+                tags_csv="${tags_csv:+$tags_csv,}\"${_t}\""
+            done
+            if [ -z "$rs_arr" ]; then
+                _error "无有效 URL (须为 http(s):// 开头、.srs/.json 结尾)。"
+                sleep 2
+                return 1
+            fi
+            ;;
+    esac
+
+    # SX: 构造路由规则修改 filter
+    # mode=all  → 删规则上的 .rule_set 键 (空数组规则 sing-box 校验会拒绝) + 清空规则集定义
+    # mode=2/3  → 写入规则集 tag + 全量替换 relay.json 内的 rule_set 定义 (幂等)
+    if [ "$mode_choice" == "1" ]; then
+        rs_filter="(.route.rules |= map(if (((.outbound? // \"\") | startswith(\"relay-out-\"))) then del(.rule_set) else . end)) | (.route.rule_set = [])"
+    else
+        rs_filter="(.route.rules |= map(if (((.outbound? // \"\") | startswith(\"relay-out-\"))) then .rule_set = [${tags_csv}] else . end)) | (.route.rule_set = [${rs_arr}])"
+    fi
+    # SX: 同步链路元数据的 relay_mode, 保证 [4] 查看链路显示一致
+    local links_filter="map_values(if (type == \"object\") then .relay_mode = \"${relay_mode}\" else . end)"
+
+    local txn_dir failed="false"
+    _state_lock_acquire || return 1
+    txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
+    if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
+        || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE"; then
+        _txn_cleanup "$txn_dir"
+        _state_lock_release
+        _error "无法创建配置快照，已取消切换"
+        sleep 2   # SX: 报错停留, 免被菜单 clear 瞬间擦掉
+        return 1
+    fi
+
+    _info "正在切换分流模式..."
+    _atomic_modify_json "$CONFIG_FILE" "$rs_filter" || failed="true"
+    if [ "$failed" != "true" ] && [ -f "$LINKS_FILE" ]; then
+        _atomic_modify_json "$LINKS_FILE" "$links_filter" || failed="true"
+    fi
+
+    if [ "$failed" = "true" ] || ! _restart_checked; then
+        _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
+        _txn_restore_file "$txn_dir" links "$LINKS_FILE"
+        _manage_service restart >/dev/null 2>&1 || true
+        _txn_cleanup "$txn_dir"
+        _state_lock_release
+        _error "切换失败，已恢复原配置"
+        sleep 2   # SX: 报错停留, 免被菜单 clear 瞬间擦掉
+        return 1
+    fi
+
+    _txn_cleanup "$txn_dir"
+    _state_lock_release
+    local _mode_disp="全局落地"
+    [ "$relay_mode" == "ai-split" ] && _mode_disp="AI域名分流"
+    [ "$relay_mode" == "custom-split" ] && _mode_disp="自定义规则集分流"
+    _success "分流模式已切换为 ${_mode_disp} (共 ${link_num} 条链路, 即时生效)"
+    _warn "若刚改过同文件名的远程名单文件, 远程规则内容可能受 24h 缓存影响"
+}
+
 # --- 4. 删除中转路由 ---
 _clear_all_relays() {
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
@@ -4688,6 +4818,7 @@ _menu() {
         echo -e "    ${GREEN}[5]${NC} 删除指定中转路由"
         echo -e "    ${GREEN}[6]${NC} 修改中转监听端口"
         echo -e "    ${RED}[7]${NC} 清空所有中转配置"
+        echo -e "    ${GREEN}[R]${NC} 分流规则管理 (全局/AI/自定义, 免重建)"
         echo ""
         echo -e "  ${CYAN}【端口转发】${NC}"
         echo -e "    ${GREEN}[8]${NC} 端口转发管理"
@@ -4698,7 +4829,7 @@ _menu() {
         echo -e "    ${GREEN}[9]${NC} WARP 出站管理 (Cloudflare 免费出口)"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-9]: " choice
+        read -p "  请输入选项 [0-9 或 R]: " choice
         case $choice in
             1) _landing_config ;;
             2) _relay_config ;;
@@ -4713,6 +4844,7 @@ _menu() {
             0) break ;;
             8) _port_forward_menu ;;
              9) _warp_menu ;;
+            R|r) _relay_route_manage ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
     done
