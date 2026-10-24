@@ -2547,12 +2547,15 @@ _relay_route_manage() {
     esac
 
     # SX: 构造路由规则修改 filter
-    # mode=all  → 删规则上的 .rule_set 键 (空数组规则 sing-box 校验会拒绝) + 清空规则集定义
-    # mode=2/3  → 写入规则集 tag + 全量替换 relay.json 内的 rule_set 定义 (幂等)
+    # mode=all  → 删规则上的 .rule_set 键 (空数组规则 sing-box 校验会拒绝) + 清掉不再被引用的定义
+    # mode=2/3  → 写入规则集 tag + rule_set 定义以"并集"方式合并
+    #   ⚠️ WARP 接管的 warp-out 规则及其 rule_set 定义也同住在 relay.json (见 _warp_takeover),
+    #      若全量替换定义会把 WARP 引用的 tag 清掉 → 组合校验必失败。故:
+    #   保留"仍被某规则引用且未被新定义覆盖"的旧定义, 追加新定义; 旧 def 与新 def 同 tag 时以新为准。
     if [ "$mode_choice" == "1" ]; then
-        rs_filter="(.route.rules |= map(if (((.outbound? // \"\") | startswith(\"relay-out-\"))) then del(.rule_set) else . end)) | (.route.rule_set = [])"
+        rs_filter="(.route.rules |= map(if (((.outbound? // \"\") | startswith(\"relay-out-\"))) then del(.rule_set) else . end)) | ([.route.rules[]? | .rule_set[]?] as \$used | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as \$t | (\$used | index(\$t)) != null))))"
     else
-        rs_filter="(.route.rules |= map(if (((.outbound? // \"\") | startswith(\"relay-out-\"))) then .rule_set = [${tags_csv}] else . end)) | (.route.rule_set = [${rs_arr}])"
+        rs_filter="(.route.rules |= map(if (((.outbound? // \"\") | startswith(\"relay-out-\"))) then .rule_set = [${tags_csv}] else . end)) | ([${tags_csv}] as \$new | ([.route.rules[]? | .rule_set[]?] as \$used | .route.rule_set = (((.route.rule_set // []) | map(select(.tag as \$t | ((\$used | index(\$t)) != null) and ((\$new | index(\$t)) == null)))) + [${rs_arr}])))"
     fi
     # SX: 同步链路元数据的 relay_mode, 保证 [4] 查看链路显示一致
     local links_filter="map_values(if (type == \"object\") then .relay_mode = \"${relay_mode}\" else . end)"
