@@ -2660,6 +2660,9 @@ _clear_all_relays() {
     # 漏掉 vless-ws-in-* 等标签, 清空后残留 inbound 占端口 (实测报告: 节点未被释放)。
     relay_tags=$(jq -c '[.inbounds[]? | (.tag? // "")] | map(select(length > 0)) | unique' "$CONFIG_FILE" 2>/dev/null)
     [ -n "$relay_tags" ] || relay_tags='[]'
+    # SX: 清除前采集中转入口端口/协议 → 清空成功后做 LISTEN 占用自检
+    local relay_ports
+    relay_ports=$(jq -r '.inbounds[]? | select(.listen_port?) | "\(.listen_port)|\(if (.type? == "hysteria2" or .type? == "tuic" or .type? == "shadowsocks" or .type? == "socks") then "udp" else "tcp" end)"' "$CONFIG_FILE" 2>/dev/null | sort -u || true)
 
     if [ "$failed" != "true" ]; then
         local clear_filter
@@ -2698,9 +2701,55 @@ _clear_all_relays() {
         rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key"
     done < <(printf '%s' "$relay_tags" | jq -r '.[]' 2>/dev/null)
     _save_nftables_rules
+    # SX: 根级清扫 —— 清空不止清配置里的 tag, 还要清流产/断连留下的孤儿状态
+    _relay_purge_residue
     _txn_cleanup "$txn_dir"
     _state_lock_release
-    _success "全部中转已清空；主节点、Xray 与端口转发配置均已保留"
+    local _sweep_port_warn
+    _sweep_port_warn="$(_relay_report_residue_ports "$relay_ports")"
+    _success "全部中转已清空；主节点、Xray 与端口转发配置均已保留${_sweep_port_warn}"
+}
+
+# SX: 中转层根级清扫 (清空后调用) —— 目标是"清空之后没有暗雷":
+#  1) nft 孤儿端口跳跃规则: 只清 comment 含前缀 singboxlite-relay-hop- 的 (流产建链的残留, LINKS_FILE 认不得它们)
+#  2) 孤儿证书文件: ${RELAY_AUX_DIR}/*.pem/.key 中 tag 不属于主配置任何 inbound 的 (主节点证书绝不碰)
+#  3) /tmp/singboxlite-relay-txn.* 事务临时目录 (断连留下的垃圾)
+# 与 relay_pf.json/主 config/xray config 无关, 绝不越界。
+_relay_purge_residue() {
+    # --- 1) nft 孤儿 hop 规则 (按 comment 名字原文删除, 同时产出即唯一形态) ---
+    local _hop_comments _c
+    _hop_comments=$(nft list ruleset 2>/dev/null | grep -oE 'singboxlite-relay-hop-[A-Za-z0-9_.-]+' | sort -u || true)
+    while IFS= read -r _c; do
+        [ -n "$_c" ] || continue
+        _nft_delete_rules_by_comment "$_c" >/dev/null 2>&1 || true
+    done <<< "$_hop_comments"
+    # --- 2) 孤儿证书 (tag 不在主配置 inbound 中 → 中转自有, 删; 属主节点 → 保留) ---
+    local _main_tags _f _tag
+    _main_tags=$(jq -r '[.inbounds[]?.tag // ""] | join(" ")' "$MAIN_CONFIG_FILE" 2>/dev/null || printf '')
+    for _f in "${RELAY_AUX_DIR}"/*.pem "${RELAY_AUX_DIR}"/*.key; do
+        [ -e "$_f" ] || continue
+        _tag=$(basename "${_f%.*}")
+        if ! printf '%s' "$_main_tags" | grep -qw -- "$_tag"; then
+            rm -f -- "${RELAY_AUX_DIR}/${_tag}.pem" "${RELAY_AUX_DIR}/${_tag}.key"
+            _info "根级清扫: 移除孤儿证书 ${_tag}.pem/.key"
+        fi
+    done 2>/dev/null
+    # --- 3) 事务临时目录 ---
+    rm -rf -- /tmp/singboxlite-relay-txn.* 2>/dev/null || true
+}
+
+# SX: 清空后的占用自检 (参数: 清除前采集的 "port|proto" 行) ——
+#     若仍有端口在 LISTEN, 说明老进程没退/重启没真成功, 明示出来不让假绿灯盖住端口占用
+_relay_report_residue_ports() {
+    local _rows="$1"
+    [ -n "$_rows" ] || return 0
+    local _still="" _row _p _proto
+    while IFS='|' read -r _p _proto; do
+        [ -n "$_p" ] || continue
+        _check_port_occupied "$_p" "${_proto:-tcp}" && _still="$_still ${_p}"
+    done <<< "$_rows"
+    [ -z "$_still" ] && return 0
+    printf '%s\n' " ${YELLOW}⚠ 端口${_still}仍被监听 (老进程未退?), 新建请换端口或先重启服务${NC}"
 }
 
 _delete_relay() {
