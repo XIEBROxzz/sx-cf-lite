@@ -73,9 +73,11 @@ function zhError(errors) {
 }
 
 async function cf(env, path, method = "GET", body) {
-  // 简化的认证: EMAIL + API_KEY 优先级高于单个 Token
+  // 认证优先级: 1) 当前所选账号的专属 Token (env.cfToken) → 2) EMAIL + API_KEY → 3) 环境变量 Token
   const headers = { "Content-Type": "application/json" };
-  if (env.EMAIL && env.API_KEY) {
+  if (env.cfToken) {
+    headers["Authorization"] = "Bearer " + env.cfToken;
+  } else if (env.EMAIL && env.API_KEY) {
     headers["X-Auth-Email"] = env.EMAIL;
     headers["X-Auth-Key"] = env.API_KEY;
   } else {
