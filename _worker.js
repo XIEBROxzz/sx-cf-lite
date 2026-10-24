@@ -1030,6 +1030,38 @@ async function handleApi(request, env, path) {
     return json({ error: "未知操作" }, 400);
   }
 
+  // /api/dns: DNS 记录管理 (新增 / 编辑 / 删除; 查看走 /api/asset)
+  if (path === "/api/dns") {
+    const zoneId = str(d.zoneId);
+    const action = str(d.action);
+    const OK_TYPES = ["A", "AAAA", "CNAME", "TXT", "MX", "NS"];
+    if (action === "add" || action === "edit") {
+      const type = str(d.type).toUpperCase();
+      const name = str(d.name);
+      const content = str(d.content);
+      const ttl = Math.max(1, Number(d.ttl) || 1); // 1 = Auto
+      if (!OK_TYPES.includes(type)) return json({ error: "仅支持类型: " + OK_TYPES.join(" / ") }, 400);
+      if (!name) return json({ error: "请填写主机名 (如 sub 或 @)" }, 400);
+      if (!content) return json({ error: "请填写记录内容" }, 400);
+      const proxied = type === "CNAME" || type === "A" || type === "AAAA" ? !!d.proxied : false;
+      const rec = { type, name, content, ttl, proxied };
+      if (type === "MX") {
+        const p = Number(d.priority);
+        if (!Number.isInteger(p) || p < 0 || p > 65535) return json({ error: "MX 记录需要有效优先级 (0-65535)" }, 400);
+        rec.priority = p;
+      }
+      let r;
+      if (action === "add") r = await cf(env, `/zones/${zoneId}/dns_records`, "POST", rec);
+      else r = await cf(env, `/zones/${zoneId}/dns_records/${str(d.id)}`, "PUT", rec);
+      return json({ ok: true, id: (r && r.id) || "" });
+    }
+    if (action === "del") {
+      await cf(env, `/zones/${zoneId}/dns_records/${str(d.id)}`, "DELETE");
+      return json({ ok: true });
+    }
+    return json({ error: "未知操作" }, 400);
+  }
+
   if (path === "/api/init")
     return json({ zones: await listZones(env), service: env.DEFAULT_SERVICE || "", cur: acc, envAcc: env.CF_ACCOUNT_ID || "" });
 
@@ -1550,6 +1582,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
     <nav class="nav">
       <a data-v="dash" class="on"><span class="i">📊</span>仪表板</a>
       <a data-v="tunnels"><span class="i">⚙️</span>Tunnel 管理</a>
+      <a data-v="domains"><span class="i">🌐</span>域名管理</a>
       <a data-v="tg"><span class="i">✈️</span>Telegram 配置</a>
     </nav>
     <div class="foot"><a href="#" id="logout"><span class="i">👤</span><span class="lt">退出登录</span><span class="lo">⇥</span></a></div>
@@ -1594,6 +1627,13 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
         <div class="card">
           <h3><span>隧道列表</span><span class="hint" id="sum" style="margin:0"></span></h3>
           <div id="list"><div class="empty">加载中...</div></div>
+        </div>
+      </section>
+
+      <section class="view" id="v-domains">
+        <div class="card">
+          <h3><span>域名管理</span><span class="hint" style="margin:0">域名 / 子域名 / DNS 解析 / Origin 规则与证书 / 关联隧道</span></h3>
+          <div id="dmg"><div class="empty">加载中...</div></div>
         </div>
       </section>
 
@@ -1878,6 +1918,7 @@ $('acc_sel').addEventListener('change',async function(){
     try{await api('/api/acc',{action:'switch',acc:v})}catch(e){}
     curAcc=v;renderAccSel({accounts:Object.keys(accNames).map(function(k){return {name:accNames[k],acc:k}}),cur:v});
     metaCache={}; // 新账号路由缓存清空
+    dmg.zone='';dmg.host='';dmg.zoneName=''; // 域名管理视图随账号重置
     await Promise.all([loadList(),initZones()]); // 列表 + 域名下拉都随账号刷新
   }finally{setBusy(false)}
   loadTg();
@@ -1951,8 +1992,9 @@ document.addEventListener('click',async function(e){
 function show(v){
   document.querySelectorAll('.nav a').forEach(function(a){a.className=a.dataset.v===v?'on':''});
   document.querySelectorAll('.view').forEach(function(s){s.className='view'+(s.id==='v-'+v?' on':'')});
-  $('ttl').textContent=({dash:'仪表板',tunnels:'Tunnel 管理',tg:'Telegram 配置'})[v]||'';
+  $('ttl').textContent=({dash:'仪表板',tunnels:'Tunnel 管理',domains:'域名管理',tg:'Telegram 配置'})[v]||'';
   $('sidenav').className='sidenav';
+  if(v==='domains')renderAssetsPage(); // 首次进入/每次进入都刷新
 }
 document.querySelectorAll('.nav a').forEach(function(a){a.onclick=function(){show(a.dataset.v)}});
 $('menu').onclick=function(){$('sidenav').className='sidenav open'};
@@ -2126,9 +2168,16 @@ async function initZones(){
     fail(e);
   }
 }
-/* ---- 域名资产管理 ---- */
-var assetZone=null,assetHost='';
+/* ---- 域名管理 (侧栏页面版 + 顶栏📂弹窗入口) ---- */
 var ST_TXT={healthy:'在线',degraded:'降级',down:'离线',inactive:'未启用'};
+var DNS_TYPES=['A','AAAA','CNAME','TXT','MX','NS'];
+var dmg={zone:'',zoneName:'',host:'',busy:false,editId:''};
+
+function showDomainsPage(zone,zName,host){
+  if(zone!==undefined&&zone!==null){dmg.zone=zone||'';dmg.zoneName=zName||dmg.zoneName;dmg.host=host||''}
+  show('domains');
+  if(!dmg.busy)renderAssetsPage();
+}
 
 $('assets_mgr').onclick=function(){openModal('mAssets');loadAssets()};
 $('a_x').onclick=closeModal;
@@ -2139,6 +2188,7 @@ $('newbtn').onclick=function(){
   setTimeout(function(){$('name').focus()},50);
 };
 
+// 弹窗版只列域名, 点击跳转到侧栏"域名管理"页面继续
 async function loadAssets(){
   $('a_body').innerHTML='<div class="empty">加载中...</div>';
   try{
@@ -2147,41 +2197,64 @@ async function loadAssets(){
     $('a_body').innerHTML='<div class="acc-list">'+d.zones.map(function(z){
       return '<div class="acc-item" style="cursor:pointer" data-azone="'+esc(z.id)+'" data-aname="'+esc(z.name)+'">'+
         '<div style="display:flex;align-items:center;gap:8px"><strong style="font-size:14px">🌐 '+esc(z.name)+'</strong>'+
-        '<span style="margin-left:auto" class="btn sm">查看子域名 →</span></div></div>';
+        '<span style="margin-left:auto" class="btn sm">打开域名管理 →</span></div></div>';
     }).join('')+'</div>';
     $('a_body').querySelectorAll('[data-azone]').forEach(function(el){
-      el.onclick=function(){openSub(el.dataset.azone,el.dataset.aname,'')};
+      el.onclick=function(){closeModal();showDomainsPage(el.dataset.azone,el.dataset.aname,'')};
     });
   }catch(e){$('a_body').innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
 
-async function openSub(zoneId,zoneName,host){
-  assetZone={id:zoneId,name:zoneName};assetHost=host||'';
-  $('s_ttl').textContent=host?(zoneName+' · '+host):zoneName;
-  openModal('mSub');
-  $('s_body').innerHTML='<div class="empty">加载中...</div>';
+// 页面版域名管理: 域名 → 子域名 → 详情 (DNS 增删改 / Origin 规则 / 证书 / 关联隧道)
+async function renderAssetsPage(){
+  var box=$('dmg');
+  if(dmg.busy)return;
+  dmg.busy=true;
+  var zoneId=dmg.zone,zoneName=dmg.zoneName,host=dmg.host;
   try{
+    if(!zoneId){
+      var dz=await api('/api/assets');
+      if(!dz.zones.length){box.innerHTML='<div class="empty">当前账号没有可用域名</div>';return}
+      var h='<div style="display:flex;gap:8px;margin-bottom:10px"><button class="btn sm" id="p_r">↻ 刷新</button></div>';
+      h+='<div>'+dz.zones.map(function(z){
+        return '<div class="acc-item" style="cursor:pointer" data-azone="'+esc(z.id)+'" data-aname="'+esc(z.name)+'">'+
+          '<strong style="font-size:14px">🌐 '+esc(z.name)+'</strong>'+
+          '<span style="margin-left:auto" class="btn sm">查看子域名 →</span></div>';
+      }).join('')+'</div>';
+      h+='<div class="hint" style="margin-top:10px">点击域名进入子域名列表; 子域名来自 DNS 解析 / Origin 规则 / 隧道路由的汇总。</div>';
+      box.innerHTML=h;
+      $('p_r').onclick=function(){dmg.zone='';dmg.host='';renderAssetsPage()};
+      box.querySelectorAll('[data-azone]').forEach(function(el){
+        el.onclick=function(){dmg.zone=el.dataset.azone;dmg.zoneName=el.dataset.aname;dmg.host='';renderAssetsPage()};
+      });
+      return;
+    }
     var d=await api('/api/asset',{zoneId:zoneId,host:host});
     if(!host){
-      // 子域名列表 (DNS + Origin 规则 + 隧道路由汇总)
-      var h='<div style="margin-bottom:10px"><button class="btn sm" id="s_r">↻ 刷新</button></div>';
-      h+='<div class="rtable">';
-      h+='<div class="acc-item" style="cursor:pointer;padding:9px 12px;display:flex;gap:8px;align-items:center" data-shost="'+esc(zoneName)+'"><strong>🏠 主域名</strong><span style="margin-left:auto;color:var(--sub)">'+esc(zoneName)+'</span></div>';
+      // 子域名列表
+      var h='<div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">'+
+        '<button class="btn sm" id="p_back">← 返回域名列表</button><button class="btn sm" id="p_r">↻ 刷新</button></div>'+
+        '<div style="font-size:13px;margin-bottom:8px">当前域名: <strong>'+esc(zoneName)+'</strong> (子域名 '+d.hosts.length+' 个)</div>';
+      h+='<div class="acc-item" style="cursor:pointer" data-shost="'+esc(zoneName)+'"><strong>🏠 主域名</strong><span style="margin-left:auto;color:var(--sub)">点击查看关联资源</span></div>';
       if(d.hosts.length){
-        h+='<div style="padding:9px 12px;border-bottom:1px solid var(--line);font-weight:600;color:var(--sub);font-size:12.5px">子域名 ('+d.hosts.length+') 来自 DNS / Origin 规则 / 隧道路由</div>';
         h+=d.hosts.map(function(x){
-          return '<div class="acc-item" style="cursor:pointer;padding:9px 12px;display:flex;align-items:center;gap:8px" data-shost="'+esc(x)+'">'+
+          return '<div class="acc-item" style="cursor:pointer" data-shost="'+esc(x)+'">'+
             '<strong style="min-width:0;word-break:break-all">'+esc(x)+'</strong>'+
-            '<button class="btn sm red" style="margin-left:auto;flex:none" data-clean="'+esc(x)+'">清理</button></div>';
+            '<span style="margin-left:auto;display:flex;gap:6px;flex:none">'+
+            '<button class="btn sm red" style="flex:none" data-clean="'+esc(x)+'">清理</button>'+
+            '<button class="btn sm" style="flex:none" data-shostbtn="'+esc(x)+'">详情 →</button></span></div>';
         }).join('');
       }else h+='<div class="empty" style="padding:8px">该域名下暂无子域名</div>';
-      h+='</div><div class="hint" style="margin-top:10px">点击任意条目查看它关联的 Origin 证书 / Origin 规则 / 隧道, 可从详情页单独删除或一键清理。</div>';
-      $('s_body').innerHTML=h;
-      $('s_r').onclick=function(){openSub(zoneId,zoneName,assetHost)};
-      $('s_body').querySelectorAll('[data-shost]').forEach(function(el){
-        el.onclick=function(){openSub(zoneId,zoneName,el.dataset.shost)};
+      box.innerHTML=h;
+      $('p_back').onclick=function(){dmg.zone='';dmg.host='';renderAssetsPage()};
+      $('p_r').onclick=function(){renderAssetsPage()};
+      box.querySelectorAll('[data-shost]').forEach(function(el){
+        el.onclick=function(){dmg.host=el.dataset.shost;dmg.editId='';renderAssetsPage()};
       });
-      $('s_body').querySelectorAll('[data-clean]').forEach(function(b){
+      box.querySelectorAll('[data-shostbtn]').forEach(function(b){
+        b.onclick=function(ev){ev.stopPropagation();dmg.host=b.dataset.shostbtn;dmg.editId='';renderAssetsPage()};
+      });
+      box.querySelectorAll('[data-clean]').forEach(function(b){
         b.onclick=async function(ev){
           ev.stopPropagation();
           if(!await askConfirm('将删除子域名 '+b.dataset.clean+' 的全部: DNS 解析 / Origin 规则 / Origin 证书 / 隧道路由 (无路由的整条隧道)。不可恢复, 确定?','一键清理','全部删除'))return;
@@ -2191,95 +2264,165 @@ async function openSub(zoneId,zoneName,host){
             var msg='清理完成: DNS '+r.dns+', 规则 '+r.rules+', 证书 '+r.certs+', 路由 '+r.routes+', 隧道 '+r.tunnels;
             (r.ok&&!r.errors.length)?toast(msg):toast('部分失败: '+(r.errors||[]).join('; '),'err');
           }catch(e){fail(e)}
-          openSub(zoneId,zoneName,'');
+          renderAssetsPage();
         };
       });
       return;
     }
-    // 子域名详情: DNS / Origin Rules / Origin 证书 / 隧道
+    // 子域名详情
     var nRules=d.originRules.length,nRoutes=0;
     d.tunnels.forEach(function(t){nRoutes+=t.routes.length});
-    var h='<div style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap">'+
-      '<button class="btn sm" id="s_back">← 返回</button>'+
-      '<button class="btn sm" id="s_r">↻ 刷新</button>'+
-      '<button class="btn sm red-solid" style="margin-left:auto" id="s_all">🧹 一键清理全部</button></div>';
-    h+='<div style="font-size:12.5px;color:var(--sub);margin-bottom:8px">'+esc(host)+' — DNS '+d.dns.length+' · 规则 '+nRules+' · 证书 '+d.certs.length+' · 隧道路由 '+nRoutes+'</div>';
-    h+='<div style="font-weight:600;margin-bottom:6px">📡 DNS 解析</div>';
+    var h='<div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">'+
+      '<button class="btn sm" id="p_back">← 返回'+esc(zoneName)+'</button>'+
+      '<button class="btn sm" id="p_r">↻ 刷新</button>'+
+      '<button class="btn sm red-solid" style="margin-left:auto" id="p_all">🧹 一键清理全部</button></div>'+
+      '<div style="font-size:12.5px;color:var(--sub);margin-bottom:8px">'+esc(host)+' — DNS '+d.dns.length+' · Origin 规则 '+nRules+' · 证书 '+d.certs.length+' · 隧道路由 '+nRoutes+'</div>'+
+      '<button class="btn sm" id="p_dnsadd" style="margin-bottom:8px">＋ 新增记录</button>'+
+      '<div id="p_dnsform" style="display:none;border:1px dashed var(--line);border-radius:10px;padding:10px;margin-bottom:10px">'+
+        '<div style="display:flex;gap:8px;flex-wrap:wrap">'+
+          '<div style="width:110px;flex:none"><label style="margin:0 0 4px">类型</label><select id="p_dt">'+DNS_TYPES.map(function(x){return '<option>'+x+'</option>'}).join('')+'</select></div>'+
+          '<div style="flex:1;min-width:140px"><label style="margin:0 0 4px">主机名 (如 sub.x.com / @)</label><input id="p_dn" placeholder="完整域名或 @"></div>'+
+          '<div style="width:130px;flex:none"><label style="margin:0 0 4px">MX 优先级</label><input id="p_dprio" placeholder="仅 MX 需要" inputmode="numeric"></div>'+
+        '</div>'+
+        '<label>记录内容</label><input id="p_dc" placeholder="如 1.2.3.4 / 目标域名 / 文本">'+
+        '<div style="display:flex;gap:14px;align-items:center;margin-top:10px;flex-wrap:wrap">'+
+          '<div style="width:130px"><label style="margin:0 0 4px">TTL (1=自动)</label><input id="p_dttl" value="1" inputmode="numeric"></div>'+
+          '<label style="margin:12px 0 0;display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="p_dpx" style="width:auto"> 开启代理 (仅 A/AAAA/CNAME)</label>'+
+          '<button class="btn sm" id="p_dns_save" style="margin-left:auto">保存记录</button>'+
+          '<button class="btn sm gray" id="p_dns_cancel">取消</button>'+
+        '</div>'+
+        '<div class="hint" style="margin-top:6px" id="p_dns_editing"></div>'+
+      '</div>';
+    h+='<div style="font-weight:600;margin:6px 0">📡 DNS 解析记录</div>';
     h+=d.dns.length?d.dns.map(function(r){
       return '<div class="acc-item" style="padding:7px 10px;margin-bottom:6px"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
         '<strong style="flex:none">'+esc(r.type)+'</strong>'+
-        '<span style="min-width:0;flex:1;word-break:break-all;font-size:12.5px">'+esc(r.content)+(r.proxied?' (已代理)':'')+'</span>'+
+        '<span style="min-width:0;flex:1;word-break:break-all;font-size:12.5px">'+esc(r.content)+(r.proxied?' · 🟠已代理':'')+' · TTL '+(r.ttl===1?'Auto':r.ttl)+'</span>'+
+        '<button class="btn sm" style="flex:none" data-edns="'+esc(r.id)+'">编辑</button>'+
         '<button class="btn sm red" style="flex:none" data-ddns="'+esc(r.id)+'">删除</button></div></div>';
     }).join(''):'<div class="empty" style="padding:5px;font-size:12.5px">无</div>';
-    h+='<div style="font-weight:600;margin:10px 0 6px">⚖️ Origin Rules</div>';
+    h+='<div style="font-weight:600;margin:12px 0 6px">⚖️ Origin Rules 规则</div>';
     h+=nRules?d.originRules.map(function(r){
       return '<div class="acc-item" style="padding:7px 10px;margin-bottom:6px"><div style="display:flex;gap:8px;align-items:center">'+
         '<span style="min-width:0;flex:1;word-break:break-all;font-size:12.5px"><strong>'+esc(r.description||'规则 '+r.id.slice(0,6))+'</strong> '+esc(r.expression)+'</span>'+
         '<button class="btn sm red" style="flex:none" data-drule="'+esc(r.id)+'" data-rset="'+esc(d.rulesetId||'')+'">删除</button></div></div>';
     }).join(''):'<div class="empty" style="padding:5px;font-size:12.5px">无</div>';
-    h+='<div style="font-weight:600;margin:10px 0 6px">🔐 Origin 证书</div>';
+    h+='<div style="font-weight:600;margin:12px 0 6px">🔐 Origin 证书</div>';
     h+=d.certs.length?d.certs.map(function(c){
       return '<div class="acc-item" style="padding:7px 10px;margin-bottom:6px"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
         '<span style="min-width:0;flex:1;word-break:break-all;font-size:12.5px">'+esc(c.hostnames.join(', '))+' · 到期 '+esc((c.expires||'—').slice(0,10))+'</span>'+
-        '<button class="btn sm red" style="flex:none" data-dcert="'+esc(c.id)+'">删除</button></div></div>';
+        '<button class="btn sm red" style="flex:none" data-dcert="'+esc(c.id)+'">吊销删除</button></div></div>';
     }).join(''):'<div class="empty" style="padding:5px;font-size:12.5px">无覆盖该域名的证书</div>';
-    h+='<div style="font-weight:600;margin:10px 0 6px">🚇 关联隧道</div>';
+    h+='<div style="font-weight:600;margin:12px 0 6px">🚇 关联隧道</div>';
     h+=d.tunnels.length?d.tunnels.map(function(t){
-      var multied=t.routes.length===1&&!t.routes[0].path; // 无路径的路由是"匹配全部", 删除单条=清空隧道所有路由, 提示由一键清理/删隧道处理
+      var multied=t.routes.length===1&&!t.routes[0].path;
       return '<div class="acc-item" style="padding:7px 10px;margin-bottom:6px">'+
         '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><strong>'+esc(t.name)+'</strong>'+
         '<em style="font-style:normal;color:'+(t.status==='healthy'?'var(--ok)':'var(--sub)')+';font-size:12.5px">'+(ST_TXT[t.status]||t.status)+'</em>'+
-        '<span style="margin-left:auto;display:flex;gap:6px">'+
+        '<span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">'+
+        '<button class="btn sm" data-gotun="'+esc(t.id)+'" data-goname="'+esc(t.name)+'">去隧道管理 →</button>'+
         (multied?'':'<button class="btn sm red" data-droute="'+esc(t.id)+'" data-path="'+esc(t.routes[0].path)+'">删此路由</button>')+
         '<button class="btn sm red-solid" data-dtun="'+esc(t.id)+'">删整条隧道</button></span></div>'+
         '<div style="margin-top:5px;font-size:12.5px;word-break:break-all;color:var(--sub)">'+t.routes.map(function(r){return esc(r.hostname+(r.path?' '+r.path:'')+' → '+r.service)}).join('<br>')+'</div></div>';
     }).join(''):'<div class="empty" style="padding:5px;font-size:12.5px">无隧道路由</div>';
-    $('s_body').innerHTML=h;
-    $('s_back').onclick=function(){openSub(zoneId,zoneName,'')};
-    $('s_r').onclick=function(){openSub(zoneId,zoneName,host)};
-    $('s_all').onclick=async function(){
+    box.innerHTML=h;
+    // ---- 顶部操作 ----
+    $('p_back').onclick=function(){dmg.host='';renderAssetsPage()};
+    $('p_r').onclick=function(){renderAssetsPage()};
+    $('p_all').onclick=async function(){
       if(!await askConfirm('将删除 '+host+' 的全部: DNS 解析 / Origin 规则 / Origin 证书 / 隧道路由。不可恢复, 确定?','一键清理','全部删除'))return;
-      $('s_all').disabled=true;
+      $('p_all').disabled=true;
       try{
         var r=await api('/api/assetOp',{zoneId:zoneId,host:host,kind:'all'});
         var msg='清理完成: DNS '+r.dns+', 规则 '+r.rules+', 证书 '+r.certs+', 路由 '+r.routes+', 隧道 '+r.tunnels;
         (r.ok&&!r.errors.length)?toast(msg):toast('部分失败: '+(r.errors||[]).join('; '),'err');
       }catch(e){fail(e)}
-      openSub(zoneId,zoneName,host);
+      renderAssetsPage();
     };
-    var after=function(){openSub(zoneId,zoneName,host)};
-    $('s_body').querySelectorAll('[data-ddns]').forEach(function(b){
+    // ---- DNS 增删改 ----
+    var form=$('p_dnsform');
+    dmg.editId='';
+    function prioVis(){var mx=$('p_dt').value==='MX';$('p_dprio').disabled=!mx;if(!mx)$('p_dprio').value=''}
+    $('p_dt').onchange=prioVis;
+    function openForm(rec){
+      dmg.editId=(rec&&rec.id)||'';
+      form.style.display='block';
+      $('p_dt').value=rec?rec.type:'CNAME';
+      $('p_dn').value=rec?(rec.name||''):'';
+      $('p_dc').value=rec?(rec.content||''):'';
+      $('p_dttl').value=rec?(rec.ttl||1):1;
+      $('p_dpx').checked=rec?!!rec.proxied:false;
+      $('p_dprio').value=(rec&&rec.priority!=null)?rec.priority:'';
+      $('p_dns_editing').innerHTML=rec?('正在编辑记录 (ID '+esc(rec.id)+')'):'新增 DNS 记录';
+      prioVis();
+    }
+    $('p_dnsadd').onclick=function(){openForm(null)};
+    $('p_dns_cancel').onclick=function(){dmg.editId='';form.style.display='none'};
+    $('p_dns_save').onclick=async function(){
+      var type=$('p_dt').value,name=$('p_dn').value.trim(),content=$('p_dc').value.trim();
+      var ttl=Number($('p_dttl').value)||1,proxied=$('p_dpx').checked;
+      var prio=$('p_dprio').value===''?null:Number($('p_dprio').value);
+      this.disabled=true;
+      try{
+        await api('/api/dns',{zoneId:zoneId,action:dmg.editId?'edit':'add',id:dmg.editId,type:type,name:name,content:content,ttl:ttl,proxied:proxied,priority:prio});
+        toast(dmg.editId?'DNS 记录已更新':'DNS 记录已创建');
+        dmg.editId='';renderAssetsPage();
+      }catch(e){this.disabled=false;fail(e)}
+    };
+    box.querySelectorAll('[data-edns]').forEach(function(b){
+      b.onclick=function(){
+        var rec=d.dns.filter(function(x){return x.id===b.dataset.edns})[0];
+        if(rec)openForm(rec);
+      };
+    });
+    box.querySelectorAll('[data-ddns]').forEach(function(b){
       b.onclick=async function(){
         if(!await askConfirm('确定删除这条 DNS 记录?','删除记录','删除'))return;
-        try{await api('/api/assetOp',{zoneId:zoneId,host:host,kind:'dns',id:b.dataset.ddns});toast('已删除')}catch(e){fail(e)}
-        after();
+        try{await api('/api/assetOp',{zoneId:zoneId,host:host,kind:'dns',id:b.dataset.ddns});toast('记录已删除')}catch(e){fail(e)}
+        renderAssetsPage();
       };
     });
-    $('s_body').querySelectorAll('[data-drule]').forEach(function(b){
+    // ---- Origin 规则 / 证书 ----
+    box.querySelectorAll('[data-drule]').forEach(function(b){
       b.onclick=async function(){
         if(!await askConfirm('确定删除这条 Origin 规则?','删除规则','删除'))return;
-        try{await api('/api/assetOp',{zoneId:zoneId,host:host,kind:'rule',id:b.dataset.drule,rulesetId:b.dataset.rset});toast('已删除')}catch(e){fail(e)}
-        after();
+        try{await api('/api/assetOp',{zoneId:zoneId,host:host,kind:'rule',id:b.dataset.drule,rulesetId:b.dataset.rset});toast('规则已删除')}catch(e){fail(e)}
+        renderAssetsPage();
       };
     });
-    $('s_body').querySelectorAll('[data-dcert]').forEach(function(b){
+    box.querySelectorAll('[data-dcert]').forEach(function(b){
       b.onclick=async function(){
         if(!await askConfirm('确定吊销并删除这张 Origin 证书?','删除证书','删除'))return;
-        try{await api('/api/assetOp',{zoneId:zoneId,host:host,kind:'cert',id:b.dataset.dcert});toast('已删除')}catch(e){fail(e)}
-        after();
+        try{await api('/api/assetOp',{zoneId:zoneId,host:host,kind:'cert',id:b.dataset.dcert});toast('证书已吊销删除')}catch(e){fail(e)}
+        renderAssetsPage();
       };
     });
-    $('s_body').querySelectorAll('[data-dtun]').forEach(function(b){
+    // ---- 隧道: 去隧道管理 / 删路由 / 删隧道 ----
+    box.querySelectorAll('[data-gotun]').forEach(function(b){
+      b.onclick=function(ev){ev.stopPropagation();show('tunnels');openRoutes(b.dataset.gotun,b.dataset.goname)};
+    });
+    box.querySelectorAll('[data-droute]').forEach(function(b){
+      b.onclick=async function(){
+        if(!await askConfirm('确定删除该隧道上指向 '+host+' 的这条路由? 如没有其他路由再用此域名会同步清理 DNS。','删除路由','删除'))return;
+        try{
+          var r=await api('/api/assetOp',{zoneId:zoneId,host:host,kind:'route',id:b.dataset.droute,path:b.dataset.path});
+          (r.ok&&!r.errors.length)?toast('路由已删除'):toast('部分失败: '+(r.errors||[]).join('; '),'err');
+        }catch(e){fail(e)}
+        renderAssetsPage();
+      };
+    });
+    box.querySelectorAll('[data-dtun]').forEach(function(b){
       b.onclick=async function(){
         if(!await askConfirm('确定删除整条隧道? 它的全部域名路由与 DNS 也会一并清理。','删除隧道','删除'))return;
         try{
           var r=await api('/api/assetOp',{zoneId:zoneId,host:host,kind:'delTunnel',id:b.dataset.dtun});
-          (r.ok&&!r.errors.length)?toast('已删除隧道'):toast('部分失败: '+(r.errors||[]).join('; '),'err');
+          (r.ok&&!r.errors.length)?toast('隧道已删除'):toast('部分失败: '+(r.errors||[]).join('; '),'err');
         }catch(e){fail(e)}
-        after();
+        renderAssetsPage();
       };
     });
-  }catch(e){$('s_body').innerHTML='<div class="empty">加载失败</div>';fail(e)}
+  }catch(e){box.innerHTML='<div class="empty">加载失败</div>';fail(e)}
+  finally{dmg.busy=false}
 }
 $('m_x').onclick=closeModal;$('m_cancel').onclick=closeModal;
 $('go').onclick=async function(){
