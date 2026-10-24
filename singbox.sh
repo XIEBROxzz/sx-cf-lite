@@ -3489,6 +3489,16 @@ _uninstall() {
 
     # SX: CF-B (Argo) 云端资源 —— 优先调用 tunnel 版现成无头清理 (隧道/CNAME 云侧)
     local tn_un=""
+    # SX: 联动清理 —— 先无头清掉中转层与 WARP (规则链/nft hop 孤儿/孤儿证书/WARP 云端注销),
+    #     否则 SINGBOX_DIR 整删只留配置尸体, nft hop 残留和老进程监听都要靠下面泛清碰运气
+    local _ar_un=""
+    [ -f "${SINGBOX_DIR}/advanced_relay.sh" ] && _ar_un="${SINGBOX_DIR}/advanced_relay.sh"
+    [ -z "$_ar_un" ] && [ -f "${SCRIPT_DIR}/advanced_relay.sh" ] && _ar_un="${SCRIPT_DIR}/advanced_relay.sh"
+    if [ -n "$_ar_un" ]; then
+        _info "最终步骤之 [一锅端]: 清理中转层与 WARP (本地规则链/nft/证书 + 云端注销)..."
+        bash "$_ar_un" full-purge || _warning "中转/WARP 联动清理有报错, 不影响卸载继续。"
+    fi
+    [ -f "${SINGBOX_DIR}/singbox-lite_tunnel.sh" ] && tn_un="${SINGBOX_DIR}/singbox-lite_tunnel.sh"
     [ -f "${SINGBOX_DIR}/singbox-lite_tunnel.sh" ] && tn_un="${SINGBOX_DIR}/singbox-lite_tunnel.sh"
     [ -z "$tn_un" ] && [ -f "${SCRIPT_DIR}/singbox-lite_tunnel.sh" ] && tn_un="${SCRIPT_DIR}/singbox-lite_tunnel.sh"
     if [ -n "$tn_un" ]; then
@@ -6181,7 +6191,7 @@ _delete_node_dispatch() {
         ((i++))
     done
     echo ""
-    echo -e "  ${RED}99)${NC} 删除所有节点 (普通 + Argo + CF-A 一锅端)"
+    echo -e "  ${RED}99)${NC} 删除所有节点 (普通 + Argo + CF-A + 中转/WARP 一锅端)"
     echo ""
     local num confirm
     read -p "请输入要删除的节点编号 (输入 0 返回): " num
@@ -6235,6 +6245,18 @@ _delete_all_nodes_all_kinds() {
     [ -z "$tn_p4" ] && [ -f "${SCRIPT_DIR}/singbox-lite_tunnel.sh" ] && tn_p4="${SCRIPT_DIR}/singbox-lite_tunnel.sh"
     [ -f "${SINGBOX_DIR}/cf_lite.sh" ] && cf_script="${SINGBOX_DIR}/cf_lite.sh"
     [ -z "$cf_script" ] && [ -f "${SCRIPT_DIR}/cf_lite.sh" ] && cf_script="${SCRIPT_DIR}/cf_lite.sh"
+
+    # SX: 联动清理 —— 主节点全删会让中转规则/悬空结构必然失效, 先把中转层和 WARP 一锅端
+    #     (relay.json 规则链/nft hop/孤儿证书/txn 目录 + WARP 本地与云端注销), 否则老进程边角残留导致端口占用
+    local _ar_script=""
+    [ -f "${SINGBOX_DIR}/advanced_relay.sh" ] && _ar_script="${SINGBOX_DIR}/advanced_relay.sh"
+    [ -z "$_ar_script" ] && [ -f "${SCRIPT_DIR}/advanced_relay.sh" ] && _ar_script="${SCRIPT_DIR}/advanced_relay.sh"
+    if [ -n "$_ar_script" ]; then
+        _info "--- 全局联动: 清空中转层与 WARP (规则链/nft/证书/云端注销) ---"
+        bash "$_ar_script" full-purge || _warning "中转层联动清理有报错, 可在中转菜单复查残留。"
+    else
+        _warning "未找到 advanced_relay.sh, 中转/WARP 层未联动清理 (可用中转菜单 [7] 手动清空)。"
+    fi
 
     _info "--- 全局删除: 普通 (sing-box 直连) ---"
     _with_state_lock _delete_all_main_nodes_locked

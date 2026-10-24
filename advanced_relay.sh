@@ -4924,6 +4924,32 @@ case "${1:-}" in
         refresh_status=$?
         _state_lock_release
         exit "$refresh_status"
+        ;;
+    # SX: 无头清理动词 —— 供主脚本 [99]删除所有节点 / 卸载流程联动调用
+    warp-purge)
+        _check_root || exit 1
+        _check_deps || exit 1
+        _warp_remove
+        exit $?
+        ;;
+    relay-purge)
+        _check_root || exit 1
+        _check_deps || exit 1
+        _install_yq || exit 1
+        _init_relay_dirs || exit 1
+        _clear_all_relays
+        exit $?
+        ;;
+    # SX: 合体动词 —— 先摘 WARP (其规则/定义也在 relay.json, 摘完重启),
+    #     再清中转层 (含 nft hop 孤儿/孤儿证书/txn 目录的根级清扫与端口占用自检)
+    full-purge|relay-full-purge)
+        _check_root || exit 1
+        _check_deps || exit 1
+        _warp_remove >/dev/null 2>&1 || true
+        _init_relay_dirs || exit 1
+        _clear_all_relays
+        exit $?
+        ;;
 esac
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
