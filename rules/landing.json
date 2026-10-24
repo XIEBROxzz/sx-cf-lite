@@ -68,7 +68,17 @@
         "character.ai",
         "copilot.microsoft.com",
         "googlevideo.com",
-        "ytimg.com"
+        "ytimg.com",
+        "youtube.com",
+        "youtu.be",
+        "youtube-nocookie.com",
+        "youtubekids.com",
+        "youtubei.googleapis.com",
+        "youtube.googleapis.com",
+        "youtube-ui.l.google.com",
+        "wide-youtube.l.google.com",
+        "yt3.ggpht.com",
+        "ggpht.com"
       ]
     }
   ]
