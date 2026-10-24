@@ -634,6 +634,16 @@ _check_combined_config() {
     "$SINGBOX_BIN" check -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" >/dev/null
 }
 
+# SX: 丢弃 stdin 中的粘贴残留 —— 剪贴板尾部多带的空行/文本会让后续交互的 read
+#     瞬间拿到"回车"默认值 (复用提示被顶成新建、协议被顶成 1)。
+#     只在有残留时生效; 无残留最多多等 0.2 秒。
+_flush_pending_stdin() {
+    local _drain _t0=$SECONDS
+    while read -t 0.2 -n 8191 -r _drain 2>/dev/null; do
+        (( SECONDS - _t0 >= 1 )) && break
+    done
+}
+
 _txn_begin() {
     mktemp -d /tmp/singboxlite-relay-txn.XXXXXX
 }
@@ -1826,6 +1836,7 @@ _finalize_relay_setup() {
             echo -e "    ${GREEN}[$_ri]${NC} ${YELLOW}${rnm}${NC} (${rty} :${rpo})${_ws}"
         done <<< "$reuse_rows"
         echo -e "    ${GREEN}[0]${NC} 新建入口"
+        _flush_pending_stdin
         read -p "  选择要复用的入口 [回车/0=新建]: " reuse_choice
         if [[ "$reuse_choice" =~ ^[1-9][0-9]*$ ]] && [ "$reuse_choice" -le "$_ri" ]; then
             IFS='|' read -r reuse_tag _rt2 _rp2 _rn2 <<< "${_tags[$((reuse_choice-1))]}"
@@ -1851,6 +1862,7 @@ _finalize_relay_setup() {
     echo -e "    ${GREEN}[5]${NC} Shadowsocks aes-256-gcm"
     echo -e "    ${GREEN}[6]${NC} VLESS + WebSocket (Argo/CF 通道)"
     echo ""
+    _flush_pending_stdin
     read -p "  请输入选项 [1-6]: " relay_choice
     
     case "$relay_choice" in
@@ -1957,6 +1969,7 @@ _finalize_relay_setup() {
     # 构造路由规则内容 (修复：定义被误删的变量)
     # SX: 转发模式 —— [1] 全量落地(默认) / [2] 仅AI域名走落地(OpenAI/Gemini/Claude), 其余中转机直连
     local relay_mode="all"
+    _flush_pending_stdin
     read -p "  转发模式 [1]全量落地(默认) [2]仅AI域名落地 [3]自定义规则集URL分流: " mode_choice
     local custom_rs_urls=""
     if [[ "$mode_choice" == "3" ]]; then
