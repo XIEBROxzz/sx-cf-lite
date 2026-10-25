@@ -13,9 +13,11 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-# SX: 版本 1.0 —— CF-A 并入主 sing-box (cfa-* 入站, 配置地基见文件说明块);
-#     [19] 优选订阅 vless 走无损参数模式逐节点出订阅; 菜单输出统一停留防闪回
-export SCRIPT_VERSION="1.0"
+# SX: 版本 1.1 —— CF-A 并入主 sing-box (cfa-* 入站, 配置地基见文件说明块);
+#     [19] 优选订阅 vless 走无损参数模式逐节点出订阅; 菜单输出统一停留防闪回;
+#     1.1: CRLF 自动转 LF (advanced_relay.sh 曾以 CRLF 入库, Linux 下 bash -n 判语法错误 →
+#          [18] 进阶功能闪回主菜单、[13] 整组更新被拒绝); 菜单动作返回非 0 时强制停留一次
+export SCRIPT_VERSION="1.1"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -7850,6 +7852,33 @@ _modify_node() {
 }
 
 # --- 更新管理脚本 ---
+# SX: CRLF 行尾自愈 —— Windows 上传的 .sh 若带 CRLF, Linux 下 `bash -n` 必报语法错误。
+#     后果是 [18] 进阶脚本被"拒绝执行"后闪回主菜单、[13] 整组更新被拒绝覆盖 (都只来得及看一眼就被 clear)。
+#     下载完成后、执行之前统一把 CRLF 转回 LF。
+_ensure_lf() {
+    local f="$1" tmp sz_old sz_new
+    [ -f "$f" ] || return 1
+    tmp=$(mktemp "${f}.crlf.XXXXXX") || return 1
+    # 不依赖 grep 的文本/二进制模式差异: 直接比字节数, 少了的就是 CR
+    if ! LC_ALL=C tr -d '\r' < "$f" > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    sz_old=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+    sz_new=$(wc -c < "$tmp" 2>/dev/null | tr -d ' ')
+    if [ -z "$sz_old" ] || [ -z "$sz_new" ] || [ "$sz_new" -eq "$sz_old" ]; then
+        rm -f -- "$tmp"
+        return 0
+    fi
+    chmod 755 "$tmp" 2>/dev/null || true
+    if ! mv -f -- "$tmp" "$f"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    _warn "已修正 CRLF 行尾: $(basename "$f") (${sz_old} → ${sz_new} 字节)"
+    return 0
+}
+
 _download_bash_script_atomic() {
     local url="$1" target="$2" label="${3:-脚本}"
     [[ "$url" == https://* ]] || { _error "拒绝从非 HTTPS 地址下载 ${label}。"; return 1; }
@@ -7860,6 +7889,12 @@ _download_bash_script_atomic() {
     if ! wget -qO "$tmp" --header='Cache-Control: no-cache' "$url" || [ ! -s "$tmp" ]; then
         rm -f "$tmp"
         _error "${label} 下载失败或内容为空。"
+        return 1
+    fi
+    # SX: 先转 LF 再校验 —— 否则上游只要有一个 CRLF 文件, 这里就会误判成语法错误
+    if ! _ensure_lf "$tmp"; then
+        rm -f "$tmp"
+        _error "${label} 行尾规范化失败。"
         return 1
     fi
     # SX修复: 兼容 #!/bin/bash 与 #!/usr/bin/env bash 两种 shebang (cf_lite.sh 用后者, 曾导致整组更新被永久拒绝)
@@ -8207,6 +8242,8 @@ _advanced_features() {
     # 执行脚本
     if [ -f "$script_path" ]; then
         _info "正在执行脚本: ${script_path}"
+        # SX: 本地已有副本可能是历史 CRLF 版本 —— 就地修正, 免得被下面的语法检查一票否决
+        _ensure_lf "$script_path" || _warn "行尾规范化失败, 若语法检查不通过请手动重装该文件"
         if ! bash -n "$script_path" 2>/dev/null; then
             _error "进阶脚本未通过 Bash 语法检查，已拒绝执行: ${script_path}"
             _error "请尝试手动执行以下命令获取错误信息:"
@@ -8382,8 +8419,12 @@ _main_menu() {
         echo -e "    ${YELLOW}[0]${NC} 退出脚本"
         echo ""
         
-        read -p "  请输入选项 [0-19]: " choice
- 
+        if ! read -p "  请输入选项 [0-19]: " choice; then
+            echo
+            exit 0   # SX: stdin 已 EOF (管道/非交互), 直接退出, 免得在 clear 循环里空转
+        fi
+
+        local _menu_rc=0
         case $choice in
             1) _require_singbox && _show_add_node_menu ;;
             2) _cf_wrap_menu ;;
@@ -8410,6 +8451,14 @@ _main_menu() {
             0) exit 0 ;;
             *) _error "无效输入，请重试。" ;;
         esac
+        _menu_rc=$?
+        # SX: 子功能报到失败时先停留 —— 否则下一轮循环顶部的 clear 会把报错瞬间擦掉,
+        #     表现为 [18]/[19] 这类"闪一下就回主菜单"。错误详情在这里必读一次。
+        if [ "$_menu_rc" -ne 0 ]; then
+            echo ""
+            _warn "操作未完成 (退出码 ${_menu_rc})，请查看上方提示"
+            _pause_back
+        fi
         echo
     done
 }
@@ -8433,6 +8482,7 @@ _quick_launch() {
         [ -z "$cand" ] && [ -f "${SCRIPT_DIR}/cf_lite.sh" ] && cand="${SCRIPT_DIR}/cf_lite.sh"
     fi
     if [ -z "$cand" ]; then _error "未找到对应脚本, 请先运行 [13] 更新脚本的最新版。"; return 1; fi
+    _ensure_lf "$cand" || true   # SX: 历史 CRLF 副本就地修正, 否则 bash 会报 $'\r' 语法错误
     bash "$cand"
 }
 

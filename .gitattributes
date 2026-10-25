@@ -1,0 +1,7 @@
+# 强制仓库内全部文本为 LF。
+# 背景: advanced_relay.sh 曾以 CRLF 上传 (Windows 编辑), Linux 下 `bash -n` 直接判语法错误,
+#       表现为 [18] 进阶功能"一闪回到主菜单"、[13] 整组更新被拒绝覆盖。
+* text=auto eol=lf
+*.sh   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
