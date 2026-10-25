@@ -4852,6 +4852,105 @@ _udp_route_menu() {
 #     ipv4_only / ipv6_only    = 只用某一族 (落地某族不通时绕开, 例如只有 AAAA 解析)
 #     注意: 设了之后域名由中转机本地解析再连 IP; 中转机 DNS 被污染时会适得其反。
 # ============================================================
+# ============================================================
+# SX: 本机直连地址族 (作用于 config.json 的 direct 出站)
+#     只影响"最终走 direct"的流量(route.final=direct / 规则指向 direct);
+#     走落地或节点的流量不受影响。空值 = 双栈默认。
+#     用途: v4 段被 Google 判中国区(送中)而 v6 段干净时, 让直连走 v6。
+# ============================================================
+_direct_fam_state() {
+    [ -s "$MAIN_CONFIG_FILE" ] || return 0
+    jq -r 'first(.outbounds[]? | select((.tag? // "") == "direct") | .domain_strategy) // ""' \
+        "$MAIN_CONFIG_FILE" 2>/dev/null
+}
+
+_direct_fam_apply() {
+    local ds="$1"
+    [ -s "$MAIN_CONFIG_FILE" ] || { _error "主配置不存在: $MAIN_CONFIG_FILE"; _pause_anykey; return 1; }
+    case "$ds" in
+        prefer_ipv6|ipv6_only)
+            if ! { ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; }; then
+                _error "本机没有全局 IPv6 地址, 选 IPv6 档位会让直连全部失败 —— 已取消"
+                _pause_anykey; return 1
+            fi ;;
+        prefer_ipv4|ipv4_only)
+            if ! { ip -4 addr show scope global 2>/dev/null | grep -q 'inet '; }; then
+                _error "本机没有 IPv4 地址, 选 IPv4 档位会让直连全部失败 —— 已取消"
+                _pause_anykey; return 1
+            fi ;;
+    esac
+    local bak="${MAIN_CONFIG_FILE}.fam_bak"
+    cp -af "$MAIN_CONFIG_FILE" "$bak" 2>/dev/null || return 1
+    _state_lock_acquire || { rm -f "$bak"; return 1; }
+    local rc=0
+    if _atomic_modify_json "$MAIN_CONFIG_FILE" '
+        .outbounds = ((.outbounds // []) | map(
+            if ((.tag? // "") == "direct")
+            then (if $ds == "" then del(.domain_strategy) else . + {domain_strategy: $ds} end)
+            else . end))
+    ' --arg ds "$ds"; then :; else _error "写入失败, 配置未改动"; rc=1; fi
+    _state_lock_release
+
+    if [ "$rc" -eq 0 ]; then
+        if _restart_checked; then
+            if [ -z "$ds" ]; then
+                _success "直连已恢复「双栈默认」"
+            else
+                _success "直连地址族已设为 ${ds}"
+            fi
+            _info "只影响直连流量; 走落地/节点的流量不受影响。"
+        else
+            mv -f "$bak" "$MAIN_CONFIG_FILE" 2>/dev/null
+            _manage_service restart >/dev/null 2>&1 || true
+            _error "sing-box 不接受该设置或校验失败, 已回滚"
+        fi
+    fi
+    rm -f "$bak"
+    _pause_anykey
+}
+
+_direct_fam_menu() {
+    while true; do
+        clear
+        local st disp
+        st=$(_direct_fam_state)
+        case "$st" in
+            "")          disp="${GREEN}双栈默认${NC} (推荐)" ;;
+            prefer_ipv4) disp="${GREEN}优先 IPv4${NC}" ;;
+            prefer_ipv6) disp="${GREEN}优先 IPv6${NC}" ;;
+            ipv4_only)   disp="${YELLOW}仅 IPv4${NC}" ;;
+            ipv6_only)   disp="${YELLOW}仅 IPv6${NC}" ;;
+            *)           disp="${YELLOW}${st}${NC}" ;;
+        esac
+        echo -e "\n  ${CYAN}==== 本机直连 地址族 (IPv4 / IPv6) ====${NC}"
+        echo -e "  当前: ${disp}"
+        echo -e "  ${YELLOW}作用: 只影响「直连」流量(未命中规则/规则指向 direct 的), 不影响落地与节点。${NC}"
+        echo -e "  ${YELLOW}用途: v4 段被 Google 判中国区(送中)、v6 段干净时, 让直连走 IPv6。${NC}"
+        echo -e "  ${RED}风险: 选「仅 IPv6」时, 只有 A 记录的站点会全部打不开。${NC}"
+        echo ""
+        echo -e "    ${GREEN}[1]${NC} 双栈默认 (清除设置, 推荐)"
+        echo -e "    ${GREEN}[2]${NC} 优先 IPv4  (prefer_ipv4)"
+        echo -e "    ${GREEN}[3]${NC} 优先 IPv6  (prefer_ipv6)"
+        echo -e "    ${GREEN}[4]${NC} 仅 IPv4    (ipv4_only)"
+        echo -e "    ${GREEN}[5]${NC} 仅 IPv6    (ipv6_only)"
+        echo -e "    ${YELLOW}[9]${NC} 返回"
+        echo ""
+        local c
+        read -p "  请选择 [1-5/9]: " c
+        case "$c" in
+            1) _direct_fam_apply "" ;;
+            2) _direct_fam_apply prefer_ipv4 ;;
+            3) _direct_fam_apply prefer_ipv6 ;;
+            4) local _y; _warn "「仅 IPv4」会让纯 IPv6 站点不可达, 确认?"; read -p "  (y/N): " _y
+               [[ "$_y" =~ ^[Yy]$ ]] && _direct_fam_apply ipv4_only ;;
+            5) local _y2; _warn "「仅 IPv6」会让只有 A 记录的站点全部打不开, 确认?"; read -p "  (y/N): " _y2
+               [[ "$_y2" =~ ^[Yy]$ ]] && _direct_fam_apply ipv6_only ;;
+            9|"") return 0 ;;
+            *) _error "无效输入"; sleep 1 ;;
+        esac
+    done
+}
+
 _ipfam_state() {
     [ -s "$RELAY_CONFIG_FILE" ] || return 0
     jq -r '[.outbounds[]? | select((.tag? // "") | startswith("relay-out-")) | .domain_strategy // empty]
@@ -5010,6 +5109,18 @@ _menu() {
         else
             echo -e "    ${GREEN}[U]${NC} UDP 转发 ${YELLOW}已关闭${NC} (NAT 小鸡禁 UDP 时打开)"
         fi
+        # SX: 本机直连地址族 (作用于 config.json 的 direct 出站)
+        local _df_st _df_disp
+        _df_st=$(_direct_fam_state)
+        case "$_df_st" in
+            "")          _df_disp="${GREEN}双栈默认${NC}" ;;
+            prefer_ipv4) _df_disp="${GREEN}优先 IPv4${NC}" ;;
+            prefer_ipv6) _df_disp="${GREEN}优先 IPv6${NC}" ;;
+            ipv4_only)   _df_disp="${YELLOW}仅 IPv4${NC}" ;;
+            ipv6_only)   _df_disp="${YELLOW}仅 IPv6${NC}" ;;
+            *)           _df_disp="${YELLOW}${_df_st}${NC}" ;;
+        esac
+        echo -e "    ${GREEN}[B]${NC} 本机直连地址族: ${_df_disp}   ${YELLOW}(治 v4 送中)${NC}"
         # SX: IPv4/IPv6 优先 (作用于全部落地出站)
         local _ipf_st _ipf_disp
         _ipf_st=$(_ipfam_state)
@@ -5055,6 +5166,7 @@ _menu() {
                fi ;;
             9|W|w) _warp_menu ;;
             U|u) _udp_route_menu ;;
+            B|b) _direct_fam_menu ;;
             V|v) _ipfam_menu ;;
             10) _port_forward_menu ;;
             0) break ;;
