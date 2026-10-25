@@ -2132,9 +2132,18 @@ _relay_list_landing_rows() {
         fi
         # SX: 没有元数据时不吞掉身份 —— 直接显示 outbound tag, 便于和日志/规则对上号
         [ -n "$node_name" ] || node_name="${ot} (无名称记录)"
-        mdisp="全局兜底"
-        [ "$mode" == "ai-split" ] && mdisp="解锁AI (geosite三件套)"
-        [ "$mode" == "custom-split" ] && mdisp="自定义规则集 (${rst})"
+        # SX: 模式显示以「规则里到底有没有 rule_set」为准 —— 旧版只看 relay_links.json 的
+        #     relay_mode 字段, 该字段和真实规则可能不一致 (先设全局兜底再改规则集 / 元数据缺失),
+        #     会显示成"全局兜底"从而误导排查。
+        if [ -n "$rst" ]; then
+            if [ "$mode" == "ai-split" ]; then
+                mdisp="解锁AI (geosite三件套)"
+            else
+                mdisp="自定义规则集 (${rst})"
+            fi
+        else
+            mdisp="全局兜底"
+        fi
         [ -z "$in_tag" ] && mdisp="未对接 (在[R-1]绑定入口)"
         echo "$ot|$node_name|$land|$mdisp"
     done

@@ -22,9 +22,9 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
-#     1.7: 修复主菜单 [8] 查看运行状态"打不开" (打印完立刻 return, 被下一轮 clear 擦掉) -> 加停留`n#     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则`n#     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
+#     1.8: [4] 落地模式改为按规则里的 rule_set 判定 (旧版读 relay_links.json 的 relay_mode, 会误报"全局兜底")`n#     1.7: 修复主菜单 [8] 查看运行状态"打不开" (打印完立刻 return, 被下一轮 clear 擦掉) -> 加停留`n#     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则`n#     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.7"
+export SCRIPT_VERSION="1.8"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
