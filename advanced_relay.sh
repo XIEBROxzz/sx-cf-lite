@@ -4860,6 +4860,19 @@ _ipfam_state() {
 
 _ipfam_apply() {
     local ds="$1"
+    # SX: 选 IPv6 档位但本机没有全局 IPv6 → 会连不上落地(整条链路断流), 直接拦下
+    case "$ds" in
+        prefer_ipv6|ipv6_only)
+            if ! { ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; }; then
+                _error "本机没有全局 IPv6 地址, 选 IPv6 档位会连不上落地 —— 已取消"
+                _pause_anykey; return 1
+            fi ;;
+        prefer_ipv4|ipv4_only)
+            if ! { ip -4 addr show scope global 2>/dev/null | grep -q 'inet '; }; then
+                _error "本机没有 IPv4 地址, 选 IPv4 档位会连不上落地 —— 已取消"
+                _pause_anykey; return 1
+            fi ;;
+    esac
     local bak="${RELAY_CONFIG_FILE}.ipfambak"
     cp -af "$RELAY_CONFIG_FILE" "$bak" 2>/dev/null || return 1
     _state_lock_acquire || { rm -f "$bak"; return 1; }
@@ -4901,9 +4914,9 @@ _ipfam_menu() {
         st=$(_ipfam_state)
         echo -e "\n  ${CYAN}==== IPv4 / IPv6 优先 (作用于全部落地) ====${NC}"
         echo -e "  当前: ${GREEN}${st:-不干预}${NC}"
-        echo -e "  ${YELLOW}作用: 让中转机先按指定地址族解析域名, 再连落地。${NC}"
-        echo -e "  ${YELLOW}场景: 落地只返回 AAAA(IPv6) 但 v6 出口不通时, 选「仅 IPv4」可绕开。${NC}"
-        echo -e "  ${YELLOW}注意: 设置后域名由中转机本地解析; 若中转机 DNS 被污染, 反而会更糟。${NC}"
+        echo -e "  ${YELLOW}作用: 决定中转机用哪一族地址去连【落地】(落地地址是域名时才相关)。${NC}"
+        echo -e "  ${YELLOW}场景: 落地地址有 AAAA 但中转没有 IPv6 时, 选「仅 IPv4」避免先撞 v6 而超时。${NC}"
+        echo -e "  ${YELLOW}警告: 中转没有 IPv6 却选 IPv6 档位 → 连不上落地, 整条链路断流。${NC}"
         echo ""
         echo -e "    ${GREEN}[1]${NC} 不干预 (默认, 交给落地解析)"
         echo -e "    ${GREEN}[2]${NC} 优先 IPv4  (prefer_ipv4)"
