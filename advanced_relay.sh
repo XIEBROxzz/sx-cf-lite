@@ -1803,7 +1803,7 @@ _cleanup_pending_relay_assets() {
 # --- 通用：完成中转配置 (Inbound + Outbound写入) ---
 # 参数: $1=dest_type, $2=dest_addr, $3=dest_port, $4=outbound_json
 # SX: 扫描主配置中可复用的入口节点 (排除已挂中转规则的) —— 有同类节点直接挂规则复用
-# 用法: _list_reusable_inbounds [all] —— 无参=排除已挂中转规则的入口; all=返回全部入口 (R-1 扫描用)
+# 用法: _list_reusable_inbounds [all] —— 无参=排除已挂中转规则的入口; all=返回全部入口 ([8]→[1] 扫描用)
 _list_reusable_inbounds() {
     local _scan_all="${1:-}"
     [ -s "$MAIN_CONFIG_FILE" ] || [ -s "/usr/local/etc/sing-box-cf/config.json" ] || return 0
@@ -1860,7 +1860,7 @@ _list_reusable_inbounds() {
     return 0
 }
 
-# --- 1. 完成落地导入 (仅出站+元数据; 不建入口不对接, 统一在 [R-1] 绑定) ---
+# --- 1. 完成落地导入 (仅出站+元数据; 不建入口不对接, 统一在 [8]→[1] 绑定) ---
 # 参数: $1=dest_type, $2=dest_addr, $3=dest_port, $4=outbound_json, $5=默认名(链接#片段识别名, 可空)
 _finalize_relay_setup() {
     local dest_type="$1"
@@ -1957,7 +1957,7 @@ _finalize_relay_setup() {
     echo -e "  落地名称: ${GREEN}$node_name${NC}"
     echo -e "  落地编号: ${CYAN}$out_tag${NC}"
     echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
-    echo -e "  对接状态: ${YELLOW}未对接 —— 入口对接请在 [R] 中转分流管理 → [1] 设置中转节点 (扫描入口, 多选落地)${NC}"
+    echo -e "  对接状态: ${YELLOW}未对接 —— 入口对接请在 [8] 中转分流管理 → [1] 设置中转节点 (扫描入口, 多选落地)${NC}"
     echo ""
     # SX: 单次添加 —— 加完按任意键回菜单, 想继续加再进 [2]/[3] 走一遍新的添加流程
     _pause_anykey
@@ -2088,7 +2088,7 @@ _view_relays() {
         [ -n "$_disp" ] || _disp="(未对接落地)"
         echo -e "    ${YELLOW}${in_t}${NC} → ${GREEN}${_disp}${NC}"
     done < <(jq -r '[.route.rules[]? | ((.inbound? // []) | if type == "array" then .[0] else . end)] | unique | .[]' "$RELAY_CONFIG_FILE" 2>/dev/null)
-    [ "$any" == "0" ] && echo -e "    ${YELLOW}暂无对接 —— 进 [R-1] 选入口多选落地${NC}"
+    [ "$any" == "0" ] && echo -e "    ${YELLOW}暂无对接 —— 进 [8]→[1] 选入口多选落地${NC}"
 
     echo ""
     read -p "  按回车键继续..."
@@ -2144,7 +2144,7 @@ _relay_list_landing_rows() {
         else
             mdisp="全局兜底"
         fi
-        [ -z "$in_tag" ] && mdisp="未对接 (在[R-1]绑定入口)"
+        [ -z "$in_tag" ] && mdisp="未对接 (在[8]→[1]绑定入口)"
         echo "$ot|$node_name|$land|$mdisp"
     done
 }
@@ -2166,7 +2166,7 @@ _relay_node_manage() {
     esac
 }
 
-# [R-1] 设置中转节点: 扫描本机入口 → 选一个 → 多选落地 (如 "1 3") 生成对接规则; 无规则时自动生成全量对接
+# [8]→[1] 设置中转节点: 扫描本机入口 → 选一个 → 多选落地 (如 "1 3") 生成对接规则; 无规则时自动生成全量对接
 _relay_bind_landing() {
     [ -f "$RELAY_CONFIG_FILE" ] || { _error "配置文件不存在。"; return; }
     local scan_rows
@@ -2301,7 +2301,7 @@ _relay_landing_rule() {
     local in_tag
     in_tag=$(jq -r --arg ot "$ot" 'first(.route.rules[]? | select(.outbound? == $ot) | .inbound[]?) // empty' "$RELAY_CONFIG_FILE" 2>/dev/null)
     if [ -z "$in_tag" ]; then
-        _warn "该落地尚未绑定入口, 请先在 [R-1] 设置中转节点中勾选它"
+        _warn "该落地尚未绑定入口, 请先在 [8]→[1] 设置中转节点中勾选它"
         read -p "  按回车键继续..."
         return
     fi
@@ -2608,7 +2608,7 @@ _relay_report_residue_ports() {
     printf '%s\n' " ${YELLOW}⚠ 端口${_still}仍被监听 (老进程未退?), 新建请换端口或先重启服务${NC}"
 }
 
-# --- 4d. 解除入口对接 (仅删除该入口的转发规则; 入口节点与落地都保留, 可随时在 [R-1] 重新对接) ---
+# --- 4d. 解除入口对接 (仅删除该入口的转发规则; 入口节点与落地都保留, 可随时在 [8]→[1] 重新对接) ---
 _delete_forward() {
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     [ -f "$CONFIG_FILE" ] || { _error "配置文件不存在。"; return; }
@@ -2665,7 +2665,7 @@ _delete_forward() {
     _txn_cleanup "$txn_dir"
     _state_lock_release
     _log_operation "UNBIND_ENTRY" "In: $sel_in"
-    _success "已解除入口 ${sel_in} 的全部对接 (入口与落地均保留, 可在 [R-1] 重新对接)"
+    _success "已解除入口 ${sel_in} 的全部对接 (入口与落地均保留, 可在 [8]→[1] 重新对接)"
 }
 
 # --- 5. 修改中转路由端口 (功能恢复) ---
@@ -2819,7 +2819,7 @@ _modify_relay_port() {
 }
 
 
-# --- 4c. 删除落地节点 (删除出站与其全部分流规则; 入口保留, 可在 [R] 重新对接) ---
+# --- 4c. 删除落地节点 (删除出站与其全部分流规则; 入口保留, 可在 [8] 重新对接) ---
 _delete_landing() {
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     [ -f "$CONFIG_FILE" ] || { _error "配置文件不存在。"; return; }
@@ -2847,7 +2847,7 @@ _delete_landing() {
     fi
     IFS='|' read -r ot nn land mdisp <<< "${rows[$((choice-1))]}"
     _warn "即将删除落地 ${nn} (${land}); 其全部分流规则一并移除。"
-    _info "中转入口本身保留, 之后可在 [R] 中转分流管理里重新对接别的落地。"
+    _info "中转入口本身保留, 之后可在 [8] 中转分流管理里重新对接别的落地。"
     read -p "  确认删除? (y/N): " yn
     [[ "$yn" =~ ^[Yy]$ ]] || return
 
@@ -4839,17 +4839,17 @@ _udp_route_menu() {
         echo -e "    ${GREEN}[1]${NC} 只把 DNS(UDP 53) 交给落地   ${YELLOW}(推荐, 最省)${NC}"
         echo -e "    ${GREEN}[2]${NC} 全部 UDP 交给落地           ${YELLOW}(含 QUIC/游戏)${NC}"
         echo -e "    ${GREEN}[3]${NC} 换落地 (档位不变: 只 DNS 就还是只 DNS)"
-        echo -e "    ${RED}[0]${NC} 关闭 (删除该规则, UDP 回直连)"
-        echo -e "    ${YELLOW}[9]${NC} 返回"
+        echo -e "    ${RED}[4]${NC} 关闭 (删除该规则, UDP 回直连)"
+        echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local c
-        read -p "  请选择 [0-3/9]: " c
+        read -p "  请选择 [0-4]: " c
         case "$c" in
             1) _udp_route_apply 53 ;;
             2) _udp_route_apply all ;;
             3) _udp_route_apply keep_port ;;
-            0) _udp_route_off ;;
-            9|"") return 0 ;;
+            4) _udp_route_off ;;
+            0|"") return 0 ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
     done
@@ -4949,10 +4949,10 @@ _direct_fam_menu() {
         echo -e "    ${GREEN}[3]${NC} 优先 IPv6  (prefer_ipv6)"
         echo -e "    ${GREEN}[4]${NC} 仅 IPv4    (ipv4_only)"
         echo -e "    ${GREEN}[5]${NC} 仅 IPv6    (ipv6_only)"
-        echo -e "    ${YELLOW}[9]${NC} 返回"
+        echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local c
-        read -p "  请选择 [1-5/9]: " c
+        read -p "  请选择 [0-5]: " c
         case "$c" in
             1) _direct_fam_apply "" ;;
             2) _direct_fam_apply prefer_ipv4 ;;
@@ -4961,7 +4961,7 @@ _direct_fam_menu() {
                [[ "$_y" =~ ^[Yy]$ ]] && _direct_fam_apply ipv4_only ;;
             5) local _y2; _warn "「仅 IPv6」会让只有 A 记录的站点全部打不开, 确认?"; read -p "  (y/N): " _y2
                [[ "$_y2" =~ ^[Yy]$ ]] && _direct_fam_apply ipv6_only ;;
-            9|"") return 0 ;;
+            0|"") return 0 ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
     done
@@ -5050,17 +5050,17 @@ _ipfam_menu() {
         echo -e "    ${GREEN}[3]${NC} 优先 IPv6  (prefer_ipv6)"
         echo -e "    ${GREEN}[4]${NC} 仅 IPv4    (ipv4_only)"
         echo -e "    ${GREEN}[5]${NC} 仅 IPv6    (ipv6_only)"
-        echo -e "    ${YELLOW}[9]${NC} 返回"
+        echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local c
-        read -p "  请选择 [1-5/9]: " c
+        read -p "  请选择 [0-5]: " c
         case "$c" in
             1) _ipfam_apply "" ;;
             2) _ipfam_apply prefer_ipv4 ;;
             3) _ipfam_apply prefer_ipv6 ;;
             4) _ipfam_apply ipv4_only ;;
             5) _ipfam_apply ipv6_only ;;
-            9|"") return 0 ;;
+            0|"") return 0 ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
     done
