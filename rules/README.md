@@ -19,6 +19,12 @@ https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing.json
 https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing-v2.json
 ```
 
+```
+https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/warp.json
+```
+
+> `rules/warp.json` 是 **WARP 专用**（89 域名 = 上面两份的并集，去掉探针）：只在 `[9] WARP 出站管理 → [2] → [2] 自定义规则` 里用，回车即默认。不要拿它给落地绑，也不要拿 `landing.json` 给 WARP 用（tag 会撞名）。
+
 ## 改完怎么一眼看出生效
 
 **landing.json（日常落地）**
