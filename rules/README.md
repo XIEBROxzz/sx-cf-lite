@@ -2,10 +2,12 @@
 
 两份，**互不重叠**，各绑一个落地：
 
-- **`landing.json`（46 条）** — 日常：YouTube 整站 + Google 搜索 + Google Play（含 APK 下载 CDN）+ 登录/静态资源 + Gemini。建议绑**距离近**的落地。
-- **`landing-v2.json`（40 条）** — 只放对 IP 要求高的 AI：ChatGPT / Claude / Grok / Perplexity / Poe / Character / Copilot + NotebookLM / Labs / Jules / Flow / Opal / Antigravity / Stitch / DeepMind。建议绑**AI 解锁**用的落地。
+- **`landing.json`（46 域名 + 148 IP 段）** — 日常：YouTube 整站 + Google 搜索 + Google Play（含 APK 下载）+ 登录/静态资源 + Gemini。建议绑**距离近**的落地。
+- **`landing-v2.json`（40 域名）** — 只放对 IP 要求高的 AI：ChatGPT / Claude / Grok / Perplexity / Poe / Character / Copilot + NotebookLM / Labs / Jules / Flow / Opal / Antigravity / Stitch / DeepMind。建议绑**AI 解锁**用的落地。
 
 > 为什么不把 Play 拆出去：Play 的授权、checkin、下载 CDN 若分属两个出口 IP，会一直卡在「等待中」。Google 全家桶放同一个落地最稳。
+>
+> landing.json 里除了域名，还有第二组规则 `ip_cidr`：**Google 官方 IP 段**（取自上 https://www.gstatic.com/ipranges/goog.json ，148 条）。Play 的真实取包经常是 **302 到 IP 直连**，域名规则抓不到，这一组能把它们兜住 —— 所以**不需要开"全局兜底"**，其余流量照旧直连。
 
 ## 一键复制
 
@@ -46,7 +48,7 @@ https://chatgpt.com/cdn-cgi/trace
 
 ## 改动后生效
 
-规则集是运行时按 URL 拉取的：推送后**重启服务**即可（面板 `[6]` 或 `systemctl restart sing-box`），不用重新绑定。数条目可确认版本：`landing.json` = 46、`landing-v2.json` = 40。
+规则集是运行时按 URL 拉取的：推送后**重启服务**即可（面板 `[6]` 或 `systemctl restart sing-box`），不用重新绑定。数条目可确认版本：`landing.json` = 46 域名 + 148 IP 段、`landing-v2.json` = 40 域名。
 
 看某条请求实际走哪：
 
