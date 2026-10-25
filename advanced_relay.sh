@@ -102,8 +102,8 @@ STATE_LOCK_OWNED="false"
 # └─────────────────────────────────────────────────────────────────────────┘
 RELAY_RULES_NORMALIZE_FLT='
 .route.rules as $r
-| ([$r[] | select((.outbound? // "") | startswith("relay-out-")) | (.inbound? // [])[]] | unique) as $rins
-| ([$r[] | select((.outbound? // "") | startswith("relay-out-")) | select(((.rule_set? // []) | length) == 0) | (.inbound? // [])[]] | unique) as $catchins
+| ([$r[] | select((.outbound? // "") | startswith("relay-out-")) | select((.network? // "") != "udp") | (.inbound? // [])[]] | unique) as $rins
+| ([$r[] | select((.outbound? // "") | startswith("relay-out-")) | select((.network? // "") != "udp") | select(((.rule_set? // []) | length) == 0) | (.inbound? // [])[]] | unique) as $catchins
 | ([$r[] | select(.outbound? == "warp-out")] | length > 0) as $warp
 | (if $warp then [$rins[] | select(. as $i | ($catchins | index($i)) == null)] else [] end) as $need
 | ([$r[] | select(((.outbound? // "") == "direct"
@@ -2122,8 +2122,10 @@ _relay_list_landing_rows() {
     local out_tags ot in_tag node_name land mode rst mdisp
     out_tags=$(jq -r '[.outbounds[]? | select((.tag // "") | startswith("relay-out-")) | .tag] | join(" ")' "$RELAY_CONFIG_FILE" 2>/dev/null)
     for ot in $out_tags; do
-        in_tag=$(jq -r --arg ot "$ot" 'first(.route.rules[]? | select(.outbound? == $ot) | .inbound[]?) // empty' "$RELAY_CONFIG_FILE" 2>/dev/null)
-        rst=$(jq -r --arg ot "$ot" '[.route.rules[]? | select(.outbound? == $ot) | .rule_set[]?] | unique | join(",")' "$RELAY_CONFIG_FILE" 2>/dev/null)
+        # SX: 忽略 UDP 转发规则 (network=udp) —— 它只是"把某个端口的 UDP 交给这个落地",
+        #     不代表这个落地被"对接"或设置了分流, 否则 [4] 会误判成已对接/全局兜底。
+        in_tag=$(jq -r --arg ot "$ot" 'first(.route.rules[]? | select((.outbound? == $ot) and ((.network? // "") != "udp")) | .inbound[]?) // empty' "$RELAY_CONFIG_FILE" 2>/dev/null)
+        rst=$(jq -r --arg ot "$ot" '[.route.rules[]? | select((.outbound? == $ot) and ((.network? // "") != "udp")) | .rule_set[]?] | unique | join(",")' "$RELAY_CONFIG_FILE" 2>/dev/null)
         node_name=""; land="未知地址"; mode="all"
         if [ -s "${RELAY_AUX_DIR}/relay_links.json" ]; then
             node_name=$(jq -r --arg t "$ot" '.[$t].node_name // empty' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
@@ -4674,6 +4676,141 @@ _warp_menu() {
     done
 }
 
+# ============================================================
+# SX: UDP 转发开关 —— 中转机(NAT 小鸡)禁用 UDP 时, 直连的 UDP(DNS/QUIC) 发不出去,
+#     表现是"能连上但空转"。开启后把 UDP 交给落地: VLESS 的 UDP 封装在 TCP 隧道里传,
+#     不需要中转机自己有原生 UDP, 由落地发真正的 UDP。
+#     规则形态: {"inbound":[...], "network":"udp", ["port":53], "outbound":"relay-out-xxxx"}
+#     · 只 DNS(UDP 53) → 最省, 解决"解析不出来"
+#     · 全部 UDP      → 连 QUIC 一起交给落地
+# ============================================================
+_udp_route_state() {
+    [ -s "$RELAY_CONFIG_FILE" ] || return 0
+    jq -r '[.route.rules[]?
+            | select(((.network? // "") == "udp") and (((.outbound? // "") | startswith("relay-out-"))))]
+           | if length == 0 then "" else "\(.[0].outbound)|\(.[0].port // 0)" end' \
+        "$RELAY_CONFIG_FILE" 2>/dev/null
+}
+
+_udp_pick_landing() {
+    local i=0 tags=() t n
+    while IFS='|' read -r t n; do
+        [ -z "$t" ] && continue
+        i=$((i+1)); tags+=("$t")
+        echo -e "    ${GREEN}[$i]${NC} ${YELLOW}${n}${NC}" >&2
+    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.node_name // .key)"' \
+                "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
+    [ "$i" -gt 0 ] || return 1
+    echo "" >&2
+    local pick
+    read -p "  选择 UDP 交给哪个落地 [1-$i] (0=取消): " pick >&2
+    [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "$i" ] || return 1
+    printf '%s' "${tags[$((pick-1))]}"
+}
+
+_udp_route_apply() {
+    local mode="$1"   # 53 | all | keep_port
+    local tag port=0
+    tag=$(_udp_route_state); port="${tag##*|}"; tag="${tag%%|*}"
+    if [ "$mode" = "all" ]; then
+        port=0
+    elif [ "$mode" = "keep_port" ] && [ -n "$tag" ]; then
+        :   # 保留原端口设置
+    else
+        port=53
+    fi
+    if [ -z "$tag" ]; then
+        tag=$(_udp_pick_landing) || { _warn "已取消"; _pause_anykey; return 1; }
+    fi
+    [ -n "$tag" ] || { _warn "已取消"; _pause_anykey; return 1; }
+
+    local INS
+    INS=$(jq -c '[.inbounds[]?.tag] | map(select(. != null))' "$RELAY_CONFIG_FILE")
+    _state_lock_acquire || return 1
+    local rc=0
+    if _atomic_modify_json "$RELAY_CONFIG_FILE" "
+        .route.rules = (
+            ([ {inbound: \$ins, network: \"udp\", outbound: \$tag}
+               + (if \$port > 0 then {port: \$port} else {} end) ])
+            + [ (.route.rules // [])[] | select((.network? // \"\") != \"udp\") ]
+          )
+        | ${RELAY_RULES_NORMALIZE_FLT}
+    " --argjson ins "$INS" --arg tag "$tag" --argjson port "$port"; then
+
+        local nm
+        nm=$(jq -r --arg t "$tag" '.[$t].node_name // empty' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
+        if [ "$port" -gt 0 ]; then
+            _success "已开启: 只把 DNS(UDP 53) 交给 ${nm:-$tag}"
+        else
+            _success "已开启: 全部 UDP 交给 ${nm:-$tag}"
+        fi
+        _info "UDP 会封装进 TCP 隧道到落地, 不需要中转机自己有原生 UDP。"
+    else
+        _error "写入失败, 配置未改动"
+        rc=1
+    fi
+    _state_lock_release
+    if [ "$rc" -eq 0 ] && ! _restart_checked; then
+        _error "sing-box 校验/重启失败, 请检查配置后手动回滚: $RELAY_CONFIG_FILE"
+    fi
+    _pause_anykey
+}
+
+_udp_route_off() {
+    if [ -z "$(_udp_route_state)" ]; then
+        _info "当前本来就是关闭的"
+        _pause_anykey; return 0
+    fi
+    _state_lock_acquire || return 1
+    if _atomic_modify_json "$RELAY_CONFIG_FILE" '
+        .route.rules = [ (.route.rules // [])[] | select((.network? // "") != "udp") ]
+    '; then
+        _success "已关闭 UDP 转发 (UDP 恢复走直连)"
+    else
+        _error "写入失败"
+    fi
+    _state_lock_release
+    _restart_checked || _error "sing-box 校验/重启失败"
+    _pause_anykey
+}
+
+_udp_route_menu() {
+    while true; do
+        clear
+        local st tag port nm disp
+        st=$(_udp_route_state)
+        tag=""; port=""
+        if [ -n "$st" ]; then tag="${st%%|*}"; port="${st##*|}"; fi
+        echo -e "\n  ${CYAN}==== UDP 转发 (DNS / QUIC 交给落地) ====${NC}"
+        if [ -n "$tag" ]; then
+            nm=$(jq -r --arg t "$tag" '.[$t].node_name // empty' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
+            if [ "$port" = "0" ]; then disp="全部 UDP"; else disp="仅 UDP/${port}"; fi
+            echo -e "  当前: ${GREEN}已开启${NC} — ${disp} → ${YELLOW}${nm:-$tag}${NC}"
+        else
+            echo -e "  当前: ${YELLOW}关闭${NC}"
+        fi
+        echo -e "  ${YELLOW}用途: NAT 小鸡(禁用 UDP)时, 直连的 DNS/QUIC 发不出去会一直空转;${NC}"
+        echo -e "  ${YELLOW}      开启后 UDP 走 TCP 隧道到落地, 不依赖中转机的原生 UDP。${NC}"
+        echo ""
+        echo -e "    ${GREEN}[1]${NC} 只把 DNS(UDP 53) 交给落地   ${YELLOW}(推荐, 最省)${NC}"
+        echo -e "    ${GREEN}[2]${NC} 全部 UDP 交给落地           ${YELLOW}(含 QUIC/游戏)${NC}"
+        echo -e "    ${GREEN}[3]${NC} 只切换落地"
+        echo -e "    ${RED}[0]${NC} 关闭 (删除该规则, UDP 回直连)"
+        echo -e "    ${YELLOW}[9]${NC} 返回"
+        echo ""
+        local c
+        read -p "  请选择 [0-3/9]: " c
+        case "$c" in
+            1) _udp_route_apply 53 ;;
+            2) _udp_route_apply all ;;
+            3) _udp_route_apply keep_port ;;
+            0) _udp_route_off ;;
+            9|"") return 0 ;;
+            *) _error "无效输入"; sleep 1 ;;
+        esac
+    done
+}
+
 _menu() {
     _check_root || return 1
     _check_deps || return 1
@@ -4736,6 +4873,15 @@ _menu() {
         echo ""
         echo -e "  ${CYAN}【出口优化】${NC}"
         echo -e "    ${GREEN}[9]${NC} WARP 出站管理 (Cloudflare 免费出口)"
+        # SX: UDP 转发开关 —— NAT 小鸡禁用 UDP 时, 把 DNS/QUIC 交给落地(走 TCP 隧道)
+        local _udp_st _udp_disp
+        _udp_st=$(_udp_route_state)
+        if [ -n "$_udp_st" ]; then
+            if [ "${_udp_st##*|}" = "0" ]; then _udp_disp="全部 UDP"; else _udp_disp="UDP/${_udp_st##*|}"; fi
+            echo -e "    ${GREEN}[U]${NC} UDP 转发 ${GREEN}已开启${NC} (${_udp_disp} → $(jq -r --arg t "${_udp_st%%|*}" '.[$t].node_name // $t' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null))"
+        else
+            echo -e "    ${GREEN}[U]${NC} UDP 转发 ${YELLOW}已关闭${NC} (NAT 小鸡禁 UDP 时打开)"
+        fi
         # SX: 两套规则同时开启时给一句口径说明 —— 规范化后落地永远优先, WARP 只兜主节点
         local _warp_on _nland
         _warp_on=$(jq -r '[.route.rules[]? | select(.outbound? == "warp-out")] | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
@@ -4750,7 +4896,7 @@ _menu() {
         echo -e "  ─────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-10 或 R]: " choice
+        read -p "  请输入选项 [0-10 或 R/U]: " choice
         case $choice in
             1) _landing_config ;;
             # SX: 每次进入只添加一个 —— 不再套 while 循环连续追问, 加完停留一次即回菜单
@@ -4768,6 +4914,7 @@ _menu() {
                    _pause_relay
                fi ;;
             9|W|w) _warp_menu ;;
+            U|u) _udp_route_menu ;;
             10) _port_forward_menu ;;
             0) break ;;
             *) _error "无效输入"; sleep 1 ;;
