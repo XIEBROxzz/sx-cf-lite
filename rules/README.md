@@ -3,7 +3,7 @@
 两份，**互不重叠**，各绑一个落地：
 
 - **`landing.json`（34 域名）** — 走**距离近**的落地。YouTube 整站、Google 搜索、Gemini，以及一个探针域名 `ipinfo.io`。
-- **`landing-v2.json`（52 域名 + 148 IP 段）** — 走**下载/AI 落地**。ChatGPT / Claude / Grok / Perplexity / Poe / Character / Copilot + NotebookLM / Labs / Jules / Flow / Opal / Antigravity / Stitch / DeepMind，再加 **Google Play 全套**（`play.*`、`android.clients.google.com`、`gvt1/2/3.com`、`dl.google.com`、`ggpht.com`）与 `accounts.google.com`、`gstatic.com`。
+- **`landing-v2.json`（54 域名 + 148 IP 段）** — 走**下载/AI 落地**。ChatGPT / Claude / Grok / Perplexity / Poe / Character / Copilot + NotebookLM / Labs / Jules / Flow / Opal / Antigravity / Stitch / DeepMind，再加 **Google Play 全套**（`play.*`、`android.clients.google.com`、`gvt1/2/3.com`、`dl.google.com`、`ggpht.com`、`android.googleapis.com`、`1e100.net`）与 `accounts.google.com`、`gstatic.com`。
 
 > 为什么 Play 跟 v2 走：Play 的授权、checkin、下载 CDN 必须**同一个出口 IP**，否则会卡在「等待中/空转」。域名之外还带一组 `ip_cidr`（Google 官方 148 条前缀，取自 https://www.gstatic.com/ipranges/goog.json ），因为取包经常 302 到 **IP 直连**，域名规则抓不到。
 >
@@ -53,7 +53,7 @@ https://chatgpt.com/cdn-cgi/trace
 curl -s https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing.json \
   | jq '{域名:(.rules[0].domain_suffix|length)}'          # 34
 curl -s https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing-v2.json \
-  | jq '{域名:(.rules[0].domain_suffix|length), IP段:(.rules[1].ip_cidr|length)}'   # 52 / 148
+  | jq '{域名:(.rules[0].domain_suffix|length), IP段:(.rules[1].ip_cidr|length)}'   # 54 / 148
 ```
 
 > raw 有几分钟 CDN 缓存，刚推送时可能还是旧版，等一会儿再重启。
