@@ -114,12 +114,13 @@ RELAY_RULES_NORMALIZE_FLT='
 | .route.rules = ($all | to_entries
     | map({i: .key, r: .value, p: (
         (.value) as $x
-        | if (($x.action? // "") == "sniff") then 0
-          elif (((($x.outbound? // "") | startswith("relay-out-")) and (((($x.rule_set? // []) | length)) > 0))) then 1
-          elif (($x.outbound? // "") | startswith("relay-out-")) then 2
-          elif ((($x.outbound? // "") == "direct") and ((($x.inbound? // []) | length) > 0)) then 3
-          elif (($x.outbound? // "") == "warp-out") then 4
-          else 5 end)})
+        | if (($x.action? // "") == "reject") then 0
+          elif (($x.action? // "") == "sniff") then 1
+          elif (((($x.outbound? // "") | startswith("relay-out-")) and (((($x.rule_set? // []) | length)) > 0))) then 2
+          elif (($x.outbound? // "") | startswith("relay-out-")) then 3
+          elif ((($x.outbound? // "") == "direct") and ((($x.inbound? // []) | length) > 0)) then 4
+          elif (($x.outbound? // "") == "warp-out") then 5
+          else 6 end)})
     | sort_by([.p, .i]) | map(.r))
 '
 
@@ -2242,7 +2243,7 @@ _relay_bind_landing() {
         sleep 2; return 1
     fi
     local flt
-    flt='.route.rules = ([ (.route.rules // [])[] | select((((.inbound? // []) | if type == "array" then . else [.] end) | index("'"${sel_in}"'")) == null) ] + '"${sn_json}"' + '"${new_rules}"') | ([.route.rules[]? | .rule_set[]?] as $used | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as $t | ($used | index($t)) != null)))) | .route.final = "direct"'
+    flt='.route.rules = ([ (.route.rules // [])[] | select((((.inbound? // []) | if type == "array" then . else [.] end) | index("'"${sel_in}"'")) == null or (.action? // "") == "reject") ] + '"${sn_json}"' + '"${new_rules}"') | ([.route.rules[]? | .rule_set[]?] as $used | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as $t | ($used | index($t)) != null)))) | .route.final = "direct"'
     # SX: 绑定会把新规则追加到数组末尾 → 必须先规范化顺序, 否则 WARP 通配规则会排在落地前面
     flt="${flt} | ${RELAY_RULES_NORMALIZE_FLT}"
     if ! _atomic_modify_json "$RELAY_CONFIG_FILE" "$flt"; then failed="true"; fi
