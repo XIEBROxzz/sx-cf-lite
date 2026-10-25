@@ -572,8 +572,11 @@ _save_nftables_rules() {
 }
 
 # 原子修改 JSON (与主脚本 singbox.sh 保持一致，不静默吞掉 jq 错误)
+# SX: 支持追加 jq 参数 (如 --arg ot "$tag") —— 避免把变量拼进过滤器字符串时漏引号,
+#     那类拼接会把 relay-out-1234 变成 jq 裸词, 报 "relay/0 is not defined"。
 _atomic_modify_json() {
     local file="$1" filter="$2"
+    shift 2
     [ ! -f "$file" ] && return 1
     local acquired="false" tmp rc=0
     if [ "${SINGBOXLITE_LOCK_HELD:-0}" != "1" ]; then
@@ -581,7 +584,7 @@ _atomic_modify_json() {
         acquired="true"
     fi
     tmp=$(_make_same_dir_tmp "$file") || rc=1
-    if [ "$rc" -eq 0 ] && jq "$filter" "$file" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$file"; then
+    if [ "$rc" -eq 0 ] && jq "$@" "$filter" "$file" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$file"; then
         :
     else
         _error "修改JSON失败: $file"
@@ -644,7 +647,17 @@ _check_combined_config() {
         sleep 2   # SX: 报错停留, 免被菜单 clear 瞬间擦掉
         return 1
     fi
-    "$SINGBOX_BIN" check -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" >/dev/null
+    # SX: 旧版直接 >/dev/null, 校验失败时只剩一句"删除失败", 无从排查 —— 把 sing-box 的原话打出来
+    local _chk_out
+    if ! _chk_out=$("$SINGBOX_BIN" check -c "$MAIN_CONFIG_FILE" -c "$RELAY_CONFIG_FILE" 2>&1); then
+        _error "sing-box 组合校验未通过:"
+        printf '%s\n' "$_chk_out" | head -n 6 | while IFS= read -r _l; do
+            [ -n "$_l" ] && _error "  ${_l}"
+        done
+        sleep 3
+        return 1
+    fi
+    return 0
 }
 
 # SX: 丢弃 stdin 中的粘贴残留 —— 剪贴板尾部多带的空行/文本会让后续交互的 read
@@ -2029,12 +2042,20 @@ _view_relays() {
 
     echo ""
     echo -e "  ${CYAN}【入口对接关系】${NC}"
-    local in_t outs any="0"
+    local in_t outs any="0" _disp
     while read -r in_t; do
         [ -z "$in_t" ] && continue
         any="1"
-        outs=$(jq -r --arg t "$in_t" '[.route.rules[]? | select((((.inbound? // []) | if type == "array" then . else [.] end) | index($t)) != null) | .outbound] | join(", ")' "$RELAY_CONFIG_FILE" 2>/dev/null)
-        echo -e "    ${YELLOW}${in_t}${NC} → ${outs}"
+        # SX: 只取真正带 outbound 的规则 —— sniff 动作规则没有出站, 旧版把空串拼进列表,
+        #     显示成 "vless-in-31000 → , relay-out-8675" 这种开头的空项
+        outs=$(jq -r --arg t "$in_t" '
+            [ .route.rules[]?
+              | select((((.inbound? // []) | if type == "array" then . else [.] end) | index($t)) != null)
+              | select((.outbound? // "") != "")
+              | .outbound ] | unique | .[]' "$RELAY_CONFIG_FILE" 2>/dev/null)
+        _disp=$(_relay_out_names "$outs")
+        [ -n "$_disp" ] || _disp="(未对接落地)"
+        echo -e "    ${YELLOW}${in_t}${NC} → ${GREEN}${_disp}${NC}"
     done < <(jq -r '[.route.rules[]? | ((.inbound? // []) | if type == "array" then .[0] else . end)] | unique | .[]' "$RELAY_CONFIG_FILE" 2>/dev/null)
     [ "$any" == "0" ] && echo -e "    ${YELLOW}暂无对接 —— 进 [R-1] 选入口多选落地${NC}"
 
@@ -2050,18 +2071,34 @@ _view_relays() {
 #   (sing-box 按数组顺序匹配, 首条命中即生效; 全局兜底没有 rule_set, 会吞掉入口所有未命中流量)
 
 # 输出落地行: out_tag|节点名|落地地址|模式显示
+# SX: 出站 tag 列表 → 落地自定义名 (relay_links.json 的 node_name), 没名字才回退 tag
+#     入参可以是空格/换行分隔的 tag 串; 输出用 ", " 连接, 供各菜单显示"入口 → 落地名"
+_relay_out_names() {
+    local tags="$1" one nm out="" _links="${RELAY_AUX_DIR}/relay_links.json"
+    for one in $tags; do
+        [ -n "$one" ] || continue
+        nm=""
+        [ -s "$_links" ] && nm=$(jq -r --arg t "$one" '.[$t].node_name // empty' "$_links" 2>/dev/null)
+        [ -n "$nm" ] || nm="$one"
+        out="${out}${out:+, }${nm}"
+    done
+    printf '%s' "$out"
+}
+
 _relay_list_landing_rows() {
     local out_tags ot in_tag node_name land mode rst mdisp
     out_tags=$(jq -r '[.outbounds[]? | select((.tag // "") | startswith("relay-out-")) | .tag] | join(" ")' "$RELAY_CONFIG_FILE" 2>/dev/null)
     for ot in $out_tags; do
         in_tag=$(jq -r --arg ot "$ot" 'first(.route.rules[]? | select(.outbound? == $ot) | .inbound[]?) // empty' "$RELAY_CONFIG_FILE" 2>/dev/null)
         rst=$(jq -r --arg ot "$ot" '[.route.rules[]? | select(.outbound? == $ot) | .rule_set[]?] | unique | join(",")' "$RELAY_CONFIG_FILE" 2>/dev/null)
-        node_name="未命名落地"; land="未知地址"; mode="all"
+        node_name=""; land="未知地址"; mode="all"
         if [ -s "${RELAY_AUX_DIR}/relay_links.json" ]; then
-            node_name=$(jq -r --arg t "$ot" '.[$t].node_name // "未命名落地"' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
+            node_name=$(jq -r --arg t "$ot" '.[$t].node_name // empty' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
             land=$(jq -r --arg t "$ot" '.[$t].landing_addr // "未知地址"' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
             mode=$(jq -r --arg t "$ot" '.[$t].relay_mode // "all"' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
         fi
+        # SX: 没有元数据时不吞掉身份 —— 直接显示 outbound tag, 便于和日志/规则对上号
+        [ -n "$node_name" ] || node_name="${ot} (无名称记录)"
         mdisp="全局兜底"
         [ "$mode" == "ai-split" ] && mdisp="解锁AI (geosite三件套)"
         [ "$mode" == "custom-split" ] && mdisp="自定义规则集 (${rst})"
@@ -2102,7 +2139,8 @@ _relay_bind_landing() {
     while IFS='|' read -r rt rty rpo rtr rnm; do
         [ -z "$rt" ] && continue
         i=$((i+1)); entries+=("$rt")
-        bound=$(jq -r --arg t "$rt" '[.route.rules[]? | select(((.inbound? // []) | index($t)) != null) | .outbound] | join(",")' "$RELAY_CONFIG_FILE" 2>/dev/null)
+        bound=$(jq -r --arg t "$rt" '[.route.rules[]? | select((((.inbound? // []) | if type == "array" then . else [.] end) | index($t)) != null) | select((.outbound? // "") != "") | .outbound] | unique | .[]' "$RELAY_CONFIG_FILE" 2>/dev/null)
+        bound=$(_relay_out_names "$bound")
         echo -e "    ${GREEN}[$i]${NC} ${YELLOW}${rnm}${NC} (${rty} :${rpo})${bound:+  ${CYAN}已对接: ${bound}${NC}}"
     done <<< "$scan_rows"
     _flush_pending_stdin
@@ -2540,8 +2578,9 @@ _delete_forward() {
     while read -r it; do
         [ -z "$it" ] && continue
         i=$((i+1)); entries+=("$it")
-        outs=$(jq -r --arg t "$it" '[.route.rules[]? | select((((.inbound? // []) | if type == "array" then . else [.] end) | index($t)) != null) | .outbound] | join(", ")' "$CONFIG_FILE" 2>/dev/null)
-        echo -e "    ${GREEN}[$i]${NC} ${YELLOW}${it}${NC} → ${outs}"
+        outs=$(jq -r --arg t "$it" '[.route.rules[]? | select((((.inbound? // []) | if type == "array" then . else [.] end) | index($t)) != null) | select((.outbound? // "") != "") | .outbound] | unique | .[]' "$CONFIG_FILE" 2>/dev/null)
+        outs=$(_relay_out_names "$outs")
+        echo -e "    ${GREEN}[$i]${NC} ${YELLOW}${it}${NC} → ${GREEN}${outs:-（未对接）}${NC}"
     done <<< "$in_tags"
     echo ""
     echo -e "    ${YELLOW}[0]${NC} 返回"
@@ -2767,30 +2806,41 @@ _delete_landing() {
     [[ "$yn" =~ ^[Yy]$ ]] || return
 
     local txn_dir failed="false"
+    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
-    if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE"; then
+    if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
+        || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE"; then
         _txn_cleanup "$txn_dir"; _state_lock_release
         _error "无法创建配置快照"
-        sleep 2; return 1
+        _pause_anykey; return 1
     fi
-    local flt
-    flt='.route.rules = ([ (.route.rules // [])[] | select((.outbound? // "") != '"${ot}"') ]) | .outbounds = ([ (.outbounds // [])[] | select((.tag? // "") != '"${ot}"') ]) | ([.route.rules[]? | .rule_set[]?] as $used | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as $t | ($used | index($t)) != null))))'
-    if ! _atomic_modify_json "$CONFIG_FILE" "$flt"; then failed="true"; fi
-    [ "$failed" != "true" ] && [ -f "${RELAY_AUX_DIR}/relay_links.json" ] && _atomic_modify_json "${RELAY_AUX_DIR}/relay_links.json" 'del(.["'"$ot"'"])' || true
+    # SX 修复 [5] 永远删不掉: 旧版是 flt='... != '"${ot}"'...' —— 少了一对引号,
+    # 拼出来的过滤器是 != relay-out-8675 (jq 裸词), 报 relay/0 is not defined,
+    # 于是每次都走 "删除失败, 已恢复原配置"。改用 jq --arg 传参, 不再手工拼字符串。
+    if ! _atomic_modify_json "$CONFIG_FILE" '
+        .route.rules = ([ (.route.rules // [])[] | select((.outbound? // "") != $ot) ])
+        | .outbounds = ([ (.outbounds // [])[] | select((.tag? // "") != $ot) ])
+        | ([.route.rules[]? | .rule_set[]?] as $used
+           | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as $t | ($used | index($t)) != null))))
+    ' --arg ot "$ot"; then failed="true"; fi
     if [ "$failed" = "true" ] || ! _restart_checked; then
         _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
+        _txn_restore_file "$txn_dir" links "$LINKS_FILE"
         _manage_service restart >/dev/null 2>&1 || true
         _txn_cleanup "$txn_dir"
         _state_lock_release
         _error "删除失败，已恢复原配置"
-        sleep 2
+        _pause_anykey
         return 1
     fi
+    # SX: 配置被服务接受后才删元数据 —— 旧版先删 links 再校验, 一旦回滚, 名字/地址就丢了
+    [ -f "$LINKS_FILE" ] && _atomic_modify_json "$LINKS_FILE" 'del(.[$ot])' --arg ot "$ot" >/dev/null 2>&1
     _txn_cleanup "$txn_dir"
     _state_lock_release
     _log_operation "DELETE_LANDING" "Out: $ot (${nn})"
     _success "已删除落地节点: ${nn} (${ot}); 入口与其余落地不受影响"
+    _pause_anykey
 }
 
 # ============================================================
