@@ -1,0 +1,30 @@
+{
+  "version": 3,
+  "rules": [
+    {
+      "domain_suffix": [
+        "openai.com",
+        "chatgpt.com",
+        "chatgpt.livekit.cloud",
+        "oaistatic.com",
+        "oaiusercontent.com",
+        "sora.com",
+        "auth0.com",
+        "anthropic.com",
+        "claude.ai",
+        "claudeusercontent.com",
+        "x.ai",
+        "grok.com",
+        "perplexity.ai",
+        "pplx.ai",
+        "poe.com",
+        "character.ai",
+        "copilot.microsoft.com",
+        "youtube.com",
+        "youtu.be",
+        "youtube-nocookie.com",
+        "gstatic.com"
+      ]
+    }
+  ]
+}
