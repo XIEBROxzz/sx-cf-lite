@@ -13,7 +13,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-# SX: 版本 1.4 —— CF-A 并入主 sing-box (cfa-* 入站, 配置地基见文件说明块);
+# SX: 版本 1.5 —— CF-A 并入主 sing-box (cfa-* 入站, 配置地基见文件说明块);
 #     [19] 优选订阅 vless 走无损参数模式逐节点出订阅; 菜单输出统一停留防闪回;
 #     1.1: CRLF 自动转 LF (advanced_relay.sh 曾以 CRLF 入库, Linux 下 bash -n 判语法错误 →
 #          [18] 进阶功能闪回主菜单、[13] 整组更新被拒绝); 菜单动作返回非 0 时强制停留一次
@@ -22,7 +22,9 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
-export SCRIPT_VERSION="1.4"
+#     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
+#          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
+export SCRIPT_VERSION="1.5"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"

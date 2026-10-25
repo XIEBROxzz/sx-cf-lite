@@ -91,6 +91,38 @@ SINGBOX_PID_FILE="${RUN_DIR}/sing-box.pid"
 STATE_LOCK_FD=""
 STATE_LOCK_OWNED="false"
 
+# ┌─ 中转规则 / WARP 接管规则的顺序与兜底规范化 (jq 程序, 追加到任何 .route.rules 修改之后) ─┐
+# │ 两套规则其实共用 relay.json 的同一个 route.rules 数组, sing-box 按顺序首条命中即生效,
+# │ 而 WARP 接管规则没有 inbound 约束 (domain_regex [".*"] + ip_version 4/6 是通配)。
+# │ 所以"顺序浮动"就会互相抢占: 重新绑入口时新规则被追加到数组末尾 → WARP 通配规则排在前面,
+# │ 把整个入口的流量先抓走, 落地看起来"不生效"。这里把顺序钉死, 并补直连兜底:
+# │   0 sniff 动作 → 1 落地(带规则集分流) → 2 落地(兜底) → 3 入口直连兜底 → 4 WARP 接管 → 5 其他
+# │ 有 WARP 接管时, 给"只做了分流、没有兜底落地"的入口补一条 direct 兜底 —— 否则未命中
+# │ 分流规则集的流量会掉进 WARP 出口 (两套本该各管各的)。WARP 关掉时这条兜底会自动摘掉。
+# └─────────────────────────────────────────────────────────────────────────┘
+RELAY_RULES_NORMALIZE_FLT='
+.route.rules as $r
+| ([$r[] | select((.outbound? // "") | startswith("relay-out-")) | (.inbound? // [])[]] | unique) as $rins
+| ([$r[] | select((.outbound? // "") | startswith("relay-out-")) | select(((.rule_set? // []) | length) == 0) | (.inbound? // [])[]] | unique) as $catchins
+| ([$r[] | select(.outbound? == "warp-out")] | length > 0) as $warp
+| (if $warp then [$rins[] | select(. as $i | ($catchins | index($i)) == null)] else [] end) as $need
+| ([$r[] | select(((.outbound? // "") == "direct"
+                  and ((.rule_set? // []) | length) == 0
+                  and ((.inbound? // []) | length) == 1
+                  and ((.inbound[0]) as $i | ($rins | index($i)) != null)) | not)]) as $base
+| ($base + [$need[] as $i | {inbound: [$i], outbound: "direct"}]) as $all
+| .route.rules = ($all | to_entries
+    | map({i: .key, r: .value, p: (
+        (.value) as $x
+        | if (($x.action? // "") == "sniff") then 0
+          elif (((($x.outbound? // "") | startswith("relay-out-")) and (((($x.rule_set? // []) | length)) > 0))) then 1
+          elif (($x.outbound? // "") | startswith("relay-out-")) then 2
+          elif ((($x.outbound? // "") == "direct") and ((($x.inbound? // []) | length) > 0)) then 3
+          elif (($x.outbound? // "") == "warp-out") then 4
+          else 5 end)})
+    | sort_by([.p, .i]) | map(.r))
+'
+
 _valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
@@ -2211,6 +2243,8 @@ _relay_bind_landing() {
     fi
     local flt
     flt='.route.rules = ([ (.route.rules // [])[] | select((((.inbound? // []) | if type == "array" then . else [.] end) | index("'"${sel_in}"'")) == null) ] + '"${sn_json}"' + '"${new_rules}"') | ([.route.rules[]? | .rule_set[]?] as $used | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as $t | ($used | index($t)) != null)))) | .route.final = "direct"'
+    # SX: 绑定会把新规则追加到数组末尾 → 必须先规范化顺序, 否则 WARP 通配规则会排在落地前面
+    flt="${flt} | ${RELAY_RULES_NORMALIZE_FLT}"
     if ! _atomic_modify_json "$RELAY_CONFIG_FILE" "$flt"; then failed="true"; fi
     if [ "$failed" = "true" ] || ! _restart_checked; then
         _txn_restore_file "$txn_dir" relay "$RELAY_CONFIG_FILE"
@@ -2377,6 +2411,8 @@ _relay_landing_rule() {
         sleep 2; return 1
     fi
     local flt="${sniff_part}${rule_part}${prune_part}${reorder_part}"
+    # SX: 落地规则改动后统一规范化顺序, 并给"仅分流"的入口补直连兜底 (有 WARP 时)
+    flt="${flt} | ${RELAY_RULES_NORMALIZE_FLT}"
     if ! _atomic_modify_json "$RELAY_CONFIG_FILE" "$flt"; then failed="true"; fi
     if [ "$failed" != "true" ] && [ -s "$LINKS_FILE" ]; then
         _atomic_modify_json "$LINKS_FILE" '.["'"$ot"'"] = ((.["'"$ot"'"] // {}) | .relay_mode = "'"$lmode_key"'")' || true
@@ -2818,12 +2854,13 @@ _delete_landing() {
     # SX 修复 [5] 永远删不掉: 旧版是 flt='... != '"${ot}"'...' —— 少了一对引号,
     # 拼出来的过滤器是 != relay-out-8675 (jq 裸词), 报 relay/0 is not defined,
     # 于是每次都走 "删除失败, 已恢复原配置"。改用 jq --arg 传参, 不再手工拼字符串。
-    if ! _atomic_modify_json "$CONFIG_FILE" '
-        .route.rules = ([ (.route.rules // [])[] | select((.outbound? // "") != $ot) ])
-        | .outbounds = ([ (.outbounds // [])[] | select((.tag? // "") != $ot) ])
-        | ([.route.rules[]? | .rule_set[]?] as $used
-           | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as $t | ($used | index($t)) != null))))
-    ' --arg ot "$ot"; then failed="true"; fi
+    if ! _atomic_modify_json "$CONFIG_FILE" "
+        .route.rules = ([ (.route.rules // [])[] | select((.outbound? // \"\") != \$ot) ])
+        | .outbounds = ([ (.outbounds // [])[] | select((.tag? // \"\") != \$ot) ])
+        | ([.route.rules[]? | .rule_set[]?] as \$used
+           | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as \$t | (\$used | index(\$t)) != null))))
+        | ${RELAY_RULES_NORMALIZE_FLT}
+    " --arg ot "$ot"; then failed="true"; fi
     if [ "$failed" = "true" ] || ! _restart_checked; then
         _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
         _txn_restore_file "$txn_dir" links "$LINKS_FILE"
@@ -4347,8 +4384,9 @@ _warp_apply_takeover() {
     [ -n "$rs_arr" ] && rs_flt="${rs_flt} + [${inject_rs}]"
 
     # 1) relay.json 单条原子修改: 端点注入 + 槽位规则 + rule_set 定义(同文件) + final=direct
+    #    SX: 末尾接顺序规范化 —— WARP 通配规则必须排在落地规则之后, 并给仅分流的入口补直连兜底
     if ! _atomic_modify_json "$RELAY_CONFIG_FILE" \
-        ".endpoints = ((.endpoints // []) | map(select(.tag != \"warp-out\"))) + [${ep_json}] | .route = (.route // {\"rules\":[]}) | ${rules_flt} | ${rs_flt} | .route.final = \"direct\""; then
+        ".endpoints = ((.endpoints // []) | map(select(.tag != \"warp-out\"))) + [${ep_json}] | .route = (.route // {\"rules\":[]}) | ${rules_flt} | ${rs_flt} | .route.final = \"direct\" | ${RELAY_RULES_NORMALIZE_FLT}"; then
         mv -f "$bak_r" "$RELAY_CONFIG_FILE" 2>/dev/null || true; mv -f "$bak_c" "$CONFIG_FILE" 2>/dev/null || true
         _error "WARP 接管规则注入失败。"
         sleep 2; return 1
@@ -4683,19 +4721,26 @@ _menu() {
         echo -e "    ${GREEN}[5]${NC} 删除落地节点"
         echo -e "    ${GREEN}[6]${NC} 解除入口对接 (仅删该入口的转发规则)"
         echo -e "    ${GREEN}[7]${NC} 修改入口监听端口 (仅本脚本创建的入口)"
-        echo -e "    ${RED}[8]${NC} 清空所有中转配置"
-        echo -e "    ${GREEN}[R]${NC} 中转分流管理 (启用落地/设置规则)"
+        echo -e "    ${GREEN}[8]${NC} 中转分流管理 (启用落地/设置规则)"
+        echo -e "    ${RED}[R]${NC} 清空所有中转配置"
+        echo ""
+        echo -e "  ${CYAN}【出口优化】${NC}"
+        echo -e "    ${GREEN}[9]${NC} WARP 出站管理 (Cloudflare 免费出口)"
+        # SX: 两套规则同时开启时给一句口径说明 —— 规范化后落地永远优先, WARP 只兜主节点
+        local _warp_on _nland
+        _warp_on=$(jq -r '[.route.rules[]? | select(.outbound? == "warp-out")] | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
+        _nland=$(jq -r '[.outbounds[]? | select((.tag // "") | startswith("relay-out-"))] | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
+        if [ "${_warp_on:-0}" -gt 0 ] 2>/dev/null && [ "${_nland:-0}" -gt 0 ] 2>/dev/null; then
+            echo -e "    ${YELLOW}● 同时启用了 中转落地 与 WARP 接管: 落地规则优先; 未命中分流的入口流量走直连, WARP 只接管主节点${NC}"
+        fi
         echo ""
         echo -e "  ${CYAN}【端口转发】${NC}"
-        echo -e "    ${GREEN}[9]${NC} 端口转发管理"
+        echo -e "    ${GREEN}[10]${NC} 端口转发管理"
         echo ""
         echo -e "  ─────────────────────────────────────────"
-        echo ""
-        echo -e "  ${CYAN}出口优化${NC}"
-        echo -e "    ${GREEN}[W]${NC} WARP 出站管理 (Cloudflare 免费出口)"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-9 或 R/W]: " choice
+        read -p "  请输入选项 [0-10 或 R]: " choice
         case $choice in
             1) _landing_config ;;
             # SX: 每次进入只添加一个 —— 不再套 while 循环连续追问, 加完停留一次即回菜单
@@ -4705,16 +4750,16 @@ _menu() {
             5) _delete_landing ;;
             6) _delete_forward ;;
             7) _modify_relay_port ;;
-            8) echo ""; _warn "确认清空所有中转配置? (主节点/WARP/端口转发保留)"; read -p "  (y/N): " cn
+            8) _relay_node_manage ;;
+            R|r) echo ""; _warn "确认清空所有中转配置? (主节点/WARP/端口转发保留)"; read -p "  (y/N): " cn
                if [[ "$cn" =~ ^[Yy]$ ]]; then
                    _clear_all_relays
                    # SX: 清空结果必须停留, 否则被下一轮 clear 瞬擦
                    _pause_relay
                fi ;;
+            9|W|w) _warp_menu ;;
+            10) _port_forward_menu ;;
             0) break ;;
-            9) _port_forward_menu ;;
-            W|w) _warp_menu ;;
-            R|r) _relay_node_manage ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
     done
