@@ -4712,16 +4712,25 @@ _udp_pick_landing() {
 
 _udp_route_apply() {
     local mode="$1"   # 53 | all | keep_port
-    local tag port=0
-    tag=$(_udp_route_state); port="${tag##*|}"; tag="${tag%%|*}"
-    if [ "$mode" = "all" ]; then
-        port=0
-    elif [ "$mode" = "keep_port" ] && [ -n "$tag" ]; then
-        :   # 保留原端口设置
+    local tag port=0 prev
+    prev=$(_udp_route_state)
+    if [ -n "$prev" ]; then
+        tag="${prev%%|*}"; port="${prev##*|}"
     else
-        port=53
+        tag=""; port=0
     fi
-    if [ -z "$tag" ]; then
+
+    case "$mode" in
+        all)       port=0 ;;
+        keep_port) : ;;   # 档位保持不变
+        *)         port=53 ;;
+    esac
+
+    if [ "$mode" = "keep_port" ]; then
+        # SX: "换落地" 必须重新选 —— 旧版在已配置时会复用原落地, 等于什么都没做
+        [ -n "$prev" ] || { _warn "当前还没开启 UDP 转发, 请先用 [1] 或 [2]"; _pause_anykey; return 1; }
+        tag=$(_udp_pick_landing) || { _warn "已取消"; _pause_anykey; return 1; }
+    elif [ -z "$tag" ]; then
         tag=$(_udp_pick_landing) || { _warn "已取消"; _pause_anykey; return 1; }
     fi
     [ -n "$tag" ] || { _warn "已取消"; _pause_anykey; return 1; }
@@ -4815,7 +4824,7 @@ _udp_route_menu() {
         echo ""
         echo -e "    ${GREEN}[1]${NC} 只把 DNS(UDP 53) 交给落地   ${YELLOW}(推荐, 最省)${NC}"
         echo -e "    ${GREEN}[2]${NC} 全部 UDP 交给落地           ${YELLOW}(含 QUIC/游戏)${NC}"
-        echo -e "    ${GREEN}[3]${NC} 只切换落地"
+        echo -e "    ${GREEN}[3]${NC} 换落地 (档位不变: 只 DNS 就还是只 DNS)"
         echo -e "    ${RED}[0]${NC} 关闭 (删除该规则, UDP 回直连)"
         echo -e "    ${YELLOW}[9]${NC} 返回"
         echo ""
