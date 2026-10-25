@@ -4845,6 +4845,87 @@ _udp_route_menu() {
     done
 }
 
+# ============================================================
+# SX: IPv4/IPv6 优先 (domain_strategy) —— 一次性作用于全部 relay-out-* 落地出站
+#     不干预 = 域名交给落地自己解析(默认, 最省事, 也不受中转机 DNS 影响)
+#     prefer_ipv4 / prefer_ipv6 = 优先某一族, 失败回退
+#     ipv4_only / ipv6_only    = 只用某一族 (落地某族不通时绕开, 例如只有 AAAA 解析)
+#     注意: 设了之后域名由中转机本地解析再连 IP; 中转机 DNS 被污染时会适得其反。
+# ============================================================
+_ipfam_state() {
+    [ -s "$RELAY_CONFIG_FILE" ] || return 0
+    jq -r '[.outbounds[]? | select((.tag? // "") | startswith("relay-out-")) | .domain_strategy // empty]
+           | unique | join(",")' "$RELAY_CONFIG_FILE" 2>/dev/null
+}
+
+_ipfam_apply() {
+    local ds="$1"
+    local bak="${RELAY_CONFIG_FILE}.ipfambak"
+    cp -af "$RELAY_CONFIG_FILE" "$bak" 2>/dev/null || return 1
+    _state_lock_acquire || { rm -f "$bak"; return 1; }
+    local rc=0
+    if _atomic_modify_json "$RELAY_CONFIG_FILE" '
+        .outbounds = ((.outbounds // []) | map(
+            if ((.tag? // "") | startswith("relay-out-"))
+            then (if $ds == "" then del(.domain_strategy) else . + {domain_strategy: $ds} end)
+            else . end))
+    ' --arg ds "$ds"; then
+        :
+    else
+        _error "写入失败, 配置未改动"; rc=1
+    fi
+    _state_lock_release
+
+    if [ "$rc" -eq 0 ]; then
+        if _restart_checked; then
+            if [ -z "$ds" ]; then
+                _success "已恢复「不干预」: 域名交给落地自行解析"
+            else
+                _success "已设置: 全部落地 ${ds}"
+            fi
+        else
+            # 当前 sing-box 版本不接受该字段时自动回滚, 不留坏配置
+            mv -f "$bak" "$RELAY_CONFIG_FILE" 2>/dev/null
+            _manage_service restart >/dev/null 2>&1 || true
+            _error "当前 sing-box 不接受 domain_strategy 或校验失败, 已回滚原配置"
+        fi
+    fi
+    rm -f "$bak"
+    _pause_anykey
+}
+
+_ipfam_menu() {
+    while true; do
+        clear
+        local st
+        st=$(_ipfam_state)
+        echo -e "\n  ${CYAN}==== IPv4 / IPv6 优先 (作用于全部落地) ====${NC}"
+        echo -e "  当前: ${GREEN}${st:-不干预}${NC}"
+        echo -e "  ${YELLOW}作用: 让中转机先按指定地址族解析域名, 再连落地。${NC}"
+        echo -e "  ${YELLOW}场景: 落地只返回 AAAA(IPv6) 但 v6 出口不通时, 选「仅 IPv4」可绕开。${NC}"
+        echo -e "  ${YELLOW}注意: 设置后域名由中转机本地解析; 若中转机 DNS 被污染, 反而会更糟。${NC}"
+        echo ""
+        echo -e "    ${GREEN}[1]${NC} 不干预 (默认, 交给落地解析)"
+        echo -e "    ${GREEN}[2]${NC} 优先 IPv4  (prefer_ipv4)"
+        echo -e "    ${GREEN}[3]${NC} 优先 IPv6  (prefer_ipv6)"
+        echo -e "    ${GREEN}[4]${NC} 仅 IPv4    (ipv4_only)"
+        echo -e "    ${GREEN}[5]${NC} 仅 IPv6    (ipv6_only)"
+        echo -e "    ${YELLOW}[9]${NC} 返回"
+        echo ""
+        local c
+        read -p "  请选择 [1-5/9]: " c
+        case "$c" in
+            1) _ipfam_apply "" ;;
+            2) _ipfam_apply prefer_ipv4 ;;
+            3) _ipfam_apply prefer_ipv6 ;;
+            4) _ipfam_apply ipv4_only ;;
+            5) _ipfam_apply ipv6_only ;;
+            9|"") return 0 ;;
+            *) _error "无效输入"; sleep 1 ;;
+        esac
+    done
+}
+
 _menu() {
     _check_root || return 1
     _check_deps || return 1
@@ -4916,6 +4997,18 @@ _menu() {
         else
             echo -e "    ${GREEN}[U]${NC} UDP 转发 ${YELLOW}已关闭${NC} (NAT 小鸡禁 UDP 时打开)"
         fi
+        # SX: IPv4/IPv6 优先 (作用于全部落地出站)
+        local _ipf_st _ipf_disp
+        _ipf_st=$(_ipfam_state)
+        case "$_ipf_st" in
+            "")          _ipf_disp="${YELLOW}不干预${NC} (交给落地解析)" ;;
+            prefer_ipv4) _ipf_disp="${GREEN}优先 IPv4${NC}" ;;
+            prefer_ipv6) _ipf_disp="${GREEN}优先 IPv6${NC}" ;;
+            ipv4_only)   _ipf_disp="${GREEN}仅 IPv4${NC}" ;;
+            ipv6_only)   _ipf_disp="${GREEN}仅 IPv6${NC}" ;;
+            *)           _ipf_disp="${YELLOW}${_ipf_st}${NC}" ;;
+        esac
+        echo -e "    ${GREEN}[V]${NC} IPv4/IPv6 优先: ${_ipf_disp}"
         # SX: 两套规则同时开启时给一句口径说明 —— 规范化后落地永远优先, WARP 只兜主节点
         local _warp_on _nland
         _warp_on=$(jq -r '[.route.rules[]? | select(.outbound? == "warp-out")] | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
@@ -4949,6 +5042,7 @@ _menu() {
                fi ;;
             9|W|w) _warp_menu ;;
             U|u) _udp_route_menu ;;
+            V|v) _ipfam_menu ;;
             10) _port_forward_menu ;;
             0) break ;;
             *) _error "无效输入"; sleep 1 ;;
