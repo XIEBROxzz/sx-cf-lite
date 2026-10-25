@@ -61,6 +61,14 @@ if ! declare -f _pause_relay >/dev/null; then
         read -r -p "  按回车键返回..." _pause_relay_dummy
     }
 fi
+# 任意键停留 —— 添加完成后回菜单用, 不必再敲回车
+if ! declare -f _pause_anykey >/dev/null; then
+    _pause_anykey() {
+        echo ""
+        read -n 1 -s -r -p "  按任意键返回主菜单..." _pause_anykey_dummy
+        echo ""
+    }
+fi
 
 # --- 全局变量 ---
 # 工具路径
@@ -1902,8 +1910,10 @@ _finalize_relay_setup() {
     echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
     echo -e "  对接状态: ${YELLOW}未对接 —— 入口对接请在 [R] 中转分流管理 → [1] 设置中转节点 (扫描入口, 多选落地)${NC}"
     echo ""
-    # SX: 单次添加 —— 加完停留一次就回菜单, 想继续加再进 [2]/[3]
-    _pause_relay
+    # SX: 单次添加 —— 加完按任意键回菜单, 想继续加再进 [2]/[3] 走一遍新的添加流程
+    _pause_anykey
+    # 节点已经写好了, 无论按了什么键 (含 Ctrl-D) 都算成功返回
+    return 0
 }
 
 # --- 2. 中转机配置 (导入 Token) ---
