@@ -1,6 +1,6 @@
 # SX-CF-lite
 
-sing-box 一键管理脚本 · **虫虫版** · 当前 **v1.0**（三脚本版本号已统一为 1.0）
+sing-box 一键管理脚本 · **虫虫版** · 主脚本 `singbox.sh` 当前 **v1.5**（`cf_lite.sh` / `singbox-lite_tunnel.sh` 仍为 1.0）
 
 > 基于 [0xdabiaoge/singbox-lite](https://github.com/0xdabiaoge/singbox-lite) 地基 + Joey [xray-cf-lite](https://github.com/byJoey/xray-cf-lite) 的 CF 套皮整合魔改。
 
