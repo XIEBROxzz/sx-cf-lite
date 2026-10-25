@@ -1424,7 +1424,8 @@ _import_link_config() {
     if [ -n "$share_link" ]; then
         local _raw_frag="${share_link##*#}"
         if [ -n "$_raw_frag" ] && [ "$_raw_frag" != "$share_link" ]; then
-            frag_name=$(printf '%b' "${_raw_frag//%/\x}" 2>/dev/null)
+            # SX: 必须写 '\\x' —— 写成 '\x' 反斜杠会被吃掉, %E4%BA%91 解成 "xE4xBAx91"
+            frag_name=$(printf '%b' "${_raw_frag//%/\\x}" 2>/dev/null)
         fi
     fi
     local dest_type dest_addr dest_port
@@ -1913,6 +1914,9 @@ _finalize_relay_setup() {
     fi
     local _input_name=""
     echo ""
+    # SX: 粘贴分享链接时剪贴板常带多余换行, 残留会被下一个 read 立刻吃掉 →
+    #     表现为"名称提示一闪而过, 没法改名"。这里先清掉残留再问。
+    _flush_pending_stdin
     read -p "  请输入落地节点名称 (直接回车 = ${node_name}): " _input_name
     # 去首尾空白; 只敲了空格视同直接回车
     _input_name="${_input_name#"${_input_name%%[![:space:]]*}"}"
