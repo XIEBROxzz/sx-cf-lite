@@ -4693,11 +4693,13 @@ _udp_route_state() {
 }
 
 _udp_pick_landing() {
-    local i=0 tags=() t n
+    local i=0 tags=() t n ty
     while IFS='|' read -r t n; do
         [ -z "$t" ] && continue
         i=$((i+1)); tags+=("$t")
-        echo -e "    ${GREEN}[$i]${NC} ${YELLOW}${n}${NC}" >&2
+        # SX: 带上出站类型 —— trojan/http 无法承载 UDP, 让用户一眼避开
+        ty=$(jq -r --arg t "$t" 'first(.outbounds[]? | select(.tag == $t) | .type) // "?"' "$RELAY_CONFIG_FILE" 2>/dev/null)
+        echo -e "    ${GREEN}[$i]${NC} ${YELLOW}${n}${NC} ${CYAN}(${ty})${NC}" >&2
     done < <(jq -r 'to_entries[] | "\(.key)|\(.value.node_name // .key)"' \
                 "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
     [ "$i" -gt 0 ] || return 1
@@ -4724,12 +4726,24 @@ _udp_route_apply() {
     fi
     [ -n "$tag" ] || { _warn "已取消"; _pause_anykey; return 1; }
 
-    local INS
+    local INS otype penc
     INS=$(jq -c '[.inbounds[]?.tag] | map(select(. != null))' "$RELAY_CONFIG_FILE")
+    otype=$(jq -r --arg t "$tag" 'first(.outbounds[]? | select(.tag == $t) | .type) // empty' "$RELAY_CONFIG_FILE" 2>/dev/null)
+    penc=$(jq -r --arg t "$tag" 'first(.outbounds[]? | select(.tag == $t) | .packet_encoding) // empty' "$RELAY_CONFIG_FILE" 2>/dev/null)
+    # SX: trojan/http 这类出站根本不能承载 UDP —— 直接拒绝, 否则只会刷
+    #     "router: UDP is not supported by outbound"
+    case "$otype" in
+        ""|trojan|http|https)
+            _error "该落地类型是 ${otype:-未知}, 不支持承载 UDP; 请换 vless/shadowsocks/hysteria2/tuic 落地"
+            _pause_anykey; return 1 ;;
+    esac
     _state_lock_acquire || return 1
     local rc=0
     if _atomic_modify_json "$RELAY_CONFIG_FILE" "
-        .route.rules = (
+        .outbounds = ((.outbounds // []) | map(
+            if ((.tag? // \"\") == \$tag) and (.type? == \"vless\") and ((.packet_encoding? // \"\") == \"\")
+            then . + {packet_encoding: \"xudp\"} else . end))
+        | .route.rules = (
             ([ {inbound: \$ins, network: \"udp\", outbound: \$tag}
                + (if \$port > 0 then {port: \$port} else {} end) ])
             + [ (.route.rules // [])[] | select((.network? // \"\") != \"udp\") ]
@@ -4743,6 +4757,13 @@ _udp_route_apply() {
             _success "已开启: 只把 DNS(UDP 53) 交给 ${nm:-$tag}"
         else
             _success "已开启: 全部 UDP 交给 ${nm:-$tag}"
+        fi
+        if [ "$otype" = "vless" ]; then
+            if [ -z "$penc" ]; then
+                _info "已自动为该落地补上 packet_encoding=xudp (VLESS 不写它就不支持 UDP)。"
+            else
+                _info "该落地的 packet_encoding=${penc} (已是 UDP 可用状态)。"
+            fi
         fi
         _info "UDP 会封装进 TCP 隧道到落地, 不需要中转机自己有原生 UDP。"
     else
