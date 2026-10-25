@@ -4856,21 +4856,24 @@ _udp_route_menu() {
 }
 
 # ============================================================
-# SX: IPv4/IPv6 优先 (domain_strategy) —— 一次性作用于全部 relay-out-* 落地出站
-#     不干预 = 域名交给落地自己解析(默认, 最省事, 也不受中转机 DNS 影响)
-#     prefer_ipv4 / prefer_ipv6 = 优先某一族, 失败回退
-#     ipv4_only / ipv6_only    = 只用某一族 (落地某族不通时绕开, 例如只有 AAAA 解析)
-#     注意: 设了之后域名由中转机本地解析再连 IP; 中转机 DNS 被污染时会适得其反。
-# ============================================================
-# ============================================================
 # SX: 本机直连地址族 (作用于 config.json 的 direct 出站)
-#     只影响"最终走 direct"的流量(route.final=direct / 规则指向 direct);
-#     走落地或节点的流量不受影响。空值 = 双栈默认。
+#     只影响"最终走 direct"的流量(route.final=direct / 规则指向 direct)。
 #     用途: v4 段被 Google 判中国区(送中)而 v6 段干净时, 让直连走 v6。
+#     sing-box 1.12+ 已移除 outbound.domain_strategy (1.13 直接 FATAL),
+#     改用 domain_resolver: {"server": <解析器tag>, "strategy": ...}
 # ============================================================
+_dns_resolver_tag() {
+    # 取配置里的"本地"解析器 tag; 退路是 route.default_domain_resolver.server, 再退 dns-local
+    local t
+    t=$(jq -r 'first(.dns.servers[]? | select((.type // "") == "local") | .tag) // empty' "$1" 2>/dev/null)
+    [ -n "$t" ] || t=$(jq -r '.route.default_domain_resolver.server // empty' "$1" 2>/dev/null)
+    [ -n "$t" ] || t="dns-local"
+    printf '%s' "$t"
+}
+
 _direct_fam_state() {
     [ -s "$MAIN_CONFIG_FILE" ] || return 0
-    jq -r 'first(.outbounds[]? | select((.tag? // "") == "direct") | .domain_strategy) // ""' \
+    jq -r 'first(.outbounds[]? | select((.tag? // "") == "direct") | .domain_resolver.strategy) // ""' \
         "$MAIN_CONFIG_FILE" 2>/dev/null
 }
 
@@ -4889,6 +4892,8 @@ _direct_fam_apply() {
                 _pause_anykey; return 1
             fi ;;
     esac
+    local srv
+    srv=$(_dns_resolver_tag "$MAIN_CONFIG_FILE")
     local bak="${MAIN_CONFIG_FILE}.fam_bak"
     cp -af "$MAIN_CONFIG_FILE" "$bak" 2>/dev/null || return 1
     _state_lock_acquire || { rm -f "$bak"; return 1; }
@@ -4896,9 +4901,10 @@ _direct_fam_apply() {
     if _atomic_modify_json "$MAIN_CONFIG_FILE" '
         .outbounds = ((.outbounds // []) | map(
             if ((.tag? // "") == "direct")
-            then (if $ds == "" then del(.domain_strategy) else . + {domain_strategy: $ds} end)
+            then (if $ds == "" then del(.domain_resolver) else . + {domain_resolver: {server: $srv, strategy: $ds}} end)
+                 | del(.domain_strategy)
             else . end))
-    ' --arg ds "$ds"; then :; else _error "写入失败, 配置未改动"; rc=1; fi
+    ' --arg ds "$ds" --arg srv "$srv"; then :; else _error "写入失败, 配置未改动"; rc=1; fi
     _state_lock_release
 
     if [ "$rc" -eq 0 ]; then
@@ -4961,9 +4967,17 @@ _direct_fam_menu() {
     done
 }
 
+# ============================================================
+# SX: 落地地址族 (作用于 relay.json 的全部 relay-out-* 出站)
+#     不干预 = 域名交给落地自己解析(默认, 最省事, 也不受中转机 DNS 影响)
+#     prefer_ipv4 / prefer_ipv6 = 优先某一族, 失败回退
+#     ipv4_only / ipv6_only    = 只用某一族 (落地某族不通时绕开, 例如只有 AAAA 解析)
+#     注意: 设了之后域名由中转机本地解析再连 IP; 中转机 DNS 被污染时会适得其反。
+#     sing-box 1.12+ 用 domain_resolver 取代已废弃的 domain_strategy。
+# ============================================================
 _ipfam_state() {
     [ -s "$RELAY_CONFIG_FILE" ] || return 0
-    jq -r '[.outbounds[]? | select((.tag? // "") | startswith("relay-out-")) | .domain_strategy // empty]
+    jq -r '[.outbounds[]? | select((.tag? // "") | startswith("relay-out-")) | .domain_resolver.strategy // empty]
            | unique | join(",")' "$RELAY_CONFIG_FILE" 2>/dev/null
 }
 
@@ -4984,14 +4998,18 @@ _ipfam_apply() {
     esac
     local bak="${RELAY_CONFIG_FILE}.ipfambak"
     cp -af "$RELAY_CONFIG_FILE" "$bak" 2>/dev/null || return 1
+    # domain_resolver 的解析器 tag 定义在 config.json (合并后全局可见)
+    local srv
+    srv=$(_dns_resolver_tag "$MAIN_CONFIG_FILE")
     _state_lock_acquire || { rm -f "$bak"; return 1; }
     local rc=0
     if _atomic_modify_json "$RELAY_CONFIG_FILE" '
         .outbounds = ((.outbounds // []) | map(
             if ((.tag? // "") | startswith("relay-out-"))
-            then (if $ds == "" then del(.domain_strategy) else . + {domain_strategy: $ds} end)
+            then (if $ds == "" then del(.domain_resolver) else . + {domain_resolver: {server: $srv, strategy: $ds}} end)
+                 | del(.domain_strategy)
             else . end))
-    ' --arg ds "$ds"; then
+    ' --arg ds "$ds" --arg srv "$srv"; then
         :
     else
         _error "写入失败, 配置未改动"; rc=1
@@ -5009,7 +5027,7 @@ _ipfam_apply() {
             # 当前 sing-box 版本不接受该字段时自动回滚, 不留坏配置
             mv -f "$bak" "$RELAY_CONFIG_FILE" 2>/dev/null
             _manage_service restart >/dev/null 2>&1 || true
-            _error "当前 sing-box 不接受 domain_strategy 或校验失败, 已回滚原配置"
+            _error "sing-box 不接受该设置或校验失败, 已回滚原配置"
         fi
     fi
     rm -f "$bak"
