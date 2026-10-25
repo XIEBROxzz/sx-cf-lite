@@ -1,58 +1,52 @@
 # 落地规则集
 
-两份规则集，**互不重叠**（已用脚本按 `domain_suffix` 包含关系核对），一份走「近节点」管日常，一份走「高 IP 要求」的节点管 AI。
+两份，**互不重叠**，各绑一个落地：
 
-## `landing.json` —— 日常那份（建议绑**距离近**的落地）
+- **`landing.json`（46 条）** — 日常：YouTube 整站 + Google 搜索 + Google Play（含 APK 下载 CDN）+ 登录/静态资源 + Gemini。建议绑**距离近**的落地。
+- **`landing-v2.json`（40 条）** — 只放对 IP 要求高的 AI：ChatGPT / Claude / Grok / Perplexity / Poe / Character / Copilot + NotebookLM / Labs / Jules / Flow / Opal / Antigravity / Stitch / DeepMind。建议绑**AI 解锁**用的落地。
 
-Google 全家桶（除 AI 以外的常用部分）+ YT：
+> 为什么不把 Play 拆出去：Play 的授权、checkin、下载 CDN 若分属两个出口 IP，会一直卡在「等待中」。Google 全家桶放同一个落地最稳。
 
-- **YouTube 整站**：`youtube.com`、`youtu.be`、`youtube-nocookie.com`、`music.youtube.com`、`youtubei.googleapis.com`、`googlevideo.com`、`ytimg.com`、`consent.youtube.com`
-- **Google 搜索**：`www.google.com`、`google.com.hk`
-- **Google Play 商店 + 下载**：`play.google.com`、`play.googleapis.com`、`play-fe`、`android.clients.google.com`、`play-lh`、`ggpht.com`，以及 **`gvt1/gvt2/gvt3.com`、`dl.google.com`**（APK 真正的下载 CDN）
-- **Google 公共依赖**：`accounts.google.com`（登录）、`gstatic.com`（JS/CSS/字体）
-- **Gemini**：`gemini.google(.com)`、`generativelanguage.googleapis.com`、`geminiweb-pa`/`alkalicore-pa`、`makersuite`/`bard`/`aistudio`/`ai.studio`、Gemini Code Assist 后端等
+## 一键复制
 
-> 为什么不拆 Play 到另一条：Play 的授权、checkin、下载 CDN 如果分属两个出口 IP，会一直卡在「等待中」。Google 全家桶放同一个落地最稳。
+```
+https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing.json
+```
 
-## `landing-v2.json` —— 只在需要时用（建议绑 **AI 解锁/住宅 IP** 那种落地）
+```
+https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing-v2.json
+```
 
-只放对 IP 要求高的 AI，不含任何 Google 日常域名：
+## 改完怎么一眼看出生效
 
-- **主流 AI**：OpenAI/ChatGPT（`openai.com`/`chatgpt.com`/`oaistatic`/`oaiusercontent`/`sora`/`auth0`）、Claude、Grok、Perplexity、Poe、Character.AI、Copilot
-- **Google 其他 AI 产品**：NotebookLM、Labs、Jules、Flow、Opal、Antigravity、Stitch、DeepMind
+**v1（日常落地）** — 浏览器打开：
 
-## 怎么一眼看出 v2 生效
+```
+https://ipinfo.io/json
+```
 
-不用真的去用 AI —— 打开一个纯文本探针即可：
+`"ip"` 是落地 IP、`"country"` / `"city"` 是落地所在地 → 生效；显示上海/CN → 没命中，退回直连了。
+
+**v2（AI 落地）** — 浏览器打开：
 
 ```
 https://chatgpt.com/cdn-cgi/trace
 ```
 
-看返回里的两行：
+看 `ip=` 和 `loc=` 两行：`loc=AU`（或对应国家）= 生效；`loc=CN` / 上海 = 没命中。
+（`https://claude.ai/cdn-cgi/trace` 同理；都是纯文本，不打开页面、不触发风控。）
 
-- `ip=` 是悉尼/该落地的 IP、`loc=AU`（或对应国家）→ **v2 生效**
-- `ip=` 是上海、`loc=CN` → **没生效**，请求退回直连了
-
-`https://claude.ai/cdn-cgi/trace` 同理（Claude 也在 Cloudflare 后面）。
-
-配置层面一眼看：`[18] → [8] → [2]` 列表、或 `[4] 查看当前中转链路`，该落地显示 `自定义规则集 (landing-v2)` 就是绑定好了。
+配置层面一眼看：`[18] → [8] → [2]` 列表、或 `[4] 查看当前中转链路`，落地后面显示 `自定义规则集 (landing-v2)` 就是绑好了。
 
 ## 用法
 
-`[18] 进阶转发管理 → [8] 中转分流管理 → [2] 设置落地规则 → [3] 自定义规则集`
+`[18] 进阶转发管理 → [8] 中转分流管理 → [2] 设置落地规则 → [3] 自定义规则集`，把上面的 URL 粘进去。
 
-```
-日常落地（Google/YT/Gemini/Play）→ .../rules/landing.json
-AI 落地（高 IP 要求）            → .../rules/landing-v2.json
-```
+同一个文件不要同时给两个落地用（tag 由文件名生成，会撞 `duplicate rule-set tag`）。两份都不命中的域名 → `route.final = direct`，从中转机自己的 IP 直连（`images`/`news`/`translate`/`maps`/`drive`/`mail` 目前仍是直连）。
 
-同一个文件不要同时给两个落地用（tag 由文件名生成，会撞 `duplicate rule-set tag`）。两份都不命中的域名 → `route.final = direct`，从中转机自己的 IP 直连（`images`/`news`/`translate`/`maps`/`drive`/`mail` 等目前仍是直连）。
+## 改动后生效
 
-## 改完怎么生效
-
-规则文件是 sing-box 运行时按 URL 拉取的：推送后**重启服务**即可（面板 `[6]` 或 `systemctl restart sing-box`），不必重新绑定。
-确认拉到新版可以数条目：`landing.json` = 45 条、`landing-v2.json` = 40 条。
+规则集是运行时按 URL 拉取的：推送后**重启服务**即可（面板 `[6]` 或 `systemctl restart sing-box`），不用重新绑定。数条目可确认版本：`landing.json` = 46、`landing-v2.json` = 40。
 
 看某条请求实际走哪：
 
@@ -60,6 +54,6 @@ AI 落地（高 IP 要求）            → .../rules/landing-v2.json
 journalctl -u sing-box -f --no-pager | grep -Ei 'gvt|play\.googleapis|googlevideo|openai|claude'
 ```
 
-显示 `outbound/vless[relay-out-xxxx]` 才是命中，`outbound/direct` 就是没命中。
+`outbound/vless[relay-out-xxxx]` 才是命中，`outbound/direct` 就是没命中。
 
-> 与 WARP 的关系：命中规则走对应**落地 VPS**；`[9] WARP 出站管理` 是另一套出口规则，并存时落地规则优先，WARP 只接管主节点。
+> 与 WARP 的关系：命中规则走对应落地；`[9] WARP 出站管理` 是另一套出口规则，并存时落地规则优先，WARP 只接管主节点。
