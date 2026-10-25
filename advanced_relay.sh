@@ -64,9 +64,14 @@ fi
 # 任意键停留 —— 添加完成后回菜单用, 不必再敲回车
 if ! declare -f _pause_anykey >/dev/null; then
     _pause_anykey() {
+        local _anykey=""
         echo ""
-        read -n 1 -s -r -p "  按任意键返回主菜单..." _pause_anykey_dummy
+        read -n 1 -s -r -p "  按任意键返回主菜单..." _anykey
         echo ""
+        # 方向键/功能键是 ESC 开头的多字节序列, 只吃掉首字节会把 "[A" 漏给下一次菜单输入
+        if [ "$_anykey" = $'\033' ]; then
+            read -t 0.05 -n 2 -s -r _anykey 2>/dev/null || true
+        fi
     }
 fi
 
