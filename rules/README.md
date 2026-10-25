@@ -62,7 +62,7 @@ journalctl -u sing-box -f --no-pager | grep -Ei 'gvt|play\.googleapis|android|1e
 
 `outbound/vless[relay-out-xxxx]` 才是命中，`outbound/direct` 就是没命中。
 
-> 与 WARP 的关系：命中规则走对应落地；`[9] WARP 出站管理` 是另一套出口规则，并存时落地规则优先，WARP 只接管主节点。
+> 与 WARP 的关系：顺序固定为「落地规则 → WARP 接管 → 其他」。命中规则走对应落地；**没命中的流量，启用了 WARP 就走 WARP**，没启用就按 `route.final=direct` 直连。
 
 ## UDP 转发（`[U]`）
 

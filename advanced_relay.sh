@@ -95,30 +95,24 @@ STATE_LOCK_OWNED="false"
 # │ 两套规则其实共用 relay.json 的同一个 route.rules 数组, sing-box 按顺序首条命中即生效,
 # │ 而 WARP 接管规则没有 inbound 约束 (domain_regex [".*"] + ip_version 4/6 是通配)。
 # │ 所以"顺序浮动"就会互相抢占: 重新绑入口时新规则被追加到数组末尾 → WARP 通配规则排在前面,
-# │ 把整个入口的流量先抓走, 落地看起来"不生效"。这里把顺序钉死, 并补直连兜底:
-# │   0 sniff 动作 → 1 落地(带规则集分流) → 2 落地(兜底) → 3 入口直连兜底 → 4 WARP 接管 → 5 其他
-# │ 有 WARP 接管时, 给"只做了分流、没有兜底落地"的入口补一条 direct 兜底 —— 否则未命中
-# │ 分流规则集的流量会掉进 WARP 出口 (两套本该各管各的)。WARP 关掉时这条兜底会自动摘掉。
+# │ 把整个入口的流量先抓走, 落地看起来"不生效"。这里把顺序钉死:
+# │   0 reject 动作 → 1 sniff → 2 落地(带规则集) → 3 落地(兜底) → 5 WARP 接管 → 6 其他
+# │ 不再自动补"入口直连兜底": 那类规则会把中转入口的未命中流量钉在直连上, 导致
+# │ WARP 接管永远轮不到 (实测用户反馈"IPv4 接管没效果")。历史版本写入的这类规则
+# │ 会在这里被一并清掉, 恢复"落地规则在前、WARP 在后、都不命中走 final=direct"。
 # └─────────────────────────────────────────────────────────────────────────┘
 RELAY_RULES_NORMALIZE_FLT='
 .route.rules as $r
-| ([$r[] | select((.outbound? // "") | startswith("relay-out-")) | select((.network? // "") != "udp") | (.inbound? // [])[]] | unique) as $rins
-| ([$r[] | select((.outbound? // "") | startswith("relay-out-")) | select((.network? // "") != "udp") | select(((.rule_set? // []) | length) == 0) | (.inbound? // [])[]] | unique) as $catchins
-| ([$r[] | select(.outbound? == "warp-out")] | length > 0) as $warp
-| (if $warp then [$rins[] | select(. as $i | ($catchins | index($i)) == null)] else [] end) as $need
 | ([$r[] | select(((.outbound? // "") == "direct"
                   and ((.rule_set? // []) | length) == 0
-                  and ((.inbound? // []) | length) == 1
-                  and ((.inbound[0]) as $i | ($rins | index($i)) != null)) | not)]) as $base
-| ($base + [$need[] as $i | {inbound: [$i], outbound: "direct"}]) as $all
-| .route.rules = ($all | to_entries
+                  and ((.inbound? // []) | length) == 1) | not)]) as $base
+| .route.rules = ($base | to_entries
     | map({i: .key, r: .value, p: (
         (.value) as $x
         | if (($x.action? // "") == "reject") then 0
           elif (($x.action? // "") == "sniff") then 1
           elif (((($x.outbound? // "") | startswith("relay-out-")) and (((($x.rule_set? // []) | length)) > 0))) then 2
           elif (($x.outbound? // "") | startswith("relay-out-")) then 3
-          elif ((($x.outbound? // "") == "direct") and ((($x.inbound? // []) | length) > 0)) then 4
           elif (($x.outbound? // "") == "warp-out") then 5
           else 6 end)})
     | sort_by([.p, .i]) | map(.r))
