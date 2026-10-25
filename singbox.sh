@@ -8181,9 +8181,12 @@ _advanced_features() {
     local script_name="advanced_relay.sh"
     local script_path="${SINGBOX_DIR}/${script_name}"
     
+    _info "正在进入进阶功能，脚本路径: ${script_path}"
+    
     # 优先检测当前目录 (开发者/测试点优先)
     if [ -f "$SCRIPT_DIR/$script_name" ]; then
         script_path="$SCRIPT_DIR/$script_name"
+        _info "使用当前目录脚本: ${script_path}"
     fi
 
     # 如果都不存在，则下载
@@ -8203,15 +8206,32 @@ _advanced_features() {
 
     # 执行脚本
     if [ -f "$script_path" ]; then
+        _info "正在执行脚本: ${script_path}"
         if ! bash -n "$script_path" 2>/dev/null; then
             _error "进阶脚本未通过 Bash 语法检查，已拒绝执行: ${script_path}"
+            _error "请尝试手动执行以下命令获取错误信息:"
+            _error "bash -n \"${script_path}\""
             return 1
         fi
         # 赋予权限并执行
         chmod 755 "$script_path"
+        _info "脚本执行完成，正在启动进阶功能..."
         bash "$script_path"
+        local exit_code=$?
+        if [ $exit_code -ne 0 ]; then
+            _error "进阶脚本执行失败，退出码: $exit_code"
+            _error "请尝试手动执行以下命令获取错误信息:"
+            _error "\"${script_path}\""
+            _error "或者查看系统日志: journalctl -u sing-box-relay.service"
+            return 1
+        fi
+        _success "进阶功能已正常退出"
     else
         _error "找不到进阶脚本文件: ${script_path}"
+        _error "请确保脚本文件存在于以下位置之一:"
+        _error "1. 当前目录: ${SCRIPT_DIR}/${script_name}"
+        _error "2. 默认目录: ${SINGBOX_DIR}/${script_name}"
+        return 1
     fi
 }
 
