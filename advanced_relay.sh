@@ -4337,13 +4337,18 @@ _warp_apply_takeover() {
     local cfg_defs cfg_used conflict="" remove_tags="" inject_rules="${new_rules:-}" inject_rs="$rs_arr"
     cfg_used=$(jq -r '[(.route.rules[]? | .rule_set[]?)] | unique | join(" ")' "$CONFIG_FILE" 2>/dev/null)
     cfg_defs=$(jq -r '[.route.rule_set[]?.tag] | unique | join(" ")' "$CONFIG_FILE" 2>/dev/null)
+    # SX: relay.json 里被"非 WARP 规则"引用的 tag 也算冲突 —— 否则 WARP 自定义规则若用了
+    #     和落地同名的规则集(如 rules/landing.json → tag "landing"), 会覆盖落地那份定义、
+    #     并把落地规则改写成走 warp-out (实测踩过: 落地分流直接消失)。
+    local relay_used
+    relay_used=$(jq -r '[(.route.rules[]? | select((.outbound? // "") != "warp-out") | .rule_set[]?)] | unique | join(" ")' "$RELAY_CONFIG_FILE" 2>/dev/null)
     local new_tags=""
     [ -n "$rs_arr" ] && new_tags=$(printf '%s' "$rs_arr" | grep -o 'tag:"[^"]*"' | sed 's/tag:"//;s/"$//' | tr '\n' ' ')
     local _t
     if [ -n "$new_tags" ]; then
-        # 冲突组: config.json 定义存在且被自身规则引用 → 改名错开
+        # 冲突组: config.json 或 relay 自身(非 WARP)已引用 → 改名错开
         for _t in $new_tags; do
-            case " $cfg_used " in *" $_t "*) conflict="${conflict}${_t} " ;; esac
+            case " $cfg_used $relay_used " in *" $_t "*) conflict="${conflict}${_t} " ;; esac
         done
         inject_rs="$rs_arr"
         if [ -n "$conflict" ]; then
@@ -4388,8 +4393,19 @@ _warp_apply_takeover() {
     # 必报 "缺少 rule_set"。因此定义随规则一并写进 relay.json (同一条原子修改, 幂等)。
     # rm_list: relay.json 侧待清除的 tag —— 上次引用的 (old_tags, 已含改名后的 warp-*) +
     #          本次注入的原名 + 冲突组原名 (清掉 relay 里可能残留的孤儿同名定义)
+    # SX: 但"仍被非 WARP 规则引用"的 tag 绝不能删 —— 否则落地规则引用的定义被清掉,
+    #     sing-box check 会报 rule-set 不存在 (实测: landing 定义被删、落地规则还在)
     local rm_list="[]" all_rm="${old_tags} ${new_tags} ${conflict}"
-    [ -n "$all_rm" ] && rm_list=$(printf '%s' "$all_rm" | tr ' ' '\n' | sed '/^$/d;s/^/"/;s/$/"/' | paste -sd, - | sed 's/^/[/;s/$/]/')
+    if [ -n "$all_rm" ]; then
+        local _rm_items="" _t2
+        for _t2 in $all_rm; do
+            case " ${relay_used} " in *" ${_t2} "*) continue ;; esac
+            _rm_items="${_rm_items}${_t2} "
+        done
+        if [ -n "$_rm_items" ]; then
+            rm_list=$(printf '%s' "$_rm_items" | tr ' ' '\n' | sed '/^$/d;s/^/"/;s/$/"/' | paste -sd, - | sed 's/^/[/;s/$/]/')
+        fi
+    fi
     local rs_flt=".route.rule_set = ((.route.rule_set // []) | map(select(.tag as \$t | ${rm_list} | index(\$t) | not)))"
     [ -n "$rs_arr" ] && rs_flt="${rs_flt} + [${inject_rs}]"
 
@@ -4490,7 +4506,7 @@ _warp_custom_menu() {
         echo -e "  ${YELLOW}规则内域名走 WARP, 规则外走直连${NC}"
         echo ""
         echo -e "    ${GREEN}[1]${NC} 一键解锁 AI 和主流媒体 (OpenAI/Gemini/Claude + Netflix/Disney+/YouTube/Spotify)"
-        echo -e "    ${GREEN}[2]${NC} 自定义规则 (规则集 URL/域名混合输入, 回车 = 默认规则集 rules/landing.json)"
+        echo -e "    ${GREEN}[2]${NC} 自定义规则 (规则集 URL/域名混合输入, 回车 = WARP 专用规则集 rules/warp.json)"
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local c
@@ -4509,8 +4525,8 @@ _warp_custom_menu() {
             2)
                 local entries rs_arr="" domains="" _first=true rule_json_arr="[]"
                 echo -e "  ${CYAN}输入条目 (空格分隔): 规则集 https://.../xx.srs|.json 或纯域名${NC}"
-                read -p "  (回车 = 默认规则集 rules/landing.json): " entries
-                [ -z "$entries" ] && entries="https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing.json"
+                read -p "  (回车 = WARP 专用规则集 rules/warp.json): " entries
+                [ -z "$entries" ] && entries="https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/warp.json"
                 local e _t _fmt ok_any=false
                 for e in $entries; do
                     if [[ "$e" =~ ^https?://.+\.(srs|json)$ ]]; then

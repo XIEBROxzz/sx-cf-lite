@@ -81,3 +81,19 @@ EOF
 ```
 
 落地发不出 UDP 时**不要开** `[U]`：DNS 会被送过去解析不出来，表现是所有网站都打不开。
+
+## WARP 专用（`rules/warp.json`，89 域名）
+
+`[9] WARP 出站管理 → [2] 启用接管并设置规则 → [2] 自定义规则` 里**直接回车**就会用这份，
+它是 `landing.json` + `landing-v2.json` 的并集（去掉探针域名），所以一处规则同时覆盖：
+
+- YouTube 整站 + YT 音乐、Google 搜索、Google Play（含下载 CDN）
+- Gemini 与 Google 其他 AI、主流 AI（OpenAI/Claude/Grok/...）
+
+**为什么要单独一份**：WARP 的自定义规则集 tag 由文件名生成，如果直接用 `rules/landing.json`，
+tag 会和落地那份**撞名**（都叫 `landing`），WARP 写入时会覆盖同名的定义、把落地规则改成走
+`warp-out` —— 实测会导致落地分流整个消失。现在：
+
+- WARP 默认指向 `rules/warp.json`（tag 是 `warp`，天然不冲突）；
+- 即使你手动填了 `landing.json`，只要该 tag 已被非 WARP 规则引用，WARP 会自动改用
+  `warp-<tag>` 前缀，并保留原定义不被删除。
