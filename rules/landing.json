@@ -4,10 +4,15 @@
     {
       "domain_suffix": [
         "music.youtube.com",
+        "youtube.com",
+        "youtu.be",
+        "youtube-nocookie.com",
         "youtubei.googleapis.com",
         "googlevideo.com",
         "ytimg.com",
         "consent.youtube.com",
+        "www.google.com",
+        "google.com.hk",
         "gemini.google",
         "gemini.google.com",
         "geminiweb-pa.clients.google.com",
