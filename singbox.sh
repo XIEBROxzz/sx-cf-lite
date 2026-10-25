@@ -13,11 +13,13 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # 基础路径定义
-# SX: 版本 1.1 —— CF-A 并入主 sing-box (cfa-* 入站, 配置地基见文件说明块);
+# SX: 版本 1.2 —— CF-A 并入主 sing-box (cfa-* 入站, 配置地基见文件说明块);
 #     [19] 优选订阅 vless 走无损参数模式逐节点出订阅; 菜单输出统一停留防闪回;
 #     1.1: CRLF 自动转 LF (advanced_relay.sh 曾以 CRLF 入库, Linux 下 bash -n 判语法错误 →
 #          [18] 进阶功能闪回主菜单、[13] 整组更新被拒绝); 菜单动作返回非 0 时强制停留一次
-export SCRIPT_VERSION="1.1"
+#     1.2: 进阶转发 [2]/[3] 改为一次添加一个节点 (名称必可自定义); [8] 清空补齐 rule_set
+#          定义清理, 空状态不再误报"清空失败"
+export SCRIPT_VERSION="1.2"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"

@@ -1846,12 +1846,18 @@ _finalize_relay_setup() {
     done
     outbound_json=$(printf '%s' "$outbound_json" | jq --arg t "$out_tag" '.tag = $t')
 
-    # 节点名: 回车 = 识别名 (链接#片段); 手动流程兜底 类型-端口
+    # 节点名: 回车 = 识别名 (链接#片段 / Token 内 name); 手动流程兜底 类型-端口
+    # SX: 两条导入路径 ([2] Token / [3] 分享链接) 都必定走到这里, 名称一定可改
     local node_name="${default_name:-}"
-    [ -z "$node_name" ] && node_name="${dest_type}-${dest_port}"
+    if [ -z "$node_name" ] || [ "$node_name" = "null" ]; then
+        node_name="${dest_type}-${dest_port}"
+    fi
     local _input_name=""
     echo ""
-    read -p "  请输入落地节点名称 (回车: ${node_name}): " _input_name
+    read -p "  请输入落地节点名称 (直接回车 = ${node_name}): " _input_name
+    # 去首尾空白; 只敲了空格视同直接回车
+    _input_name="${_input_name#"${_input_name%%[![:space:]]*}"}"
+    _input_name="${_input_name%"${_input_name##*[![:space:]]}"}"
     [ -n "$_input_name" ] && node_name="$_input_name"
 
     _info "正在写入落地节点 ${node_name} (${out_tag})..."
@@ -1896,13 +1902,8 @@ _finalize_relay_setup() {
     echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
     echo -e "  对接状态: ${YELLOW}未对接 —— 入口对接请在 [R] 中转分流管理 → [1] 设置中转节点 (扫描入口, 多选落地)${NC}"
     echo ""
-    echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
-    echo -e "  继续添加落地节点: ${GREEN}回车=继续添加, 0=返回${NC}"
-    echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
-    read -p "  请选择: " _continue_add
-    if [[ "$_continue_add" == "0" ]]; then
-        return
-    fi
+    # SX: 单次添加 —— 加完停留一次就回菜单, 想继续加再进 [2]/[3]
+    _pause_relay
 }
 
 # --- 2. 中转机配置 (导入 Token) ---
@@ -2405,14 +2406,25 @@ _clear_all_relays() {
     local relay_ports
     relay_ports=$(jq -r '.inbounds[]? | select(.listen_port?) | "\(.listen_port)|\(if (.type? == "hysteria2" or .type? == "tuic" or .type? == "shadowsocks" or .type? == "socks") then "udp" else "tcp" end)"' "$CONFIG_FILE" 2>/dev/null | sort -u || true)
 
+    local _mutated="false"
     if [ "$failed" != "true" ]; then
         local clear_filter
-        clear_filter="$relay_tags as \$relay_in | [.route.rules[]? | select(((.outbound? // \"\") | startswith(\"relay-out-\"))) | .outbound] as \$relay_out | .inbounds = [(.inbounds // [])[] | select((.tag as \$tag | (\$relay_in | index(\$tag))) == null)] | .outbounds = [(.outbounds // [])[] | select((.tag as \$tag | (\$relay_out | index(\$tag))) == null and ((.tag? // \"\") | startswith(\"relay-out-\") | not))] | .route.rules = [(.route.rules // [])[] | select((.inbound as \$tag | (\$relay_in | index(\$tag))) == null and (((.outbound? // \"\") | startswith(\"relay-out-\")) | not))]"
-        _atomic_modify_json "$CONFIG_FILE" "$clear_filter" || failed="true"
-        _atomic_modify_json "$LINKS_FILE" '{}' || failed="true"
+        # SX: 末尾补 rule_set 定义清理 —— 只留仍被规则的 rule_set 引用的定义 (WARP 接管规则还在, 其定义保留);
+        #     旧版只删 rules 不删定义, [8] 清空后 relay.json 里会残留 geosite-*/.srs 定义 (与 [5] 单删不一致)
+        clear_filter="$relay_tags as \$relay_in | [.route.rules[]? | select(((.outbound? // \"\") | startswith(\"relay-out-\"))) | .outbound] as \$relay_out | .inbounds = [(.inbounds // [])[] | select((.tag as \$tag | (\$relay_in | index(\$tag))) == null)] | .outbounds = [(.outbounds // [])[] | select((.tag as \$tag | (\$relay_out | index(\$tag))) == null and ((.tag? // \"\") | startswith(\"relay-out-\") | not))] | .route.rules = [(.route.rules // [])[] | select((.inbound as \$tag | (\$relay_in | index(\$tag))) == null and (((.outbound? // \"\") | startswith(\"relay-out-\")) | not))] | ([.route.rules[]? | .rule_set[]?] as \$used | if ((.route.rule_set? // []) | length) > 0 then .route.rule_set = ((.route.rule_set // []) | map(select(.tag as \$t | (\$used | index(\$t)) != null))) else . end)"
+        # SX: _atomic_modify_json 对不存在的文件直接返回 1 —— 全新机器上没有 relay.json,
+        #     不能把"本来就空"判成"清空失败"。改为: 有文件才改。
+        #     注意只有 relay.json 被改写才需要重启校验 (links 单独写不需要, 否则空状态会因
+        #     _check_combined_config 找不到 relay.json 而误报清空失败)。
+        if [ -f "$CONFIG_FILE" ]; then
+            if _atomic_modify_json "$CONFIG_FILE" "$clear_filter"; then _mutated="true"; else failed="true"; fi
+        fi
+        if [ -f "$LINKS_FILE" ]; then
+            _atomic_modify_json "$LINKS_FILE" '{}' || failed="true"
+        fi
     fi
 
-    if [ "$failed" = "true" ] || ! _restart_checked; then
+    if [ "$failed" = "true" ] || { [ "$_mutated" = "true" ] && ! _restart_checked; }; then
         _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
         _txn_restore_file "$txn_dir" links "$LINKS_FILE"
         _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
@@ -2448,7 +2460,11 @@ _clear_all_relays() {
     _state_lock_release
     local _sweep_port_warn
     _sweep_port_warn="$(_relay_report_residue_ports "$relay_ports")"
-    _success "全部中转已清空；主节点、Xray 与端口转发配置均已保留${_sweep_port_warn}"
+    if [ "$_mutated" = "true" ]; then
+        _success "全部中转已清空；主节点、Xray、WARP 与端口转发配置均已保留${_sweep_port_warn}"
+    else
+        _success "当前没有中转配置可清空；已顺带清扫残留 (证书/跳跃规则/事务临时目录)${_sweep_port_warn}"
+    fi
 }
 
 # SX: 中转层根级清扫 (清空后调用) —— 目标是"清空之后没有暗雷":
@@ -4617,31 +4633,18 @@ _menu() {
         read -p "  请输入选项 [0-9 或 R/W]: " choice
         case $choice in
             1) _landing_config ;;
-            2) while :; do 
-                _relay_config
-                echo ""
-                echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
-                echo -e "  继续添加落地节点: ${GREEN}回车=继续添加, 0=返回中转菜单${NC}"
-                echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
-                read -p "  请选择: " _more_l
-                [[ "$_more_l" == "0" ]] && break
-              done ;;
-            3) while :; do 
-                _import_link_config
-                echo ""
-                echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
-                echo -e "  继续添加落地节点: ${GREEN}回车=继续添加, 0=返回中转菜单${NC}"
-                echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
-                read -p "  请选择: " _more_t
-                [[ "$_more_t" == "0" ]] && break
-              done ;;
+            # SX: 每次进入只添加一个 —— 不再套 while 循环连续追问, 加完停留一次即回菜单
+            2) _relay_config ;;
+            3) _import_link_config ;;
             4) _view_relays ;;
             5) _delete_landing ;;
             6) _delete_forward ;;
             7) _modify_relay_port ;;
-            8) echo ""; _warn "确认清空所有中转配置?"; read -p "  (y/N): " cn;
-               if [ "$cn" == "y" ]; then
+            8) echo ""; _warn "确认清空所有中转配置? (主节点/WARP/端口转发保留)"; read -p "  (y/N): " cn
+               if [[ "$cn" =~ ^[Yy]$ ]]; then
                    _clear_all_relays
+                   # SX: 清空结果必须停留, 否则被下一轮 clear 瞬擦
+                   _pause_relay
                fi ;;
             0) break ;;
             9) _port_forward_menu ;;
