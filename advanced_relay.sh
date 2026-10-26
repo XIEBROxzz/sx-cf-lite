@@ -4646,17 +4646,19 @@ EOF
     return 0
 }
 
+
+
+
 # ============================================================
-# SX: 刷出口地区 —— 反复强制重新握手, 直到 WARP 出口落到目标国家/地区
-#     原理同社区脚本: 重启隧道 → 探出口 → 不匹配再重启
-#     (WARP 出口由 Cloudflare anycast + NAT 池随机分配, 只能"抽"不能"选")
-#     代价: 每轮重启 sing-box, 期间连接会短暂中断; 是否能命中取决于 Cloudflare 分区池
+# SX: 逐个换 WARP 端点探测目标地区 —— 只换 endpoint 的 IP:端口, 不改账户
+#     原理: anycast 下"重启"只会换同一 PoP 的 IP 池; 换端点前缀才可能换 PoP/地区。
+#     做法: 每个候选端点起一个临时实例探测 (不动线上服务), 命中后只改一次配置并重启。
 # ============================================================
-_warp_probe_country() {
-    local st ep tport tcfg tlog pid out
-    st=$(_warp_state_file)
-    [ -s "$st" ] || return 1
+_warp_probe_with_endpoint() {
+    local addr="$1" port="$2" ep tport tcfg tlog pid out
     ep=$(_warp_endpoint_json) || return 1
+    ep=$(printf '%s' "$ep" | jq --arg a "$addr" --arg p "$port" '
+        .peers = ((.peers // [{}]) | .[0].address = $a | .[0].port = ($p | tonumber))' 2>/dev/null) || return 1
     tport=41951
     while _check_port_occupied "$tport"; do tport=$((tport+1)); [ "$tport" -gt 41990 ] && break; done
     tcfg=$(mktemp) || return 1
@@ -4674,7 +4676,7 @@ EOF
     "$SINGBOX_BIN" run -c "$tcfg" > "$tlog" 2>&1 &
     pid=$!
     sleep 3
-    out=$(curl -sS -m 12 -x "socks5h://127.0.0.1:$tport" "http://ip-api.com/json/?fields=query,countryCode,isp" 2>/dev/null) || true
+    out=$(curl -sS -m 10 -x "socks5h://127.0.0.1:$tport" "http://ip-api.com/json/?fields=query,countryCode,isp" 2>/dev/null) || true
     kill "$pid" 2>/dev/null || true
     rm -f -- "$tcfg" "$tlog"
     printf '%s' "$out" | jq -r 'if (.query // "") != "" then "\(.query)|\(.countryCode // "??")|\(.isp // "")" else empty end' 2>/dev/null
@@ -4687,49 +4689,84 @@ _warp_roll_region() {
         _error "尚未注册 WARP, 请先选 [1] 注册"
         _pause_anykey; return 1
     fi
+    if ! jq -e '.endpoints[]? | select(.tag == "warp-out")' "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
+        _error "当前还没有 WARP 端点, 请先 [2] 启用接管 (任选一种规则) 再回来刷"
+        _pause_anykey; return 1
+    fi
     clear
-    echo -e "\n  ${CYAN}==== 刷 WARP 出口地区 ====${NC}"
-    echo -e "  ${YELLOW}原理: 每轮强制重新握手, WARP 出口由 Cloudflare 随机分配;${NC}"
-    echo -e "  ${YELLOW}      不匹配就再摇一次, 直到命中目标地区。${NC}"
-    echo -e "  ${RED}代价: 每轮会重启 sing-box, 期间所有连接会短暂中断。${NC}"
+    echo -e "\n  ${CYAN}==== 刷 WARP 出口地区 (逐个换端点) ====${NC}"
+    echo -e "  ${YELLOW}为什么重启没用: anycast 会把你固定导到同一 PoP, 重启只换池内 IP;${NC}"
+    echo -e "  ${YELLOW}换 endpoint 的 IP 前缀, 才可能落到别的 PoP (别的地区)。${NC}"
+    echo -e "  ${GREEN}安全: 每个候选都先用临时实例探测, 命中后才改一次线上配置。${NC}"
     echo ""
-    local area maxn
+    local area
     read -p "  目标地区代码 (US/HK/SG/JP/TW..., 回车=US): " area
     area=$(printf '%s' "${area:-US}" | tr 'a-z' 'A-Z')
-    read -p "  最多重连次数 (回车=20, 上限 200): " maxn
-    [[ "$maxn" =~ ^[0-9]+$ ]] && [ "$maxn" -ge 1 ] && [ "$maxn" -le 200 ] || maxn=20
+
+    # 候选端点: 常见 WARP anycast 前缀 × 常用端口
+    local cands=() ip p
+    for ip in 162.159.192.1 162.159.192.2 162.159.192.3 162.159.192.4 \
+              162.159.193.1 162.159.193.2 162.159.195.1 \
+              188.114.96.1 188.114.97.1 188.114.98.1 188.114.99.1; do
+        for p in 2408 500; do cands+=("$ip $p"); done
+    done
+    local total=${#cands[@]}
+
+    read -p "  最多尝试几个端点 (回车=${total}): " maxn
+    [[ "$maxn" =~ ^[0-9]+$ ]] && [ "$maxn" -ge 1 ] && [ "$maxn" -le "$total" ] || maxn=$total
+
     local _y
-    _warn "确认开始? 最多 ${maxn} 轮, 每轮约 6-10 秒。"
+    _warn "将依次探测 ${maxn} 个端点 (每个约 6-8 秒), 期间不改动线上配置。"
     read -p "  (y/N): " _y
     [[ "$_y" =~ ^[Yy]$ ]] || { _info "已取消"; _pause_anykey; return 0; }
 
-    local i=0 hit="" r ip cc rest isp
-    while [ "$i" -lt "$maxn" ]; do
+    local i=0 winner="" r ip2 cc rest isp
+    for cand in "${cands[@]}"; do
         i=$((i+1))
-        _manage_service restart >/dev/null 2>&1
-        sleep 3
-        r=$(_warp_probe_country)
+        [ "$i" -gt "$maxn" ] && break
+        ip="${cand%% *}"; p="${cand##* }"
+        printf '  第 %2d/%d 轮: %-16s:%-5s ' "$i" "$maxn" "$ip" "$p"
+        r=$(_warp_probe_with_endpoint "$ip" "$p")
         if [ -z "$r" ]; then
-            echo -e "  第 ${i}/${maxn} 轮: ${YELLOW}探测失败 (WARP 未连上)${NC}"
+            echo -e "${YELLOW}连不上${NC}"
             continue
         fi
-        ip="${r%%|*}"; rest="${r#*|}"; cc="${rest%%|*}"; isp="${rest#*|}"
+        ip2="${r%%|*}"; rest="${r#*|}"; cc="${rest%%|*}"; isp="${rest#*|}"
         if [ "$cc" = "$area" ]; then
-            echo -e "  第 ${i}/${maxn} 轮: ${GREEN}${ip} (${cc}) — 命中!${NC}"
-            hit=1; break
+            echo -e "→ ${GREEN}${cc} 命中!${NC}"
+            winner="$ip $p"
+            break
         fi
-        echo -e "  第 ${i}/${maxn} 轮: ${ip} (${cc}) — 不匹配, 继续"
+        echo -e "→ ${cc}"
     done
 
-    if [ -n "$hit" ]; then
-        _success "已命中目标地区 ${area} (第 ${i} 轮)"
-        _info "出口每次握手都可能变, 建议用 [3] 出口测试复核一次。"
-    else
-        _warn "重试 ${maxn} 轮仍未命中 ${area}; 配置保持原样, 不影响使用。"
+    if [ -z "$winner" ]; then
+        _warn "试了 ${i} 个端点都没命中 ${area}; 线上配置未改动。"
+        _pause_anykey; return 1
     fi
+
+    # 命中: 只改一次线上端点
+    local wip="${winner%% *}" wport="${winner##* }"
+    local bak="${RELAY_CONFIG_FILE}.ep.bak"
+    cp -af "$RELAY_CONFIG_FILE" "$bak" 2>/dev/null
+    if ! _atomic_modify_json "$RELAY_CONFIG_FILE" '
+        .endpoints = ((.endpoints // []) | map(
+            if .tag == "warp-out"
+            then .peers = ((.peers // [{}]) | .[0].address = $a | .[0].port = ($p | tonumber))
+            else . end))
+    ' --arg a "$wip" --arg p "$wport"; then
+        _error "写入失败"; [ -f "$bak" ] && mv -f "$bak" "$RELAY_CONFIG_FILE"; _pause_anykey; return 1
+    fi
+    if ! _restart_checked; then
+        [ -f "$bak" ] && mv -f "$bak" "$RELAY_CONFIG_FILE"
+        _manage_service restart >/dev/null 2>&1 || true
+        _error "校验失败, 已还原原端点"; _pause_anykey; return 1
+    fi
+    rm -f "$bak"
+    _success "已切到端点 ${wip}:${wport} (出口 ${cc})"
+    _info "该端点已写入 relay.json; 可用 [3] 出口测试复核。"
     _pause_anykey
 }
-
 
 _warp_menu() {
     while true; do
@@ -4756,7 +4793,7 @@ _warp_menu() {
         echo -e "    ${GREEN}[2]${NC} 启用接管并设置规则 (IPv4/IPv6/自定义规则, 可叠加)"
         echo -e "    ${GREEN}[3]${NC} WARP 出口测试 (临时实例实测出口 IP)"
         echo -e "    ${GREEN}[4]${NC} 关闭 WARP 接管 (移除全部接管规则, 保留账户)"
-        echo -e "    ${GREEN}[5]${NC} 刷出口地区 (反复重连, 直到命中目标地区)"
+        echo -e "    ${GREEN}[5]${NC} 刷出口地区 (逐个换端点, 直到命中目标地区)"
         echo -e "    ${RED}[6]${NC} 彻底移除 WARP (删除本地密钥并注销云端账户)"
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
