@@ -5066,6 +5066,55 @@ _ipfam_menu() {
     done
 }
 
+# ============================================================
+# SX: 中转排障 —— 收纳"特定故障才用"的两个开关
+#     [U] UDP 转发   : 中转发不出 UDP(DNS) 时, 交给落地代发
+#     [V] 落地地址族 : 中转连落地的域名解析偏好
+# ============================================================
+_relay_troubleshoot_menu() {
+    while true; do
+        clear
+        local us is
+        us=$(_udp_route_state); is=$(_ipfam_state)
+        echo ""
+        echo -e "  ${CYAN}==== 中转排障 (平时保持默认即可) ====${NC}"
+        echo ""
+        if [ -n "$us" ]; then
+            local _t _p _nm
+            _t="${us%%|*}"; _p="${us##*|}"
+            _nm=$(jq -r --arg k "$_t" '.[$k].node_name // $k' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
+            if [ "$_p" = "0" ]; then
+                echo -e "  UDP 转发 : ${GREEN}已开启${NC} (全部 UDP → ${_nm})"
+            else
+                echo -e "  UDP 转发 : ${GREEN}已开启${NC} (UDP/${_p} → ${_nm})"
+            fi
+        else
+            echo -e "  UDP 转发 : ${YELLOW}关闭${NC}"
+        fi
+        echo -e "  落地地址族: ${GREEN}${is:-不干预}${NC}"
+        echo ""
+        echo -e "  ${YELLOW}[1] 什么时候用? 中转机自己发不出 UDP (典型: NAT 小鸡 / 机房限 UDP 出站),${NC}"
+        echo -e "  ${YELLOW}    表现为节点能连、但网页打不开(域名解析失败)。开了由落地代发 DNS。${NC}"
+        echo -e "  ${YELLOW}    前提: 落地能发 UDP, 且落地是 VLESS/VMess 这类 TCP 隧道。${NC}"
+        echo ""
+        echo -e "  ${YELLOW}[2] 什么时候用? 落地地址写的是域名, 且解析到的那一族连不上${NC}"
+        echo -e "  ${YELLOW}    (例如落地有 AAAA 但中转没有 IPv6)。落地填 IP 的完全不相关。${NC}"
+        echo ""
+        echo -e "    ${GREEN}[1]${NC} UDP 转发 (DNS/QUIC 交给落地)"
+        echo -e "    ${GREEN}[2]${NC} 落地地址族 (IPv4/IPv6 优先)"
+        echo -e "    ${YELLOW}[0]${NC} 返回"
+        echo ""
+        local c
+        read -p "  请选择 [0-2]: " c
+        case "$c" in
+            1) _udp_route_menu ;;
+            2) _ipfam_menu ;;
+            0|"") return 0 ;;
+            *) _error "无效输入"; sleep 1 ;;
+        esac
+    done
+}
+
 _menu() {
     _check_root || return 1
     _check_deps || return 1
@@ -5127,16 +5176,6 @@ _menu() {
         echo -e "    ${RED}[R]${NC} 清空所有中转配置"
         echo ""
         echo -e "  ${CYAN}【出口优化】${NC}"
-        echo -e "    ${GREEN}[9]${NC} WARP 出站管理 (Cloudflare 免费出口)"
-        # SX: UDP 转发开关 —— NAT 小鸡禁用 UDP 时, 把 DNS/QUIC 交给落地(走 TCP 隧道)
-        local _udp_st _udp_disp
-        _udp_st=$(_udp_route_state)
-        if [ -n "$_udp_st" ]; then
-            if [ "${_udp_st##*|}" = "0" ]; then _udp_disp="全部 UDP"; else _udp_disp="UDP/${_udp_st##*|}"; fi
-            echo -e "    ${GREEN}[U]${NC} UDP 转发 ${GREEN}已开启${NC} (${_udp_disp} → $(jq -r --arg t "${_udp_st%%|*}" '.[$t].node_name // $t' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null))"
-        else
-            echo -e "    ${GREEN}[U]${NC} UDP 转发 ${YELLOW}已关闭${NC} (NAT 小鸡禁 UDP 时打开)"
-        fi
         # SX: 本机直连地址族 (作用于 config.json 的 direct 出站)
         local _df_st _df_disp
         _df_st=$(_direct_fam_state)
@@ -5149,24 +5188,29 @@ _menu() {
             *)           _df_disp="${YELLOW}${_df_st}${NC}" ;;
         esac
         echo -e "    ${GREEN}[B]${NC} 本机直连地址族: ${_df_disp}   ${YELLOW}(治 v4 送中)${NC}"
-        # SX: IPv4/IPv6 优先 (作用于全部落地出站)
-        local _ipf_st _ipf_disp
+        echo -e "    ${GREEN}[9]${NC} WARP 出站管理 (Cloudflare 免费出口)"
+        echo -e "    ${GREEN}[T]${NC} 中转排障 (UDP 转发 / 落地地址族)"
+        # SX: 排障类开关 (U/V) 收进 [T], 主菜单只汇总一行状态
+        local _udp_st _udp_disp _ipf_st _ipf_disp
+        _udp_st=$(_udp_route_state)
+        if [ -n "$_udp_st" ]; then
+            if [ "${_udp_st##*|}" = "0" ]; then _udp_disp="全部 UDP"; else _udp_disp="DNS/${_udp_st##*|}"; fi
+            _udp_disp="${GREEN}UDP 转发=${_udp_disp}${NC}"
+        else
+            _udp_disp="${YELLOW}UDP 转发=关${NC}"
+        fi
         _ipf_st=$(_ipfam_state)
         case "$_ipf_st" in
-            "")          _ipf_disp="${YELLOW}不干预${NC} (交给落地解析)" ;;
-            prefer_ipv4) _ipf_disp="${GREEN}优先 IPv4${NC}" ;;
-            prefer_ipv6) _ipf_disp="${GREEN}优先 IPv6${NC}" ;;
-            ipv4_only)   _ipf_disp="${GREEN}仅 IPv4${NC}" ;;
-            ipv6_only)   _ipf_disp="${GREEN}仅 IPv6${NC}" ;;
-            *)           _ipf_disp="${YELLOW}${_ipf_st}${NC}" ;;
+            "")          _ipf_disp="${YELLOW}落地地址族=不干预${NC}" ;;
+            *)           _ipf_disp="${GREEN}落地地址族=${_ipf_st}${NC}" ;;
         esac
-        echo -e "    ${GREEN}[V]${NC} IPv4/IPv6 优先: ${_ipf_disp}"
+        echo -e "        ${_udp_disp}   ${_ipf_disp}"
         # SX: 两套规则同时开启时给一句口径说明 —— 规范化后落地永远优先, WARP 只兜主节点
         local _warp_on _nland
         _warp_on=$(jq -r '[.route.rules[]? | select(.outbound? == "warp-out")] | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
         _nland=$(jq -r '[.outbounds[]? | select((.tag // "") | startswith("relay-out-"))] | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
         if [ "${_warp_on:-0}" -gt 0 ] 2>/dev/null && [ "${_nland:-0}" -gt 0 ] 2>/dev/null; then
-            echo -e "    ${YELLOW}● 同时启用了 中转落地 与 WARP 接管: 落地规则优先; 未命中分流的入口流量走直连, WARP 只接管主节点${NC}"
+            echo -e "    ${YELLOW}● 同时启用了 中转落地 与 WARP 接管: 落地规则优先; 未命中落地规则的流量走 WARP${NC}"
         fi
         echo ""
         echo -e "  ${CYAN}【端口转发】${NC}"
@@ -5175,7 +5219,7 @@ _menu() {
         echo -e "  ─────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-10 或 R/U]: " choice
+        read -p "  请输入选项 [0-10 或 R/B/T]: " choice
         case $choice in
             1) _landing_config ;;
             # SX: 每次进入只添加一个 —— 不再套 while 循环连续追问, 加完停留一次即回菜单
@@ -5195,6 +5239,7 @@ _menu() {
             9|W|w) _warp_menu ;;
             U|u) _udp_route_menu ;;
             B|b) _direct_fam_menu ;;
+            T|t) _relay_troubleshoot_menu ;;
             V|v) _ipfam_menu ;;
             10) _port_forward_menu ;;
             0) break ;;
