@@ -113,6 +113,7 @@ RELAY_RULES_NORMALIZE_FLT='
           elif (($x.action? // "") == "sniff") then 1
           elif (((($x.outbound? // "") | startswith("relay-out-")) and (((($x.rule_set? // []) | length)) > 0))) then 2
           elif (($x.outbound? // "") | startswith("relay-out-")) then 3
+          elif (($x.action? // "") == "resolve") then 4
           elif (($x.outbound? // "") == "warp-out") then 5
           else 6 end)})
     | sort_by([.p, .i]) | map(.r))
@@ -4310,6 +4311,83 @@ _warp_takeover_rs_tags() {
 }
 
 # SX: 应用 WARP 接管 (规则级) —— slot: ip4/ip6/rules/clear; new_rules: 规则 JSON 数组文本; rs_arr: rule_set 注入数组文本(可空)
+# ============================================================
+# SX: WARP 解析策略 —— 域名先解析成哪种地址再进 WARP 隧道
+#     存于 warp.json 的 family 字段 (空 = 双栈默认, 不插 resolve 规则)
+#     生效方式: 在 WARP 规则前插一条同条件的 {action:"resolve", strategy:X},
+#              让 sing-box 先按该策略解析目标域名, 再交给 warp-out
+# ============================================================
+_warp_family_get() {
+    local st
+    st=$(_warp_state_file)
+    [ -s "$st" ] || return 0
+    jq -r '.family // ""' "$st" 2>/dev/null
+}
+
+_warp_family_set() {
+    local st s
+    st=$(_warp_state_file)
+    [ -s "$st" ] || return 1
+    s="$1"
+    if [ -z "$s" ]; then
+        jq 'del(.family)' "$st" > "${st}.tmp" 2>/dev/null && mv -f "${st}.tmp" "$st"
+    else
+        jq --arg s "$s" '.family = $s' "$st" > "${st}.tmp" 2>/dev/null && mv -f "${st}.tmp" "$st"
+    fi
+    _secure_state_file "$st" 2>/dev/null || true
+}
+
+_warp_family_name() {
+    case "$1" in
+        prefer_ipv4) echo "优先 IPv4" ;;
+        prefer_ipv6) echo "优先 IPv6" ;;
+        ipv4_only)   echo "仅 IPv4" ;;
+        ipv6_only)   echo "仅 IPv6" ;;
+        *)           echo "双栈默认" ;;
+    esac
+}
+
+# 选解析策略: $1 = v4|v6|both; 成功时 echo 策略 (空=双栈), 取消返回 1
+_warp_family_prompt() {
+    local scope="$1" c
+    echo ""
+    echo -e "  ${CYAN}【解析策略】${NC} 目标域名先解析成哪种地址, 再进 WARP 隧道"
+    case "$scope" in
+        v4)
+            echo -e "    ${GREEN}[1]${NC} 双栈默认 (不限制)"
+            echo -e "    ${GREEN}[2]${NC} 优先 IPv4 (prefer_ipv4)"
+            echo -e "    ${GREEN}[3]${NC} 仅 IPv4   (ipv4_only)" ;;
+        v6)
+            echo -e "    ${GREEN}[1]${NC} 双栈默认 (不限制)"
+            echo -e "    ${GREEN}[2]${NC} 优先 IPv6 (prefer_ipv6)"
+            echo -e "    ${GREEN}[3]${NC} 仅 IPv6   (ipv6_only)" ;;
+        *)
+            echo -e "    ${GREEN}[1]${NC} 双栈默认 (回车)"
+            echo -e "    ${GREEN}[2]${NC} 优先 IPv4"
+            echo -e "    ${GREEN}[3]${NC} 优先 IPv6"
+            echo -e "    ${GREEN}[4]${NC} 仅 IPv4"
+            echo -e "    ${GREEN}[5]${NC} 仅 IPv6" ;;
+    esac
+    echo -e "    ${YELLOW}[0]${NC} 取消"
+    read -p "  请选择: " c
+    case "$scope:$c" in
+        "v4:1"|"v4:") echo "" ;;
+        "v4:2") echo "prefer_ipv4" ;;
+        "v4:3") echo "ipv4_only" ;;
+        "v6:1"|"v6:") echo "" ;;
+        "v6:2") echo "prefer_ipv6" ;;
+        "v6:3") echo "ipv6_only" ;;
+        "both:1"|"both:") echo "" ;;
+        "both:2") echo "prefer_ipv4" ;;
+        "both:3") echo "prefer_ipv6" ;;
+        "both:4") echo "ipv4_only" ;;
+        "both:5") echo "ipv6_only" ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+
 _warp_apply_takeover() {
     local slot="$1" new_rules="${2:-}" rs_arr="${3:-}"
     local st ep_json
@@ -4363,6 +4441,19 @@ _warp_apply_takeover() {
             _info "config.json 已在引用同名规则集, WARP 侧改用独立标签: ${conflict// / warp- }"
         fi
     fi
+
+    # SX: 解析策略 (family) —— 在 WARP 规则前插同条件的 resolve 规则,
+    #     让目标域名先按该策略解析, 再进 WARP 隧道 (否则走全局 default_domain_resolver)
+    local _fam
+    _fam=$(_warp_family_get)
+    if [ -n "$_fam" ] && [ -n "$inject_rules" ] && [ "$inject_rules" != "[]" ] && [ "$inject_rules" != "null" ]; then
+        local _rr
+        _rr=$(printf '%s' "$inject_rules" | jq -c --arg s "$_fam" \
+            'map(del(.outbound) + {action: "resolve", strategy: $s} | select(has("domain_regex") or has("rule_set") or has("domain_suffix")))' 2>/dev/null)
+        if [ -n "$_rr" ] && [ "$_rr" != "null" ]; then
+            inject_rules=$(jq -c -n --argjson a "$_rr" --argjson b "$inject_rules" '$a + $b' 2>/dev/null)
+        fi
+    fi
     # 清除组: config.json 定义存在但未被自身规则引用, 且与 WARP 沾边 (上次 relay 引用过 / 本次要注入)
     for _t in $cfg_defs; do
         case " $cfg_used " in *" $_t "*) continue ;; esac
@@ -4412,7 +4503,7 @@ _warp_apply_takeover() {
     # 1) relay.json 单条原子修改: 端点注入 + 槽位规则 + rule_set 定义(同文件) + final=direct
     #    SX: 末尾接顺序规范化 —— WARP 通配规则必须排在落地规则之后, 并给仅分流的入口补直连兜底
     if ! _atomic_modify_json "$RELAY_CONFIG_FILE" \
-        ".endpoints = ((.endpoints // []) | map(select(.tag != \"warp-out\"))) + [${ep_json}] | .route = (.route // {\"rules\":[]}) | ${rules_flt} | ${rs_flt} | .route.final = \"direct\" | ${RELAY_RULES_NORMALIZE_FLT}"; then
+        ".endpoints = ((.endpoints // []) | map(select(.tag != \"warp-out\"))) + [${ep_json}] | .route = (.route // {\"rules\":[]}) | .route.rules = [.route.rules[] | select((.action? // \"\") != \"resolve\")] | ${rules_flt} | ${rs_flt} | .route.final = \"direct\" | ${RELAY_RULES_NORMALIZE_FLT}"; then
         mv -f "$bak_r" "$RELAY_CONFIG_FILE" 2>/dev/null || true; mv -f "$bak_c" "$CONFIG_FILE" 2>/dev/null || true
         _error "WARP 接管规则注入失败。"
         sleep 2; return 1
@@ -4456,9 +4547,11 @@ _warp_disable() {
 _warp_takeover() {
     while true; do
         clear
-        local st sum
+        local st sum fam fam_name
         st=$(_warp_state_file)
         sum=$(_warp_takeover_summary)
+        fam=$(_warp_family_get)
+        fam_name=$(_warp_family_name "$fam")
         echo ""
         echo -e "  ${CYAN}==== WARP 规则接管 ====${NC}"
         if [ -s "$st" ] && jq -e . "$st" >/dev/null 2>&1; then
@@ -4471,24 +4564,35 @@ _warp_takeover() {
         else
             echo -e "  当前接管: ${YELLOW}无${NC} — 未命中流量走直连"
         fi
-        echo -e "  ${YELLOW}规则命中走 WARP, 未命中走直连; 多模式可叠加; 主菜单 [4] 一键关闭${NC}"
+        echo -e "  解析策略: ${GREEN}${fam_name}${NC}   ${YELLOW}(进入各模式后可改)${NC}"
+        echo -e "  ${YELLOW}规则命中走 WARP, 未命中走直连; 多模式可叠加; WARP 菜单 [4] 一键关闭${NC}"
         echo ""
         echo -e "    ${GREEN}[1]${NC} IPv4 接管 (域名 + IPv4 目标全部走 WARP)"
         echo -e "    ${GREEN}[2]${NC} IPv6 接管 (域名 + IPv6 目标全部走 WARP)"
         echo -e "    ${GREEN}[3]${NC} 自定义规则 (解锁 AI+主流媒体 / 规则集 URL/域名)"
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
-        local c
+        local c _f
         read -p "  请选择 [0-3]: " c
         case $c in
-            1) _warp_apply_takeover ip4 '[{"domain_regex":[".*"],"outbound":"warp-out"},{"ip_version":4,"outbound":"warp-out"}]' "" ;;
-            2) _warp_apply_takeover ip6 '[{"domain_regex":[".*"],"outbound":"warp-out"},{"ip_version":6,"outbound":"warp-out"}]' "" ;;
-            3) _warp_custom_menu ;;
+            1)
+                _f=$(_warp_family_prompt v4) || { _info "已取消"; sleep 1; continue; }
+                _warp_family_set "$_f"
+                _warp_apply_takeover ip4 '[{"domain_regex":[".*"],"outbound":"warp-out"},{"ip_version":4,"outbound":"warp-out"}]' "" ;;
+            2)
+                _f=$(_warp_family_prompt v6) || { _info "已取消"; sleep 1; continue; }
+                _warp_family_set "$_f"
+                _warp_apply_takeover ip6 '[{"domain_regex":[".*"],"outbound":"warp-out"},{"ip_version":6,"outbound":"warp-out"}]' "" ;;
+            3)
+                _f=$(_warp_family_prompt both) || { _info "已取消"; sleep 1; continue; }
+                _warp_family_set "$_f"
+                _warp_custom_menu ;;
             0) break ;;
             *) _error "无效选择"; sleep 1 ;;
         esac
     done
 }
+
 
 # SX: WARP 自定义规则接管 (二级菜单) —— [1] 内置解锁组合 (AI+主流媒体) / [2] 自定义规则输入
 _warp_custom_menu() {
@@ -4503,6 +4607,7 @@ _warp_custom_menu() {
         else
             echo -e "  当前接管: ${YELLOW}无${NC} — 未命中流量走直连"
         fi
+        echo -e "  解析策略: ${GREEN}$(_warp_family_name "$(_warp_family_get)")${NC}"
         echo -e "  ${YELLOW}规则内域名走 WARP, 规则外走直连${NC}"
         echo ""
         echo -e "    ${GREEN}[1]${NC} 一键解锁 AI 和主流媒体 (OpenAI/Gemini/Claude + Netflix/Disney+/YouTube/Spotify)"
@@ -4577,7 +4682,7 @@ _warp_remove() {
         cfg_defs=$(jq -r '[.route.rule_set[]?.tag] | unique | join(" ")' "$CONFIG_FILE" 2>/dev/null)
         local rm_list="[]"
         [ -n "${old_tags}${cfg_defs}" ] && rm_list=$(printf '%s' "${old_tags} ${cfg_defs}" | tr ' ' '\n' | sed '/^$/d;s/^/"/;s/$/"/' | paste -sd, - | sed 's/^/[/;s/$/]/')
-        local flt="del(.endpoints[]? | select(.tag == \"warp-out\")) | .route = (.route // {\"rules\":[]}) | .route.rules = ((.route.rules // []) | map(select(.outbound? == \"warp-out\" | not))) | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as \$t | ${rm_list} | index(\$t) | not))) | .route.final = \"direct\""
+        local flt="del(.endpoints[]? | select(.tag == \"warp-out\")) | .route = (.route // {\"rules\":[]}) | .route.rules = ((.route.rules // []) | map(select(.outbound? == \"warp-out\" | not) | select((.action? // "") != \"resolve\"))) | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as \$t | ${rm_list} | index(\$t) | not))) | .route.final = \"direct\""
         if _atomic_modify_json "$RELAY_CONFIG_FILE" "$flt"; then
             if [ "$rm_list" != "[]" ] && [ -s "$CONFIG_FILE" ]; then
                 # 旧版迁移 —— config.json 里可能还残留老版本写入的定义; 带护栏清理 (自身规则仍引用则保留)
