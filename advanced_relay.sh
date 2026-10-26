@@ -5181,6 +5181,7 @@ _menu() {
         echo -e "    ${RED}[R]${NC} 清空所有中转配置"
         echo ""
         echo -e "  ${CYAN}【出口优化】${NC}"
+        echo -e "    ${GREEN}[9]${NC} WARP 出站管理 (Cloudflare 免费出口)"
         # SX: 本机直连地址族 (作用于 config.json 的 direct 出站)
         local _df_st _df_disp
         _df_st=$(_direct_fam_state)
@@ -5192,11 +5193,10 @@ _menu() {
             ipv6_only)   _df_disp="${YELLOW}仅 IPv6${NC}" ;;
             *)           _df_disp="${YELLOW}${_df_st}${NC}" ;;
         esac
-        echo -e "    ${GREEN}[B]${NC} 本机直连地址族: ${_df_disp}   ${YELLOW}(治 v4 送中)${NC}"
-        echo -e "    ${GREEN}[9]${NC} WARP 出站管理 (Cloudflare 免费出口)"
+        echo -e "    ${GREEN}[B]${NC} 本机直连地址族: ${_df_disp}   ${YELLOW}(v4 送中时改走 v6)${NC}"
         echo -e "    ${GREEN}[T]${NC} 中转排障 (UDP 转发 / 落地地址族)"
-        # SX: 排障类开关 (U/V) 收进 [T], 主菜单只汇总一行状态
-        local _udp_st _udp_disp _ipf_st _ipf_disp
+        # SX: 排障类开关 (U/V) 收进 [T], 这里只汇总一行状态 (与 [T] 的文字对齐)
+        local _udp_st _udp_disp _ipf_st _ipf_disp _tsum
         _udp_st=$(_udp_route_state)
         if [ -n "$_udp_st" ]; then
             if [ "${_udp_st##*|}" = "0" ]; then _udp_disp="全部 UDP"; else _udp_disp="DNS/${_udp_st##*|}"; fi
@@ -5205,11 +5205,14 @@ _menu() {
             _udp_disp="${YELLOW}UDP 转发=关${NC}"
         fi
         _ipf_st=$(_ipfam_state)
-        case "$_ipf_st" in
-            "")          _ipf_disp="${YELLOW}落地地址族=不干预${NC}" ;;
-            *)           _ipf_disp="${GREEN}落地地址族=${_ipf_st}${NC}" ;;
-        esac
-        echo -e "        ${_udp_disp}   ${_ipf_disp}"
+        if [ -n "$_ipf_st" ]; then
+            _ipf_disp="${GREEN}落地地址族=${_ipf_st}${NC}"
+        else
+            _ipf_disp="${YELLOW}落地地址族=不干预${NC}"
+        fi
+        _tsum="${_udp_disp}   ${_ipf_disp}"
+        [ -n "$_tsum" ] || _tsum="${YELLOW}UDP 转发=关   落地地址族=不干预${NC}"
+        echo -e "        ${_tsum}"
         # SX: 落地与 WARP 同时启用时给一句口径说明 —— 顺序是 落地→WARP→final
         #     全量接管(带 domain_regex [".*"] 的 catch-all) 才会"未命中走 WARP";
         #     自定义规则模式只把命中的送去 WARP, 其余仍按 final=direct 走直连。
