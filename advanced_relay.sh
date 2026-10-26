@@ -4350,25 +4350,25 @@ _warp_family_name() {
 # 选解析策略: $1 = v4|v6|both; 成功时 echo 策略 (空=双栈), 取消返回 1
 _warp_family_prompt() {
     local scope="$1" c
-    echo ""
-    echo -e "  ${CYAN}【解析策略】${NC} 目标域名先解析成哪种地址, 再进 WARP 隧道"
+    echo "" >&2
+    echo -e "  ${CYAN}【解析策略】${NC} 目标域名先解析成哪种地址, 再进 WARP 隧道" >&2
     case "$scope" in
         v4)
-            echo -e "    ${GREEN}[1]${NC} 双栈默认 (不限制)"
-            echo -e "    ${GREEN}[2]${NC} 优先 IPv4 (prefer_ipv4)"
-            echo -e "    ${GREEN}[3]${NC} 仅 IPv4   (ipv4_only)" ;;
+            echo -e "    ${GREEN}[1]${NC} 双栈默认 (不限制)" >&2
+            echo -e "    ${GREEN}[2]${NC} 优先 IPv4 (prefer_ipv4)" >&2
+            echo -e "    ${GREEN}[3]${NC} 仅 IPv4   (ipv4_only)" >&2 ;;
         v6)
-            echo -e "    ${GREEN}[1]${NC} 双栈默认 (不限制)"
-            echo -e "    ${GREEN}[2]${NC} 优先 IPv6 (prefer_ipv6)"
-            echo -e "    ${GREEN}[3]${NC} 仅 IPv6   (ipv6_only)" ;;
+            echo -e "    ${GREEN}[1]${NC} 双栈默认 (不限制)" >&2
+            echo -e "    ${GREEN}[2]${NC} 优先 IPv6 (prefer_ipv6)" >&2
+            echo -e "    ${GREEN}[3]${NC} 仅 IPv6   (ipv6_only)" >&2 ;;
         *)
-            echo -e "    ${GREEN}[1]${NC} 双栈默认 (回车)"
-            echo -e "    ${GREEN}[2]${NC} 优先 IPv4"
-            echo -e "    ${GREEN}[3]${NC} 优先 IPv6"
-            echo -e "    ${GREEN}[4]${NC} 仅 IPv4"
-            echo -e "    ${GREEN}[5]${NC} 仅 IPv6" ;;
+            echo -e "    ${GREEN}[1]${NC} 双栈默认 (回车)" >&2
+            echo -e "    ${GREEN}[2]${NC} 优先 IPv4" >&2
+            echo -e "    ${GREEN}[3]${NC} 优先 IPv6" >&2
+            echo -e "    ${GREEN}[4]${NC} 仅 IPv4" >&2
+            echo -e "    ${GREEN}[5]${NC} 仅 IPv6" >&2 ;;
     esac
-    echo -e "    ${YELLOW}[0]${NC} 取消"
+    echo -e "    ${YELLOW}[0]${NC} 取消" >&2
     read -p "  请选择: " c
     case "$scope:$c" in
         "v4:1"|"v4:") echo "" ;;
@@ -4682,7 +4682,7 @@ _warp_remove() {
         cfg_defs=$(jq -r '[.route.rule_set[]?.tag] | unique | join(" ")' "$CONFIG_FILE" 2>/dev/null)
         local rm_list="[]"
         [ -n "${old_tags}${cfg_defs}" ] && rm_list=$(printf '%s' "${old_tags} ${cfg_defs}" | tr ' ' '\n' | sed '/^$/d;s/^/"/;s/$/"/' | paste -sd, - | sed 's/^/[/;s/$/]/')
-        local flt="del(.endpoints[]? | select(.tag == \"warp-out\")) | .route = (.route // {\"rules\":[]}) | .route.rules = ((.route.rules // []) | map(select(.outbound? == \"warp-out\" | not) | select((.action? // "") != \"resolve\"))) | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as \$t | ${rm_list} | index(\$t) | not))) | .route.final = \"direct\""
+        local flt="del(.endpoints[]? | select(.tag == \"warp-out\")) | .route = (.route // {\"rules\":[]}) | .route.rules = ((.route.rules // []) | map(select(.outbound? == \"warp-out\" | not) | select((.action? // \"\") != \"resolve\"))) | .route.rule_set = ((.route.rule_set // []) | map(select(.tag as \$t | ${rm_list} | index(\$t) | not))) | .route.final = \"direct\""
         if _atomic_modify_json "$RELAY_CONFIG_FILE" "$flt"; then
             if [ "$rm_list" != "[]" ] && [ -s "$CONFIG_FILE" ]; then
                 # 旧版迁移 —— config.json 里可能还残留老版本写入的定义; 带护栏清理 (自身规则仍引用则保留)
