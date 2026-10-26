@@ -4646,6 +4646,91 @@ EOF
     return 0
 }
 
+# ============================================================
+# SX: 刷出口地区 —— 反复强制重新握手, 直到 WARP 出口落到目标国家/地区
+#     原理同社区脚本: 重启隧道 → 探出口 → 不匹配再重启
+#     (WARP 出口由 Cloudflare anycast + NAT 池随机分配, 只能"抽"不能"选")
+#     代价: 每轮重启 sing-box, 期间连接会短暂中断; 是否能命中取决于 Cloudflare 分区池
+# ============================================================
+_warp_probe_country() {
+    local st ep tport tcfg tlog pid out
+    st=$(_warp_state_file)
+    [ -s "$st" ] || return 1
+    ep=$(_warp_endpoint_json) || return 1
+    tport=41951
+    while _check_port_occupied "$tport"; do tport=$((tport+1)); [ "$tport" -gt 41990 ] && break; done
+    tcfg=$(mktemp) || return 1
+    tlog=$(mktemp) || { rm -f -- "$tcfg"; return 1; }
+    cat > "$tcfg" << EOF
+{
+  "log": {"level": "error"},
+  "dns": {"servers": [{"type": "local", "tag": "l"}], "final": "l"},
+  "inbounds": [{"type": "socks", "tag": "s-in", "listen": "127.0.0.1", "listen_port": $tport}],
+  "endpoints": [$ep],
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "route": {"final": "warp-out", "default_domain_resolver": {"server": "l"}}
+}
+EOF
+    "$SINGBOX_BIN" run -c "$tcfg" > "$tlog" 2>&1 &
+    pid=$!
+    sleep 3
+    out=$(curl -sS -m 12 -x "socks5h://127.0.0.1:$tport" "http://ip-api.com/json/?fields=query,countryCode,isp" 2>/dev/null) || true
+    kill "$pid" 2>/dev/null || true
+    rm -f -- "$tcfg" "$tlog"
+    printf '%s' "$out" | jq -r 'if (.query // "") != "" then "\(.query)|\(.countryCode // "??")|\(.isp // "")" else empty end' 2>/dev/null
+}
+
+_warp_roll_region() {
+    local st
+    st=$(_warp_state_file)
+    if [ ! -s "$st" ] || ! jq -e . "$st" >/dev/null 2>&1; then
+        _error "尚未注册 WARP, 请先选 [1] 注册"
+        _pause_anykey; return 1
+    fi
+    clear
+    echo -e "\n  ${CYAN}==== 刷 WARP 出口地区 ====${NC}"
+    echo -e "  ${YELLOW}原理: 每轮强制重新握手, WARP 出口由 Cloudflare 随机分配;${NC}"
+    echo -e "  ${YELLOW}      不匹配就再摇一次, 直到命中目标地区。${NC}"
+    echo -e "  ${RED}代价: 每轮会重启 sing-box, 期间所有连接会短暂中断。${NC}"
+    echo ""
+    local area maxn
+    read -p "  目标地区代码 (US/HK/SG/JP/TW..., 回车=US): " area
+    area=$(printf '%s' "${area:-US}" | tr 'a-z' 'A-Z')
+    read -p "  最多重连次数 (回车=20, 上限 200): " maxn
+    [[ "$maxn" =~ ^[0-9]+$ ]] && [ "$maxn" -ge 1 ] && [ "$maxn" -le 200 ] || maxn=20
+    local _y
+    _warn "确认开始? 最多 ${maxn} 轮, 每轮约 6-10 秒。"
+    read -p "  (y/N): " _y
+    [[ "$_y" =~ ^[Yy]$ ]] || { _info "已取消"; _pause_anykey; return 0; }
+
+    local i=0 hit="" r ip cc rest isp
+    while [ "$i" -lt "$maxn" ]; do
+        i=$((i+1))
+        _manage_service restart >/dev/null 2>&1
+        sleep 3
+        r=$(_warp_probe_country)
+        if [ -z "$r" ]; then
+            echo -e "  第 ${i}/${maxn} 轮: ${YELLOW}探测失败 (WARP 未连上)${NC}"
+            continue
+        fi
+        ip="${r%%|*}"; rest="${r#*|}"; cc="${rest%%|*}"; isp="${rest#*|}"
+        if [ "$cc" = "$area" ]; then
+            echo -e "  第 ${i}/${maxn} 轮: ${GREEN}${ip} (${cc}) — 命中!${NC}"
+            hit=1; break
+        fi
+        echo -e "  第 ${i}/${maxn} 轮: ${ip} (${cc}) — 不匹配, 继续"
+    done
+
+    if [ -n "$hit" ]; then
+        _success "已命中目标地区 ${area} (第 ${i} 轮)"
+        _info "出口每次握手都可能变, 建议用 [3] 出口测试复核一次。"
+    else
+        _warn "重试 ${maxn} 轮仍未命中 ${area}; 配置保持原样, 不影响使用。"
+    fi
+    _pause_anykey
+}
+
+
 _warp_menu() {
     while true; do
         clear
@@ -4671,16 +4756,18 @@ _warp_menu() {
         echo -e "    ${GREEN}[2]${NC} 启用接管并设置规则 (IPv4/IPv6/自定义规则, 可叠加)"
         echo -e "    ${GREEN}[3]${NC} WARP 出口测试 (临时实例实测出口 IP)"
         echo -e "    ${GREEN}[4]${NC} 关闭 WARP 接管 (移除全部接管规则, 保留账户)"
-        echo -e "    ${RED}[5]${NC} 彻底移除 WARP (删除本地密钥并注销云端账户)"
+        echo -e "    ${GREEN}[5]${NC} 刷出口地区 (反复重连, 直到命中目标地区)"
+        echo -e "    ${RED}[6]${NC} 彻底移除 WARP (删除本地密钥并注销云端账户)"
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
-        read -p "  请选择 [0-5]: " c
+        read -p "  请选择 [0-6]: " c
         case $c in
             1) _warp_register ;;
             2) _warp_takeover ;;
             3) _warp_test_exit ;;
             4) _warp_disable ;;
-            5) echo ""; _warn "确认移除 WARP (本地密钥 + 云端账户)?"
+            5) _warp_roll_region ;;
+            6) echo ""; _warn "确认移除 WARP (本地密钥 + 云端账户)?"
                read -p "  (y/N): " cn
                if [ "$cn" == "y" ]; then
                    _warp_remove
