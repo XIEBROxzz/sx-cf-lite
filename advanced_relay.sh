@@ -5205,12 +5205,19 @@ _menu() {
             *)           _ipf_disp="${GREEN}落地地址族=${_ipf_st}${NC}" ;;
         esac
         echo -e "        ${_udp_disp}   ${_ipf_disp}"
-        # SX: 两套规则同时开启时给一句口径说明 —— 规范化后落地永远优先, WARP 只兜主节点
-        local _warp_on _nland
+        # SX: 落地与 WARP 同时启用时给一句口径说明 —— 顺序是 落地→WARP→final
+        #     全量接管(带 domain_regex [".*"] 的 catch-all) 才会"未命中走 WARP";
+        #     自定义规则模式只把命中的送去 WARP, 其余仍按 final=direct 走直连。
+        local _warp_on _nland _warp_all
         _warp_on=$(jq -r '[.route.rules[]? | select(.outbound? == "warp-out")] | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
         _nland=$(jq -r '[.outbounds[]? | select((.tag // "") | startswith("relay-out-"))] | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
+        _warp_all=$(jq -r '[.route.rules[]? | select(.outbound? == "warp-out" and (.domain_regex? == [".*"]))] | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
         if [ "${_warp_on:-0}" -gt 0 ] 2>/dev/null && [ "${_nland:-0}" -gt 0 ] 2>/dev/null; then
-            echo -e "    ${YELLOW}● 同时启用了 中转落地 与 WARP 接管: 落地规则优先; 未命中落地规则的流量走 WARP${NC}"
+            if [ "${_warp_all:-0}" -gt 0 ] 2>/dev/null; then
+                echo -e "    ${YELLOW}● 落地 + WARP 全量接管: 先落地规则 → 再 WARP, 未命中落地的流量走 WARP${NC}"
+            else
+                echo -e "    ${YELLOW}● 落地 + WARP 自定义规则: 先落地 → 再命中 WARP 规则的走 WARP, 其余走直连${NC}"
+            fi
         fi
         echo ""
         echo -e "  ${CYAN}【端口转发】${NC}"
