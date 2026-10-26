@@ -4650,6 +4650,98 @@ EOF
 
 
 
+# ============================================================
+# SX: TCP 时间戳开关 (net.ipv4.tcp_timestamps)
+#     疑难场景: 电脑 WiFi 正常、手机 5G 连不上 —— 部分运营商/CPE 会丢弃带
+#     TCP 时间戳的包, 关掉可绕过。代价: 失去 PAWS (防重放/序号回绕) 能力。
+#     持久化: /etc/sysctl.d/99-sx-tcp-timestamps.conf + /etc/sysctl.conf 标记块
+#     (后者兼容只读 sysctl.conf 的 openrc init 脚本)
+# ============================================================
+_TCP_TS_MARK_BEGIN="# >>> sx-cf-lite tcp_timestamps >>>"
+_TCP_TS_MARK_END="# <<< sx-cf-lite tcp_timestamps <<<"
+_TCP_TS_FILE="/etc/sysctl.d/99-sx-tcp-timestamps.conf"
+_TCP_TS_CONF="/etc/sysctl.conf"
+
+_tcp_ts_state() {
+    sysctl -n net.ipv4.tcp_timestamps 2>/dev/null | tr -d ' '
+}
+
+_tcp_ts_off() {
+    mkdir -p /etc/sysctl.d 2>/dev/null || true
+    printf '# sx-cf-lite: 手机 5G 连不上时的兼容性设置\nnet.ipv4.tcp_timestamps = 0\n' \
+        > "$_TCP_TS_FILE" 2>/dev/null || true
+    [ -f "$_TCP_TS_CONF" ] || : > "$_TCP_TS_CONF"
+    if ! grep -qF "$_TCP_TS_MARK_BEGIN" "$_TCP_TS_CONF" 2>/dev/null; then
+        { echo ""; echo "$_TCP_TS_MARK_BEGIN"; echo "net.ipv4.tcp_timestamps = 0"; echo "$_TCP_TS_MARK_END"; } >> "$_TCP_TS_CONF"
+    fi
+    sysctl -w net.ipv4.tcp_timestamps=0 >/dev/null 2>&1 || return 1
+    # 开机自启 (openrc; systemd 会自动读 /etc/sysctl.d)
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-update add sysctl default >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+_tcp_ts_on() {
+    rm -f "$_TCP_TS_FILE" 2>/dev/null || true
+    if [ -f "$_TCP_TS_CONF" ] && grep -qF "$_TCP_TS_MARK_BEGIN" "$_TCP_TS_CONF" 2>/dev/null; then
+        local tmp
+        tmp=$(mktemp) || return 1
+        awk -v b="$_TCP_TS_MARK_BEGIN" -v e="$_TCP_TS_MARK_END" '
+            $0 == b { skip=1; next }
+            $0 == e { skip=0; next }
+            skip != 1 { print }
+        ' "$_TCP_TS_CONF" > "$tmp" && mv -f "$tmp" "$_TCP_TS_CONF" || { rm -f "$tmp"; return 1; }
+    fi
+    sysctl -w net.ipv4.tcp_timestamps=1 >/dev/null 2>&1 || return 1
+    return 0
+}
+
+_tcp_ts_menu() {
+    while true; do
+        clear
+        local st disp
+        st=$(_tcp_ts_state)
+        if [ "$st" = "0" ]; then
+            disp="${YELLOW}已关闭 (0)${NC}"
+        else
+            disp="${GREEN}开启 (1, 默认)${NC}"
+        fi
+        echo -e "\n  ${CYAN}==== TCP 时间戳 (net.ipv4.tcp_timestamps) ====${NC}"
+        echo -e "  当前: ${disp}"
+        echo -e "  ${YELLOW}场景: 电脑 WiFi 正常、手机 5G 连不上 —— 部分运营商/CPE 会丢弃${NC}"
+        echo -e "  ${YELLOW}      带 TCP 时间戳的包, 关掉可绕过。${NC}"
+        echo -e "  ${RED}代价: 关闭后失去 PAWS (防重放 / 序号回绕) 能力, 仅在排障时用。${NC}"
+        echo -e "  ${YELLOW}持久化: 写入 /etc/sysctl.d 与 /etc/sysctl.conf 标记块, 重启仍生效。${NC}"
+        echo ""
+        echo -e "    ${GREEN}[1]${NC} 关闭时间戳 (排障用)"
+        echo -e "    ${GREEN}[2]${NC} 恢复默认 (开启)"
+        echo -e "    ${YELLOW}[0]${NC} 返回"
+        echo ""
+        local c
+        read -p "  请选择 [0-2]: " c
+        case "$c" in
+            1)
+                if _tcp_ts_off; then
+                    _success "已关闭 TCP 时间戳 (立即生效, 已持久化)"
+                else
+                    _error "写入失败, 请检查 root 权限与 sysctl 可用性"
+                fi
+                _pause_anykey ;;
+            2)
+                if _tcp_ts_on; then
+                    _success "已恢复 TCP 时间戳 (开启)"
+                else
+                    _error "恢复失败, 请手动 sysctl -w net.ipv4.tcp_timestamps=1"
+                fi
+                _pause_anykey ;;
+            0|"") return 0 ;;
+            *) _error "无效输入"; sleep 1 ;;
+        esac
+    done
+}
+
+
 _warp_menu() {
     while true; do
         clear
@@ -5180,7 +5272,7 @@ _menu() {
         echo -e "    ${GREEN}[8]${NC} 中转分流管理 (启用落地/设置规则)"
         echo -e "    ${RED}[R]${NC} 清空所有中转配置"
         echo ""
-        echo -e "  ${CYAN}【出口优化】${NC}"
+        echo -e "  ${CYAN}【出口与网络优化】${NC}"
         echo -e "    ${GREEN}[9]${NC} WARP 出站管理 (Cloudflare 免费出口)"
         # SX: 本机直连地址族 (作用于 config.json 的 direct 出站)
         local _df_st _df_disp
@@ -5213,6 +5305,11 @@ _menu() {
         _tsum="${_udp_disp}   ${_ipf_disp}"
         [ -n "$_tsum" ] || _tsum="${YELLOW}UDP 转发=关   落地地址族=不干预${NC}"
         echo -e "        ${_tsum}"
+        # SX: TCP 时间戳 (内核网络参数, 疑难"手机 5G 连不上"时用)
+        local _ts_st _ts_disp
+        _ts_st=$(_tcp_ts_state)
+        if [ "$_ts_st" = "0" ]; then _ts_disp="${YELLOW}已关闭${NC}"; else _ts_disp="${GREEN}开启 (默认)${NC}"; fi
+        echo -e "    ${GREEN}[S]${NC} TCP 时间戳: ${_ts_disp}   ${YELLOW}(手机 5G 连不上时关掉试试)${NC}"
         # SX: 落地与 WARP 同时启用时给一句口径说明 —— 顺序是 落地→WARP→final
         #     全量接管(带 domain_regex [".*"] 的 catch-all) 才会"未命中走 WARP";
         #     自定义规则模式只把命中的送去 WARP, 其余仍按 final=direct 走直连。
@@ -5234,7 +5331,7 @@ _menu() {
         echo -e "  ─────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-10 或 R/B/T]: " choice
+        read -p "  请输入选项 [0-10 或 R/B/T/S]: " choice
         case $choice in
             1) _landing_config ;;
             # SX: 每次进入只添加一个 —— 不再套 while 循环连续追问, 加完停留一次即回菜单
@@ -5255,6 +5352,7 @@ _menu() {
             U|u) _udp_route_menu ;;
             B|b) _direct_fam_menu ;;
             T|t) _relay_troubleshoot_menu ;;
+            S|s) _tcp_ts_menu ;;
             V|v) _ipfam_menu ;;
             10) _port_forward_menu ;;
             0) break ;;
