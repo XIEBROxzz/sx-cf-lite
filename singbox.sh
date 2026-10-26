@@ -22,9 +22,9 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
-#     1.28: 服务重启/停止菜单收尾 (标题居中、说明列对齐、Argo 提示随动作变化)`n#     1.27: 出口优化排序/对齐收尾 ([9] WARP → [B] 直连地址族 → [T] 排障 + 状态汇总行)`n#     1.26: 撤掉 WARP [5] 刷出口地区 (实测 anycast 出口锁死在本机最近 PoP, 换端点也摇不动)`n#     1.25: [5] 刷出口地区 改为"逐个换端点"探测 (重启只换同 PoP IP 池, 换端点才可能换地区)`n#     1.24: WARP 菜单新增 [5] 刷出口地区 (反复重连直到命中目标地区), 彻底移除顺延为 [6]`n#     1.23: 撤掉 WARP [6] 一键换 IP (实测重注册不改公网出口, 出口由 anycast/NAT 池决定)`n#     1.22: WARP 菜单新增 [6] 一键换 IP (注销旧账户→重注册→自动还原接管规则)`n#     1.21: 修正 WARP 口径说明 —— 自定义规则是"命中走 WARP, 其余走直连"; 只有全量接管才是"未命中走 WARP"`n#     1.20: [U]/[V] 收进 [T] 中转排障, 主菜单只留 [B] 与状态汇总 (出口优化更清爽)`n#     1.19: 修正提示里过期的 [R-1] 指向(现为 [8]→[1]); [U]/[B]/[V] 返回键统一为 0 ([U] 的关闭改为 4)`n#     1.18: [B]/[V] 改用 domain_resolver (sing-box 1.12+ 已废弃 domain_strategy, 1.13 直接 FATAL)`n#     1.17: WARP 自定义规则改用专用 rules/warp.json; 与落地规则集撞名时自动改 warp- 前缀并保留原定义`n#     1.16: 去掉"入口直连兜底"自动注入 (它会让 WARP 接管永远轮不到), 并清理历史残留`n#     1.15: 进阶转发新增 [B] 本机直连地址族 (作用于 config.json 的 direct 出站, 治 v4 送中)`n#     1.14: [V] 文案纠正(该字段作用于"中转机→落地"的解析) + 无对应地址族时拒绝设置, 避免整条链路断流`n#     1.13: 进阶转发新增 [V] IPv4/IPv6 优先 (domain_strategy 一次性作用于全部落地出站, 校验失败自动回滚)`n#     1.12: 修复"落地节点名称一闪而过无法改名"(粘贴残留吃掉输入) 与 #片段中文解码乱码 (\\x 少一层转义)`n#     1.11: [U] 的"换落地"[3] 修好 —— 原来已配置时复用旧落地, 等于空操作`n#     1.10: [U] UDP 转发开启时自动给 vless 落地补 packet_encoding=xudp (否则 sing-box 报 UDP is not supported), 并拒绝 trojan/http 落地`n#     1.9: 进阶转发新增 [U] UDP 转发开关 (NAT 小鸡禁 UDP 时把 DNS/QUIC 交给落地走 TCP 隧道)`n#     1.8: [4] 落地模式改为按规则里的 rule_set 判定 (旧版读 relay_links.json 的 relay_mode, 会误报"全局兜底")`n#     1.7: 修复主菜单 [8] 查看运行状态"打不开" (打印完立刻 return, 被下一轮 clear 擦掉) -> 加停留`n#     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则`n#     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
+#     1.29: 服务重启/停止菜单的 sing-box-cf 旧服务改为"存在才显示", 无则 Argo 顺位为 [2]`n#     1.28: 服务重启/停止菜单收尾 (标题居中、说明列对齐、Argo 提示随动作变化)`n#     1.27: 出口优化排序/对齐收尾 ([9] WARP → [B] 直连地址族 → [T] 排障 + 状态汇总行)`n#     1.26: 撤掉 WARP [5] 刷出口地区 (实测 anycast 出口锁死在本机最近 PoP, 换端点也摇不动)`n#     1.25: [5] 刷出口地区 改为"逐个换端点"探测 (重启只换同 PoP IP 池, 换端点才可能换地区)`n#     1.24: WARP 菜单新增 [5] 刷出口地区 (反复重连直到命中目标地区), 彻底移除顺延为 [6]`n#     1.23: 撤掉 WARP [6] 一键换 IP (实测重注册不改公网出口, 出口由 anycast/NAT 池决定)`n#     1.22: WARP 菜单新增 [6] 一键换 IP (注销旧账户→重注册→自动还原接管规则)`n#     1.21: 修正 WARP 口径说明 —— 自定义规则是"命中走 WARP, 其余走直连"; 只有全量接管才是"未命中走 WARP"`n#     1.20: [U]/[V] 收进 [T] 中转排障, 主菜单只留 [B] 与状态汇总 (出口优化更清爽)`n#     1.19: 修正提示里过期的 [R-1] 指向(现为 [8]→[1]); [U]/[B]/[V] 返回键统一为 0 ([U] 的关闭改为 4)`n#     1.18: [B]/[V] 改用 domain_resolver (sing-box 1.12+ 已废弃 domain_strategy, 1.13 直接 FATAL)`n#     1.17: WARP 自定义规则改用专用 rules/warp.json; 与落地规则集撞名时自动改 warp- 前缀并保留原定义`n#     1.16: 去掉"入口直连兜底"自动注入 (它会让 WARP 接管永远轮不到), 并清理历史残留`n#     1.15: 进阶转发新增 [B] 本机直连地址族 (作用于 config.json 的 direct 出站, 治 v4 送中)`n#     1.14: [V] 文案纠正(该字段作用于"中转机→落地"的解析) + 无对应地址族时拒绝设置, 避免整条链路断流`n#     1.13: 进阶转发新增 [V] IPv4/IPv6 优先 (domain_strategy 一次性作用于全部落地出站, 校验失败自动回滚)`n#     1.12: 修复"落地节点名称一闪而过无法改名"(粘贴残留吃掉输入) 与 #片段中文解码乱码 (\\x 少一层转义)`n#     1.11: [U] 的"换落地"[3] 修好 —— 原来已配置时复用旧落地, 等于空操作`n#     1.10: [U] UDP 转发开启时自动给 vless 落地补 packet_encoding=xudp (否则 sing-box 报 UDP is not supported), 并拒绝 trojan/http 落地`n#     1.9: 进阶转发新增 [U] UDP 转发开关 (NAT 小鸡禁 UDP 时把 DNS/QUIC 交给落地走 TCP 隧道)`n#     1.8: [4] 落地模式改为按规则里的 rule_set 判定 (旧版读 relay_links.json 的 relay_mode, 会误报"全局兜底")`n#     1.7: 修复主菜单 [8] 查看运行状态"打不开" (打印完立刻 return, 被下一轮 clear 擦掉) -> 加停留`n#     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则`n#     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.28"
+export SCRIPT_VERSION="1.29"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -784,6 +784,11 @@ _service_action_menu() {
     [ "$action" == "restart" ] && zh="重启" || zh="停止"
     while true; do
         clear
+        # SX: sing-box-cf 只在老装机存在 (CF-A 已并入主服务) → 有才显示, 没有则 Argo 顺位为 [2]
+        local _has_cf="false"
+        if [ -f /etc/systemd/system/sing-box-cf.service ] || [ -f /etc/init.d/sing-box-cf ]; then
+            _has_cf="true"
+        fi
         echo -e "  ${CYAN}╔═══════════════════════════════════════╗"
         # SX: 标题居中 (框内 39 列, "服务重启"/"服务停止" 各 8 列 → 左 15 右 16)
         printf '  ║%15s服务%s%16s║\n' "" "$zh" ""
@@ -791,21 +796,35 @@ _service_action_menu() {
         echo ""
         echo -e "  ${CYAN}【选择${zh}对象】${NC}"
         echo -e "    ${GREEN}[1]${NC} sing-box 主服务     (直连节点 / CF-B 隧道节点内核)"
-        echo -e "    ${GREEN}[2]${NC} sing-box-cf 旧服务  (仅旧装机残留, 现行 CF-A 随主服务)"
+        if [ "$_has_cf" = "true" ]; then
+            echo -e "    ${GREEN}[2]${NC} sing-box-cf 旧服务  (旧装机残留, 现行 CF-A 随主服务)"
+        fi
+        local _argo_key=3
+        [ "$_has_cf" = "true" ] || _argo_key=2
         if [ "$action" == "restart" ]; then
-            echo -e "    ${GREEN}[3]${NC} Argo 隧道           (临时→重建 / 固定→重启进程)"
+            echo -e "    ${GREEN}[${_argo_key}]${NC} Argo 隧道           (临时→重建 / 固定→重启进程)"
         else
-            echo -e "    ${GREEN}[3]${NC} Argo 隧道           (停止后临时隧道域名失效, 需重建)"
+            echo -e "    ${GREEN}[${_argo_key}]${NC} Argo 隧道           (停止后临时隧道域名失效, 需重建)"
         fi
         echo ""
         echo -e "  ───────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-3]: " choice
+        local _max_key=2
+        [ "$_has_cf" = "true" ] && _max_key=3
+        read -p "  请输入选项 [0-${_max_key}]: " choice
         case $choice in
             1) _manage_service_action_target "$action" "$zh" "direct" ;;
-            2) _manage_service_action_target "$action" "$zh" "xray" ;;
-            3) _manage_service_action_target "$action" "$zh" "argo" ;;
+            2) if [ "$_has_cf" = "true" ]; then
+                   _manage_service_action_target "$action" "$zh" "xray"
+               else
+                   _manage_service_action_target "$action" "$zh" "argo"
+               fi ;;
+            3) if [ "$_has_cf" = "true" ]; then
+                   _manage_service_action_target "$action" "$zh" "argo"
+               else
+                   _error "无效输入"
+               fi ;;
             0) return ;;
             *) _error "无效输入" ;;
         esac
