@@ -4564,75 +4564,6 @@ _warp_custom_menu() {
     done
 }
 
-# ============================================================
-# SX: 一键换 IP —— 注销旧 WARP 账户 → 重新注册 → 自动恢复原有接管规则
-#     解决"想换 IP 必须先 [5] 卸载、再 [1] 注册、再 [2] 重设规则"的三步操作。
-#     注意: WARP 公网出口由 Cloudflare anycast 决定, 换账户不保证换到新公网 IP,
-#           但隧道地址/密钥一定换新; 想真正换地区只能换端点或换机房。
-# ============================================================
-_warp_rotate_ip() {
-    local st rules tags rs bak
-    st=$(_warp_state_file)
-    if [ ! -s "$st" ] || ! jq -e . "$st" >/dev/null 2>&1; then
-        _error "尚未注册 WARP, 请先选 [1] 注册"
-        _pause_anykey; return 1
-    fi
-
-    # 1) 快照现有接管规则 + 它们引用的 rule_set 定义
-    rules=$(jq -c '[.route.rules[]? | select(.outbound? == "warp-out")]' "$RELAY_CONFIG_FILE" 2>/dev/null)
-    [ -n "$rules" ] && [ "$rules" != "null" ] || rules="[]"
-    tags=$(jq -r '[(.route.rules[]? | select(.outbound? == "warp-out") | .rule_set[]?)] | unique | join(" ")' "$RELAY_CONFIG_FILE" 2>/dev/null)
-    rs="[]"
-    if [ -n "$tags" ]; then
-        rs=$(jq -c --arg t "$tags" '[.route.rule_set[]? | select(.tag as $x | ($t | split(" ") | index($x)) != null)]' "$RELAY_CONFIG_FILE" 2>/dev/null)
-        [ -n "$rs" ] || rs="[]"
-    fi
-
-    echo ""
-    _warn "即将注销当前 WARP 账户并重新注册; 现有接管规则会在完成后自动还原。"
-    _info "注: 公网出口 IP 由 Cloudflare 分配, 重新注册不保证换到新的公网 IP。"
-    local _y
-    read -p "  继续? (y/N): " _y
-    [[ "$_y" =~ ^[Yy]$ ]] || { _info "已取消"; _pause_anykey; return 0; }
-
-    # 2) 清掉旧账户/端点/规则 (规则稍后还原)
-    _warp_remove >/dev/null 2>&1
-
-    # 3) 重新注册
-    if ! _warp_register; then
-        _error "重新注册失败, 请在菜单 [1] 手动注册"
-        _pause_anykey; return 1
-    fi
-    local ep
-    ep=$(_warp_endpoint_json) || { _error "WARP 端点生成失败"; _pause_anykey; return 1; }
-
-    # 4) 写回端点 + 规则 + 规则集定义 (失败回滚)
-    bak="${RELAY_CONFIG_FILE}.rot.bak"
-    cp -af "$RELAY_CONFIG_FILE" "$bak" 2>/dev/null
-    if ! _atomic_modify_json "$RELAY_CONFIG_FILE" "
-        .endpoints = (((.endpoints // []) | map(select(.tag != \"warp-out\"))) + [${ep}])
-        | .route = (.route // {\"rules\":[]})
-        | .route.rules = (([ (.route.rules // [])[] | select(.outbound? != \"warp-out\") ]) + ${rules})
-        | .route.rule_set = ((((.route.rule_set // []) + ${rs}) | group_by(.tag) | map(.[-1])))
-        | .route.final = \"direct\"
-        | ${RELAY_RULES_NORMALIZE_FLT}
-    "; then
-        _error "写入失败, 已回滚"
-        [ -f "$bak" ] && mv -f "$bak" "$RELAY_CONFIG_FILE"
-        _pause_anykey; return 1
-    fi
-
-    if ! _restart_checked; then
-        [ -f "$bak" ] && mv -f "$bak" "$RELAY_CONFIG_FILE"
-        _manage_service restart >/dev/null 2>&1 || true
-        _error "校验失败, 已回滚到换 IP 之前的配置"
-        _pause_anykey; return 1
-    fi
-    rm -f "$bak"
-    _success "已换新 WARP 账户, 原接管规则已还原: $(_warp_takeover_summary)"
-    _info "可用 [3] 出口测试 确认新出口。"
-    _pause_anykey
-}
 
 _warp_remove() {
     local st CONFIG_FILE="$MAIN_CONFIG_FILE"
@@ -4741,10 +4672,9 @@ _warp_menu() {
         echo -e "    ${GREEN}[3]${NC} WARP 出口测试 (临时实例实测出口 IP)"
         echo -e "    ${GREEN}[4]${NC} 关闭 WARP 接管 (移除全部接管规则, 保留账户)"
         echo -e "    ${RED}[5]${NC} 彻底移除 WARP (删除本地密钥并注销云端账户)"
-        echo -e "    ${GREEN}[6]${NC} 一键换 IP (重新注册, 自动保留现有接管规则)"
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
-        read -p "  请选择 [0-6]: " c
+        read -p "  请选择 [0-5]: " c
         case $c in
             1) _warp_register ;;
             2) _warp_takeover ;;
@@ -4755,7 +4685,6 @@ _warp_menu() {
                if [ "$cn" == "y" ]; then
                    _warp_remove
                fi ;;
-            6) _warp_rotate_ip ;;
             0) break ;;
             *) _error "无效选择"; sleep 1 ;;
         esac
