@@ -22,9 +22,9 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
-#     1.36: 三合一端口输入改为宽容解析 (全角冒号/逗号/多余空格/CR 均可), 不再依赖 tr+xargs, 失败时回显收到的值`n#     1.35: 修复 [1] 策略菜单被命令替换吞掉 (输出改 stderr); 修复 [6] 彻底移除 WARP 因 jq 引号未转义而失败`n#     1.34: WARP 接管新增"解析策略"(双栈/优先v4/优先v6/仅v4/仅v6), 用 resolve 动作实现`n#     1.33: 卸载补全 3 处漏点 (sing-box-relay 服务 / [S] sysctl 改动 / ~/.cloudflared 证书)`n#     1.32: [16] 落地/中转/第三方节点导入 归入【进阶功能】组`n#     1.31: 主菜单重排 —— 编号连续(1-18)、两列对齐、卸载移到最后`n#     1.30: 新增 [S] TCP 时间戳开关 (治"电脑WiFi通/手机5G不通"), 区块更名【出口与网络优化】`n#     1.29: 服务重启/停止菜单的 sing-box-cf 旧服务改为"存在才显示", 无则 Argo 顺位为 [2]`n#     1.28: 服务重启/停止菜单收尾 (标题居中、说明列对齐、Argo 提示随动作变化)`n#     1.27: 出口优化排序/对齐收尾 ([9] WARP → [B] 直连地址族 → [T] 排障 + 状态汇总行)`n#     1.26: 撤掉 WARP [5] 刷出口地区 (实测 anycast 出口锁死在本机最近 PoP, 换端点也摇不动)`n#     1.25: [5] 刷出口地区 改为"逐个换端点"探测 (重启只换同 PoP IP 池, 换端点才可能换地区)`n#     1.24: WARP 菜单新增 [5] 刷出口地区 (反复重连直到命中目标地区), 彻底移除顺延为 [6]`n#     1.23: 撤掉 WARP [6] 一键换 IP (实测重注册不改公网出口, 出口由 anycast/NAT 池决定)`n#     1.22: WARP 菜单新增 [6] 一键换 IP (注销旧账户→重注册→自动还原接管规则)`n#     1.21: 修正 WARP 口径说明 —— 自定义规则是"命中走 WARP, 其余走直连"; 只有全量接管才是"未命中走 WARP"`n#     1.20: [U]/[V] 收进 [T] 中转排障, 主菜单只留 [B] 与状态汇总 (出口优化更清爽)`n#     1.19: 修正提示里过期的 [R-1] 指向(现为 [8]→[1]); [U]/[B]/[V] 返回键统一为 0 ([U] 的关闭改为 4)`n#     1.18: [B]/[V] 改用 domain_resolver (sing-box 1.12+ 已废弃 domain_strategy, 1.13 直接 FATAL)`n#     1.17: WARP 自定义规则改用专用 rules/warp.json; 与落地规则集撞名时自动改 warp- 前缀并保留原定义`n#     1.16: 去掉"入口直连兜底"自动注入 (它会让 WARP 接管永远轮不到), 并清理历史残留`n#     1.15: 进阶转发新增 [B] 本机直连地址族 (作用于 config.json 的 direct 出站, 治 v4 送中)`n#     1.14: [V] 文案纠正(该字段作用于"中转机→落地"的解析) + 无对应地址族时拒绝设置, 避免整条链路断流`n#     1.13: 进阶转发新增 [V] IPv4/IPv6 优先 (domain_strategy 一次性作用于全部落地出站, 校验失败自动回滚)`n#     1.12: 修复"落地节点名称一闪而过无法改名"(粘贴残留吃掉输入) 与 #片段中文解码乱码 (\\x 少一层转义)`n#     1.11: [U] 的"换落地"[3] 修好 —— 原来已配置时复用旧落地, 等于空操作`n#     1.10: [U] UDP 转发开启时自动给 vless 落地补 packet_encoding=xudp (否则 sing-box 报 UDP is not supported), 并拒绝 trojan/http 落地`n#     1.9: 进阶转发新增 [U] UDP 转发开关 (NAT 小鸡禁 UDP 时把 DNS/QUIC 交给落地走 TCP 隧道)`n#     1.8: [4] 落地模式改为按规则里的 rule_set 判定 (旧版读 relay_links.json 的 relay_mode, 会误报"全局兜底")`n#     1.7: 修复主菜单 [8] 查看运行状态"打不开" (打印完立刻 return, 被下一轮 clear 擦掉) -> 加停留`n#     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则`n#     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
+#     1.37: 单节点创建支持 "内部:暴露" 端口写法 (NAT 机器免手动改客户端端口), 覆盖 Reality/HY2/WS/gRPC/Trojan`n#     1.36: 三合一端口输入改为宽容解析 (全角冒号/逗号/多余空格/CR 均可), 不再依赖 tr+xargs, 失败时回显收到的值`n#     1.35: 修复 [1] 策略菜单被命令替换吞掉 (输出改 stderr); 修复 [6] 彻底移除 WARP 因 jq 引号未转义而失败`n#     1.34: WARP 接管新增"解析策略"(双栈/优先v4/优先v6/仅v4/仅v6), 用 resolve 动作实现`n#     1.33: 卸载补全 3 处漏点 (sing-box-relay 服务 / [S] sysctl 改动 / ~/.cloudflared 证书)`n#     1.32: [16] 落地/中转/第三方节点导入 归入【进阶功能】组`n#     1.31: 主菜单重排 —— 编号连续(1-18)、两列对齐、卸载移到最后`n#     1.30: 新增 [S] TCP 时间戳开关 (治"电脑WiFi通/手机5G不通"), 区块更名【出口与网络优化】`n#     1.29: 服务重启/停止菜单的 sing-box-cf 旧服务改为"存在才显示", 无则 Argo 顺位为 [2]`n#     1.28: 服务重启/停止菜单收尾 (标题居中、说明列对齐、Argo 提示随动作变化)`n#     1.27: 出口优化排序/对齐收尾 ([9] WARP → [B] 直连地址族 → [T] 排障 + 状态汇总行)`n#     1.26: 撤掉 WARP [5] 刷出口地区 (实测 anycast 出口锁死在本机最近 PoP, 换端点也摇不动)`n#     1.25: [5] 刷出口地区 改为"逐个换端点"探测 (重启只换同 PoP IP 池, 换端点才可能换地区)`n#     1.24: WARP 菜单新增 [5] 刷出口地区 (反复重连直到命中目标地区), 彻底移除顺延为 [6]`n#     1.23: 撤掉 WARP [6] 一键换 IP (实测重注册不改公网出口, 出口由 anycast/NAT 池决定)`n#     1.22: WARP 菜单新增 [6] 一键换 IP (注销旧账户→重注册→自动还原接管规则)`n#     1.21: 修正 WARP 口径说明 —— 自定义规则是"命中走 WARP, 其余走直连"; 只有全量接管才是"未命中走 WARP"`n#     1.20: [U]/[V] 收进 [T] 中转排障, 主菜单只留 [B] 与状态汇总 (出口优化更清爽)`n#     1.19: 修正提示里过期的 [R-1] 指向(现为 [8]→[1]); [U]/[B]/[V] 返回键统一为 0 ([U] 的关闭改为 4)`n#     1.18: [B]/[V] 改用 domain_resolver (sing-box 1.12+ 已废弃 domain_strategy, 1.13 直接 FATAL)`n#     1.17: WARP 自定义规则改用专用 rules/warp.json; 与落地规则集撞名时自动改 warp- 前缀并保留原定义`n#     1.16: 去掉"入口直连兜底"自动注入 (它会让 WARP 接管永远轮不到), 并清理历史残留`n#     1.15: 进阶转发新增 [B] 本机直连地址族 (作用于 config.json 的 direct 出站, 治 v4 送中)`n#     1.14: [V] 文案纠正(该字段作用于"中转机→落地"的解析) + 无对应地址族时拒绝设置, 避免整条链路断流`n#     1.13: 进阶转发新增 [V] IPv4/IPv6 优先 (domain_strategy 一次性作用于全部落地出站, 校验失败自动回滚)`n#     1.12: 修复"落地节点名称一闪而过无法改名"(粘贴残留吃掉输入) 与 #片段中文解码乱码 (\\x 少一层转义)`n#     1.11: [U] 的"换落地"[3] 修好 —— 原来已配置时复用旧落地, 等于空操作`n#     1.10: [U] UDP 转发开启时自动给 vless 落地补 packet_encoding=xudp (否则 sing-box 报 UDP is not supported), 并拒绝 trojan/http 落地`n#     1.9: 进阶转发新增 [U] UDP 转发开关 (NAT 小鸡禁 UDP 时把 DNS/QUIC 交给落地走 TCP 隧道)`n#     1.8: [4] 落地模式改为按规则里的 rule_set 判定 (旧版读 relay_links.json 的 relay_mode, 会误报"全局兜底")`n#     1.7: 修复主菜单 [8] 查看运行状态"打不开" (打印完立刻 return, 被下一轮 clear 擦掉) -> 加停留`n#     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则`n#     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.36"
+export SCRIPT_VERSION="1.37"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4207,9 +4207,24 @@ _show_grpc_cdn_guidance() {
 }
 
 
+# SX: 解析端口输入 "内部" 或 "内部:暴露" (兼容全角冒号/逗号与多余空格), 输出 "监听 链接"
+_sx_split_port_input() {
+    local raw="$1"
+    raw="${raw//：/:}"; raw="${raw//，/,}"; raw="${raw//,/ }"; raw="${raw//:/ }"
+    raw=$(printf '%s' "$raw" | tr -d '\r' | tr -s ' ' | sed 's/^ *//; s/ *$//')
+    [ -z "$raw" ] && return 1
+    local -a p=(); read -r -a p <<< "$raw"
+    [ "${#p[@]}" -ge 1 ] && [ "${#p[@]}" -le 2 ] || return 1
+    local l="${p[0]}" k="${p[1]:-${p[0]}}"
+    [[ "$l" =~ ^[0-9]+$ ]] && [[ "$k" =~ ^[0-9]+$ ]] || return 1
+    [ "$l" -ge 1 ] && [ "$l" -le 65535 ] || return 1
+    [ "$k" -ge 1 ] && [ "$k" -le 65535 ] || return 1
+    printf '%s %s' "$l" "$k"
+}
 _add_vless_ws_tls() {
     local camouflage_domain=""
     local port=""
+    local link_port=""
     local client_server_addr="${server_ip}"
 
     if [ "$BATCH_MODE" = "true" ]; then
@@ -4235,7 +4250,13 @@ _add_vless_ws_tls() {
         [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
 
         while true; do
-            read -p "请输入监听端口 (直连模式下首推 443 端口): " port
+            link_port=""
+            read -p "请输入监听端口 (可填 内部:暴露, 如 443:31000): " _port_raw
+            if ! _pl=$(_sx_split_port_input "$_port_raw"); then
+                _error "格式不对: 填 端口 或 内部:暴露 (如 443 或 443:31000)。收到: [${_port_raw}]"
+                continue
+            fi
+            port="${_pl%% *}"; link_port="${_pl#* }"
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
@@ -4243,7 +4264,7 @@ _add_vless_ws_tls() {
     fi
 
     # 客户端连接端口默认与监听端口一致 (直连模式)
-    local client_port="$port"
+    local client_port="${link_port:-$port}"
 
     # --- 步骤 4: 路径 ---
     local ws_path=""
@@ -4393,6 +4414,7 @@ _add_vless_ws_tls() {
 _add_vless_grpc_tls() {
     local camouflage_domain=""
     local port=""
+    local link_port=""
     local client_server_addr="${server_ip}"
 
     if [ "$BATCH_MODE" = "true" ]; then
@@ -4418,14 +4440,20 @@ _add_vless_grpc_tls() {
         [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
 
         while true; do
-            read -p "请输入监听端口 (直连模式下首推 443 端口): " port
+            link_port=""
+            read -p "请输入监听端口 (可填 内部:暴露, 如 443:31000): " _port_raw
+            if ! _pl=$(_sx_split_port_input "$_port_raw"); then
+                _error "格式不对: 填 端口 或 内部:暴露 (如 443 或 443:31000)。收到: [${_port_raw}]"
+                continue
+            fi
+            port="${_pl%% *}"; link_port="${_pl#* }"
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
         done
     fi
 
-    local client_port="$port"
+    local client_port="${link_port:-$port}"
 
     local generated_service_name="grpc-$(${SINGBOX_BIN} generate rand --hex 4)"
     local service_name=""
@@ -4559,6 +4587,7 @@ _add_vless_grpc_tls() {
 _add_trojan_ws_tls() {
     local camouflage_domain=""
     local port=""
+    local link_port=""
     local client_server_addr="${server_ip}"
 
     if [ "$BATCH_MODE" = "true" ]; then
@@ -4583,7 +4612,13 @@ _add_trojan_ws_tls() {
         [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
 
         while true; do
-            read -p "请输入监听端口 (直连模式下首推 443 端口): " port
+            link_port=""
+            read -p "请输入监听端口 (可填 内部:暴露, 如 443:31000): " _port_raw
+            if ! _pl=$(_sx_split_port_input "$_port_raw"); then
+                _error "格式不对: 填 端口 或 内部:暴露 (如 443 或 443:31000)。收到: [${_port_raw}]"
+                continue
+            fi
+            port="${_pl%% *}"; link_port="${_pl#* }"
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
@@ -4591,7 +4626,7 @@ _add_trojan_ws_tls() {
     fi
 
     # 客户端连接端口默认与监听端口一致 (直连模式)
-    local client_port="$port"
+    local client_port="${link_port:-$port}"
 
     # --- 步骤 4: 路径 ---
     local ws_path=""
@@ -5047,6 +5082,7 @@ _add_vless_reality() {
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local server_name="www.amd.com"
     local port=""
+    local link_port=""
     local name=""
 
     if [ "$BATCH_MODE" = "true" ]; then
@@ -5063,7 +5099,13 @@ _add_vless_reality() {
         read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
         server_name=${camouflage_domain:-"www.amd.com"}
         while true; do
-            read -p "请输入监听端口: " port
+            link_port=""
+            read -p "请输入监听端口 (可填 内部:暴露, 如 443:31000): " _port_raw
+            if ! _pl=$(_sx_split_port_input "$_port_raw"); then
+                _error "格式不对: 填 端口 或 内部:暴露 (如 443 或 443:31000)。收到: [${_port_raw}]"
+                continue
+            fi
+            port="${_pl%% *}"; link_port="${_pl#* }"
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
             break
@@ -5080,7 +5122,7 @@ _add_vless_reality() {
     local short_id=$(${SINGBOX_BIN} generate rand --hex 8)
     local tag="vless-in-${port}"
     # 三合一/批量: 链接(暴露)端口可与内部监听端口分离 (NAT 场景)
-    local client_port="$port"
+    local client_port="${link_port:-$port}"
     [ -n "$BATCH_LINK_PORT" ] && client_port="$BATCH_LINK_PORT"
     # IPv6处理：YAML用原始IP，链接用带[]的IP
     local yaml_ip="$node_ip"
@@ -5150,6 +5192,7 @@ _add_hysteria2() {
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
+    local link_port=""
     local server_name="www.amd.com"
     local obfs_password=""
     local port_hopping=""
@@ -5196,7 +5239,13 @@ _add_hysteria2() {
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
         while true; do
-            read -p "请输入监听端口: " port
+            link_port=""
+            read -p "请输入监听端口 (可填 内部:暴露, 如 443:31000): " _port_raw
+            if ! _pl=$(_sx_split_port_input "$_port_raw"); then
+                _error "格式不对: 填 端口 或 内部:暴露 (如 443 或 443:31000)。收到: [${_port_raw}]"
+                continue
+            fi
+            port="${_pl%% *}"; link_port="${_pl#* }"
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "udp" && continue
             break
@@ -5269,7 +5318,7 @@ _add_hysteria2() {
     local up="${up_speed:-100}"
     local down="${down_speed:-100}"
     # 三合一/批量: 链接(暴露)端口可与内部监听端口分离 (NAT 场景)
-    local client_port="$port"
+    local client_port="${link_port:-$port}"
     [ -n "$BATCH_LINK_PORT" ] && client_port="$BATCH_LINK_PORT"
 
     local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --arg op "$obfs_password" --arg cert "$cert_path" --arg key "$key_path" \
