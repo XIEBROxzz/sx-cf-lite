@@ -91,7 +91,8 @@
         "deepmind.com",
         "deepmind.google",
         "labstailwind.pa.googleapis.com",
-        "aisandbox-pa.googleapis.com"
+        "aisandbox-pa.googleapis.com",
+        "ip.sb"
       ]
     }
   ]
