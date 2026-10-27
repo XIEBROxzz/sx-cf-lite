@@ -1,16 +1,36 @@
 # SX-CF-lite
 
-sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.13**
+sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.35**
 
 > 基于 [0xdabiaoge/singbox-lite](https://github.com/0xdabiaoge/singbox-lite) 地基 + Joey [xray-cf-lite](https://github.com/byJoey/xray-cf-lite) 的 CF 套皮整合魔改。
+
+## 仓库文件说明
+
+| 文件 | 作用 | 备注 |
+|---|---|---|
+| `singbox.sh` | **主面板**：建节点 / 套 CF / 服务控制 / 日志 / 定时重启 / DNS / 内核 / 卸载 | 入口，`sx` 命令指向它 |
+| `advanced_relay.sh` | **进阶转发**（`[16]`）：落地导入 / 中转分流 / WARP 出站 / 端口转发 | 由主面板调起 |
+| `singbox-lite_tunnel.sh` | **CF-B（Argo 隧道）** 模块：临时/固定隧道、节点管理 | `s` 命令直达 |
+| `cf_lite.sh` | **CF-A（橙云 VLESS-WSS + OriginRules）** 模块 | 入站并入主 sing-box |
+| `parser.sh` | **节点链接解析/生成**：分享链接 ↔ 配置互转 | 中转导入第三方节点时用 |
+| `install.sh` | **一键安装器**：拉取上面的脚本 + 装内核 + 建 `sx`/`s` 命令 | 只在首次安装用 |
+| `rules/landing.json` | 规则集：**Google 全家桶 + Gemini**（50 域名 + 148 IP 段） | 绑主力落地 |
+| `rules/landing-v2.json` | 规则集：**高 IP 要求 AI**（OpenAI/Claude/Grok…） | 绑 AI 落地 |
+| `rules/warp.json` | 规则集：**WARP 专用**（89 域名，上面两份的并集） | `[9]→[2]→[2]` 回车默认 |
+| `rules/README.md` | 三份规则集的说明 / 一键复制 URL / 生效验证 | 改规则前看这个 |
+| `README.md` | 本文件 | 项目说明与菜单速查 |
+| `.gitattributes` | 强制仓库内文本为 **LF** | 防 CRLF 导致 Linux 上 `bash -n` 报错、`[16]` 闪退 |
+| `.gitignore` | 忽略本地工具目录与临时文件（`.commandcode/`、`*.bak`…） | 防误提交无关文件 |
+
+> 更新时 `[13]` 只会拉前 **5 个 `.sh`**（按 commit sha 下载，绕 CDN 缓存）；`rules/*.json` 由 sing-box 运行时按 URL 自取，改完重启服务即可。
 
 ## 能做什么
 
 - **CF-B**：Argo 隧道（临时 / 固定域名）
 - **CF-A**：橙云 VLESS-WSS + OriginRules（入站并入主 sing-box）
 - **中转落地**：Token / 分享链接导入落地，按规则集分流（Play、YouTube、Gemini、主流 AI）
-- **出口优化**：WARP 出站 · UDP 转发 · IPv4/IPv6 优先
-- **端口转发**、定时重启、脚本/规则集在线更新
+- **出口与网络优化**：WARP 出站（含解析策略）· UDP 转发 · IPv4/IPv6 优先 · TCP 时间戳开关
+- **端口转发**（nftables 内核态 / sing-box 用户态）、定时重启、脚本与规则集在线更新
 
 ## 一键安装
 
@@ -43,19 +63,32 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/in
 
 ## 进阶转发（16）
 
+**基础配置 / 链路管理**
+
 | 键 | 功能 |
 |---|---|
 | 1 / 2 / 3 | 落地机生成 Token / 中转机 Token 导入 / 导入第三方节点 |
 | 4 / 5 / 6 / 7 | 查看链路 / 删除落地 / 解除入口对接 / 改入口端口 |
-| 8 | 中转分流管理 |
+| 8 | 中转分流管理（启用落地、绑规则集） |
 | R | 清空所有中转配置 |
-| 9 | WARP 出站管理 |
-| U | UDP 转发（NAT 小鸡禁 UDP 时，把 DNS/QUIC 交给落地） |
-| V | IPv4/IPv6 优先（作用于全部落地） |
-| 10 | 端口转发管理 |
 
-落地规则集见 [rules/README.md](rules/README.md)：`landing.json`（Google 全家桶 + Gemini）、`landing-v2.json`（高 IP 要求的 AI）。
+**出口与网络优化**
+
+| 键 | 功能 |
+|---|---|
+| 9 | WARP 出站管理（注册 / 接管+解析策略 / 出口测试 / 关闭 / 彻底移除） |
+| B | 本机直连地址族（双栈 / 优先v4 / 优先v6 / 仅v4 / 仅v6，治 v4 送中） |
+| T | 中转排障（UDP 转发 / 落地地址族） |
+| S | TCP 时间戳开关（治"电脑 WiFi 通、手机 5G 不通"） |
+
+**端口转发**
+
+| 键 | 功能 |
+|---|---|
+| 10 | 端口转发管理（添加 / 查看 / 修改 / 删除 / 切换引擎 / 清空） |
+
+落地规则集见 [rules/README.md](rules/README.md)：`landing.json`（Google 全家桶 + Gemini）、`landing-v2.json`（高 IP 要求的 AI）、`warp.json`（WARP 专用）。
 
 ## 更新
 
-菜单 `[13]` 一键更新全部脚本组件（事务式替换，任一失败整组回滚）。
+菜单 `[13]` 一键更新全部脚本组件（按 commit sha 下载，事务式替换，任一失败整组回滚）。
