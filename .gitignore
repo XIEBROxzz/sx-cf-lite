@@ -1,0 +1,7 @@
+# 本机工具产物 / 编辑器临时文件 (不应入库)
+.commandcode/
+*.bak
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
