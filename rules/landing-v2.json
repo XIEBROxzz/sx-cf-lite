@@ -42,7 +42,8 @@
         "deepmind.com",
         "deepmind.google",
         "labstailwind.pa.googleapis.com",
-        "aisandbox-pa.googleapis.com"
+        "aisandbox-pa.googleapis.com",
+        "api.ipify.org"
       ]
     }
   ]
