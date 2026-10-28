@@ -22,7 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
-#     1.43: 手动节点不再输出"CF优选专用链接" (与 [2] 一键套CF 的自动配置冲突/误导), 只给直连链接
+#     1.44: VLESS-WS-TLS 简化: 伪装域名回车用默认, 证书固定自动自签名; [4] 菜单文案更新`n#     1.43: 手动节点不再输出"CF优选专用链接" (与 [2] 一键套CF 的自动配置冲突/误导), 只给直连链接
 #     1.42: SS-2022+ShadowTLS v3 建完补 sing-box JSON 配置 + 说明(无标准单行链接), 不再"看起来什么都没输出"
 #     1.41: parser.sh 新增 anytls:// 链接解析 (中转可直接粘贴导入 AnyTLS 落地)
 #     1.40: 恢复手动创建 4 个协议 (SS-2022 / AnyTLS / TUIC / VLESS-WS-TLS), 挂在 [1] 的 [4] 更多协议; 端口写法与 [1]/[2] 一致
@@ -62,7 +62,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.43"
+export SCRIPT_VERSION="1.44"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4296,10 +4296,10 @@ _add_vless_ws_tls() {
              client_server_addr="[${client_server_addr}]"
         fi
 
-        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
+        _info "伪装域名 (SNI): 直接回车用默认 ${DEFAULT_SNI}, 也可输入你自己的域名。"
         _info " (例如: xxx.741865.xyz)"
-        read -p "请输入伪装域名: " camouflage_domain
-        [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
+        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
+        camouflage_domain=${camouflage_domain:-$DEFAULT_SNI}
 
         while true; do
             read -p "填端口 (内部:暴露, 单填=内外一致, 回车=随机 30000-50000): " _port_raw
@@ -4345,45 +4345,14 @@ _add_vless_ws_tls() {
     local key_path=""
     local skip_verify=false
 
-    # --- 步骤 5: 证书选择 ---
-    local cert_choice="1"
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_choice="1"
-    else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
-        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
-    fi
-
-    if [ "$cert_choice" == "1" ]; then
-        # 自签名证书
-        cert_path="${SINGBOX_DIR}/${tag}.pem"
-        key_path="${SINGBOX_DIR}/${tag}.key"
-        _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-        skip_verify=true
-        _info "已生成自签名证书，客户端将跳过证书验证。"
-    else
-        # 手动上传证书
-        _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
-        _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
-        _info "  - (或)   使用 Cloudflare 源服务器证书"
-        read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
-        [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
-
-        read -p "请输入私钥文件 .key 的完整路径: " key_path
-        [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
-        
-        # 询问是否跳过验证
-        read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
-        if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
-            skip_verify=true
-            _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
-        fi
-    fi
-    
+    # --- 步骤 5: 证书 (自动自签名, 不再询问) ---
+    # SX: 手动节点走直连, 证书固定自签名 + 链接内 pcs 指纹;
+    #     需要真证书 / 套 Cloudflare 请用 [2] 一键套CF (CF-A 全自动)。
+    cert_path="${SINGBOX_DIR}/${tag}.pem"
+    key_path="${SINGBOX_DIR}/${tag}.key"
+    skip_verify=true
+    _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
+    _info "已自动生成自签名证书 (直连用, 链接内含 pcs 指纹)。"
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
@@ -4491,10 +4460,10 @@ _add_vless_grpc_tls() {
              client_server_addr="[${client_server_addr}]"
         fi
 
-        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
+        _info "伪装域名 (SNI): 直接回车用默认 ${DEFAULT_SNI}, 也可输入你自己的域名。"
         _info " (例如: xxx.741865.xyz)"
-        read -p "请输入伪装域名: " camouflage_domain
-        [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
+        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
+        camouflage_domain=${camouflage_domain:-$DEFAULT_SNI}
 
         while true; do
             read -p "填端口 (内部:暴露, 单填=内外一致, 回车=随机 30000-50000): " _port_raw
@@ -4669,9 +4638,9 @@ _add_trojan_ws_tls() {
              client_server_addr="[${client_server_addr}]"
         fi
 
-        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
-        read -p "请输入伪装域名: " camouflage_domain
-        [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
+        _info "伪装域名 (SNI): 直接回车用默认 ${DEFAULT_SNI}, 也可输入你自己的域名。"
+        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
+        camouflage_domain=${camouflage_domain:-$DEFAULT_SNI}
 
         while true; do
             read -p "填端口 (内部:暴露, 单填=内外一致, 回车=随机 30000-50000): " _port_raw
@@ -9643,7 +9612,7 @@ _show_more_protocols_menu() {
         echo -e "    ${GREEN}[1]${NC} Shadowsocks-2022 (含 ShadowTLS v3)"
         echo -e "    ${GREEN}[2]${NC} AnyTLS (TLS / Reality, 可同时建两个)"
         echo -e "    ${GREEN}[3]${NC} TUIC (需机器 UDP 可用)"
-        echo -e "    ${GREEN}[4]${NC} VLESS + WS + TLS (需自备域名证书)"
+        echo -e "    ${GREEN}[4]${NC} VLESS + WS + TLS (自动证书直连, 套CF请用 [2]→1)"
         echo ""
         echo -e "  ${YELLOW}端口统一写法: 单填=内外一致 / 内部:暴露 / 回车=随机 30000-50000${NC}"
         echo ""
