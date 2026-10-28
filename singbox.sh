@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.52: [4] 更多协议 去掉逐行长标注, 改为顶部统一提示 (直连首选 Reality, 其余属补充协议)
 #     1.51: AnyTLS 协议选择重新编号为 1=Any-Reality / 2=AnyTLS / 3=两个都建 (逗号写法仍兼容)
 #     1.50: AnyTLS / Trojan 证书改为全自动自签名; AnyTLS 默认选 Reality (回车即 Reality)
 #     1.49: 中转补 AnyTLS 导入校验 (此前 anytls 链接能解析但被 schema 拒); 修 Trojan-WS 校验表达式; 入口列表加"是否适合做前端"标注
@@ -70,7 +71,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.51"
+export SCRIPT_VERSION="1.52"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -9539,12 +9540,16 @@ _show_more_protocols_menu() {
         echo -e "  ║           更多协议 (手动创建)         ║"
         echo -e "  ╚═══════════════════════════════════════╝${NC}"
         echo ""
-        echo -e "  ${CYAN}【可选协议】(按直连推荐度排序)${NC}"
-        echo -e "    ${GREEN}[1]${NC} AnyTLS (TLS / Reality, 可同时建两个)     ${GREEN}← 直连推荐 (选 Reality)${NC}"
-        echo -e "    ${GREEN}[2]${NC} TUIC (需机器 UDP 可用)                   ${YELLOW}← 直连看线路 (UDP 易被 QoS)${NC}"
-        echo -e "    ${YELLOW}[3]${NC} VLESS + WS + TLS (自签证书)               ${RED}← 不建议直连 (宜作落地/套CF用 [2]→1)${NC}"
-        echo -e "    ${YELLOW}[4]${NC} Trojan + WS + TLS (自签证书)                ${RED}← 不建议直连 (宜作落地/中转后段)${NC}"
-        echo -e "    ${YELLOW}[5]${NC} Shadowsocks-2022 (含 ShadowTLS v3)        ${RED}← 不建议直连 (宜作中转落地)${NC}"
+        echo -e "  ${CYAN}【可选协议】${NC}"
+        echo -e "    ${GREEN}[1]${NC} AnyTLS (Reality / TLS, 可同时建两个)"
+        echo -e "    ${GREEN}[2]${NC} TUIC (需机器 UDP 可用)"
+        echo -e "    ${YELLOW}[3]${NC} VLESS + WS + TLS (自签证书)"
+        echo -e "    ${YELLOW}[4]${NC} Trojan + WS + TLS (自签证书)"
+        echo -e "    ${YELLOW}[5]${NC} Shadowsocks-2022 (含 ShadowTLS v3)"
+        echo ""
+        echo -e "  ${YELLOW}提示: 直连首选还是 [1] VLESS + Reality (主菜单那个)。${NC}"
+        echo -e "  ${YELLOW}     以上属于补充协议, 直连的隐蔽性都不如 Reality,${NC}"
+        echo -e "  ${YELLOW}     更适合当中转落地 (TUIC 需机器 UDP 可用), 直连请谨慎选用。${NC}"
         echo ""
         echo -e "  ${YELLOW}端口统一写法: 单填=内外一致 / 内部:暴露 / 回车=随机 30000-50000${NC}"
         echo ""
