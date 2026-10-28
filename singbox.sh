@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.53: 端口统一写法提示从 [4] 移到 [1] 创建节点菜单 (所有入口同一套写法, 不必重复)
 #     1.52: [4] 更多协议 去掉逐行长标注, 改为顶部统一提示 (直连首选 Reality, 其余属补充协议)
 #     1.51: AnyTLS 协议选择重新编号为 1=Any-Reality / 2=AnyTLS / 3=两个都建 (逗号写法仍兼容)
 #     1.50: AnyTLS / Trojan 证书改为全自动自签名; AnyTLS 默认选 Reality (回车即 Reality)
@@ -71,7 +72,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.52"
+export SCRIPT_VERSION="1.53"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -9551,8 +9552,6 @@ _show_more_protocols_menu() {
         echo -e "  ${YELLOW}     以上属于补充协议, 直连的隐蔽性都不如 Reality,${NC}"
         echo -e "  ${YELLOW}     更适合当中转落地 (TUIC 需机器 UDP 可用), 直连请谨慎选用。${NC}"
         echo ""
-        echo -e "  ${YELLOW}端口统一写法: 单填=内外一致 / 内部:暴露 / 回车=随机 30000-50000${NC}"
-        echo ""
         echo -e "  ───────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
@@ -9589,6 +9588,8 @@ _show_add_node_menu() {
     
     echo -e "  ${CYAN}【快捷功能】${NC}"
     echo -e "    ${GREEN}[5]${NC} 三合一 (填一个端口, 直连双节点+临时Argo)"
+    echo ""
+    echo -e "  ${YELLOW}端口统一写法: 单填=内外一致 / 内部:暴露 / 回车=随机 30000-50000${NC}"
     echo ""
     
     echo -e "  ─────────────────────────────────────────"
