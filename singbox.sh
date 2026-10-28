@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.50: AnyTLS / Trojan 证书改为全自动自签名; AnyTLS 默认选 Reality (回车即 Reality)
 #     1.49: 中转补 AnyTLS 导入校验 (此前 anytls 链接能解析但被 schema 拒); 修 Trojan-WS 校验表达式; 入口列表加"是否适合做前端"标注
 #     1.48: [4] 更多协议 新增 [4] Trojan + WS + TLS, SS-2022 顺延为 [5]
 #     1.47: [4] 更多协议 按直连推荐度重排并标注 (1 AnyTLS / 2 TUIC / 3 WS-TLS / 4 SS-2022)
@@ -68,7 +69,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.49"
+export SCRIPT_VERSION="1.50"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4673,45 +4674,14 @@ _add_trojan_ws_tls() {
     local key_path=""
     local skip_verify=false
 
-    # --- 步骤 5: 证书选择 ---
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_path="${SINGBOX_DIR}/${tag}.pem"
-        key_path="${SINGBOX_DIR}/${tag}.key"
-        _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-        skip_verify=true
-    else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
-        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
-        if [ "$cert_choice" == "1" ]; then
-            cert_path="${SINGBOX_DIR}/${tag}.pem"
-            key_path="${SINGBOX_DIR}/${tag}.key"
-            _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-            skip_verify=true
-            _info "已生成自签名证书，客户端将跳过证书验证。"
-        else
-            # 手动上传证书
-            _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
-            _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
-            _info "  - (或)   使用 Cloudflare 源服务器证书"
-            read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
-            [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
-
-            read -p "请输入私钥文件 .key 的完整路径: " key_path
-            [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
-            
-            # 询问是否跳过验证
-            read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
-            if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
-                skip_verify=true
-                _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
-            fi
-        fi
-    fi
-
+    # --- 步骤 5: 证书 (自动自签名, 不再询问) ---
+    # SX: 手动节点走直连, 证书固定自签名 + 链接内 pcs 指纹;
+    #     需要真证书 / 套 Cloudflare 请用 [2] 一键套CF (CF-A 全自动)。
+    cert_path="${SINGBOX_DIR}/${tag}.pem"
+    key_path="${SINGBOX_DIR}/${tag}.key"
+    _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
+    skip_verify=true
+    _info "已自动生成自签名证书 (直连用, 链接内含 pcs 指纹)。"
     # [!] Trojan: 使用密码
     local password=""
     if [ "$BATCH_MODE" = "true" ]; then
@@ -4813,49 +4783,17 @@ _create_anytls_tls_node() {
     local password="$4"
     local name="$5"
 
-    # --- 步骤 4: 证书选择 ---
-    local cert_choice="1"
-    if [ "$BATCH_MODE" = "true" ]; then
-        cert_choice="1"
-    else
-        echo ""
-        echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (推荐)"
-        echo "  2) 手动上传证书文件 (Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
-        cert_choice=${cert_choice:-1}
-    fi
-    
+    # --- 步骤 4: 证书 (自动自签名, 不再询问) ---
+    # SX: 手动节点走直连, 证书固定自签名 + 链接内 pcs 指纹;
+    #     需要真证书 / 套 Cloudflare 请用 [2] 一键套CF (CF-A 全自动)。
     local cert_path=""
     local key_path=""
-    local skip_verify=true  # 默认跳过验证 (自签证书需要)
+    local skip_verify=true
     local tag="anytls-in-${port}"
-    
-    if [ "$cert_choice" == "1" ]; then
-        # 自签名证书
-        cert_path="${SINGBOX_DIR}/${tag}.pem"
-        key_path="${SINGBOX_DIR}/${tag}.key"
-        _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
-        _info "已生成自签名证书，客户端将跳过证书验证。"
-    else
-        # 手动上传证书
-        _info "请输入 ${server_name} 对应的证书文件路径。"
-        read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
-        [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
-        
-        read -p "请输入私钥文件 .key 的完整路径: " key_path
-        [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
-        
-        # 询问是否跳过验证
-        read -p "$(echo -e ${YELLOW}"您是否正在使用自签名证书或Cloudflare源证书? (y/N): "${NC})" use_self_signed
-        if [[ "$use_self_signed" == "y" || "$use_self_signed" == "Y" ]]; then
-            skip_verify=true
-            _warning "已启用 'skip-cert-verify: true'，客户端将跳过证书验证。"
-        else
-            skip_verify=false
-        fi
-    fi
-    
+    cert_path="${SINGBOX_DIR}/${tag}.pem"
+    key_path="${SINGBOX_DIR}/${tag}.key"
+    _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
+    _info "已自动生成自签名证书 (直连用, 链接内含 pcs 指纹)。"
     # IPv6 处理
     local yaml_ip="$node_ip"
     local link_ip="$node_ip"
@@ -5008,11 +4946,11 @@ _add_anytls() {
     else
         _info "--- 添加 AnyTLS / Any-Reality 节点 ---"
         echo "请选择节点协议:"
-        echo "  1) AnyTLS"
-        echo "  2) Any-Reality"
-        echo "  1,2) 同时创建 AnyTLS 和 Any-Reality"
-        read -p "请选择 [1/2/1,2] (默认: 1): " mode_choice
-        mode_choice=${mode_choice:-1}
+        echo "  2) Any-Reality   ${YELLOW}← 默认, 推荐 (抗 TLS-in-TLS 指纹)${NC}"
+        echo "  1) AnyTLS (自签证书, 可用但特征弱)"
+        echo "  1,2) 同时创建 AnyTLS + Any-Reality"
+        read -p "请选择 [1/2/1,2] (默认: 2=Any-Reality): " mode_choice
+        mode_choice=${mode_choice:-2}
         mode_choice=$(echo "$mode_choice" | tr '，' ',' | xargs)
         case "$mode_choice" in
             1|2|1,2|2,1|"1 2"|"2 1") ;;
