@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.47: [4] 更多协议 按直连推荐度重排并标注 (1 AnyTLS / 2 TUIC / 3 WS-TLS / 4 SS-2022)
 #     1.46: 修复 SS 链接端口为空 (client_port 被插进 if shadowtls 内部导致普通 SS 取不到端口 -> 客户端显示 -1)
 #     1.45: 去掉手动节点的 "如何开启 Cloudflare CDN 优选" 长篇提示 (与 [2] 一键套CF 自动流程重复)
 #     1.44: VLESS-WS-TLS 简化: 伪装域名回车用默认, 证书固定自动自签名; [4] 菜单文案更新
@@ -65,7 +66,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.46"
+export SCRIPT_VERSION="1.47"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -9591,11 +9592,11 @@ _show_more_protocols_menu() {
         echo -e "  ║           更多协议 (手动创建)         ║"
         echo -e "  ╚═══════════════════════════════════════╝${NC}"
         echo ""
-        echo -e "  ${CYAN}【可选协议】${NC}"
-        echo -e "    ${GREEN}[1]${NC} Shadowsocks-2022 (含 ShadowTLS v3)"
-        echo -e "    ${GREEN}[2]${NC} AnyTLS (TLS / Reality, 可同时建两个)"
-        echo -e "    ${GREEN}[3]${NC} TUIC (需机器 UDP 可用)"
-        echo -e "    ${GREEN}[4]${NC} VLESS + WS + TLS (自动证书直连, 套CF请用 [2]→1)"
+        echo -e "  ${CYAN}【可选协议】(按直连推荐度排序)${NC}"
+        echo -e "    ${GREEN}[1]${NC} AnyTLS (TLS / Reality, 可同时建两个)     ${GREEN}← 直连推荐 (选 Reality)${NC}"
+        echo -e "    ${GREEN}[2]${NC} TUIC (需机器 UDP 可用)                   ${YELLOW}← 直连看线路 (UDP 易被 QoS)${NC}"
+        echo -e "    ${YELLOW}[3]${NC} VLESS + WS + TLS (自签证书)               ${RED}← 不建议直连 (宜作落地/套CF用 [2]→1)${NC}"
+        echo -e "    ${YELLOW}[4]${NC} Shadowsocks-2022 (含 ShadowTLS v3)        ${RED}← 不建议直连 (宜作中转落地)${NC}"
         echo ""
         echo -e "  ${YELLOW}端口统一写法: 单填=内外一致 / 内部:暴露 / 回车=随机 30000-50000${NC}"
         echo ""
@@ -9605,10 +9606,10 @@ _show_more_protocols_menu() {
         local c
         read -p "  请输入选项 [0-4]: " c
         case $c in
-            1) _run_main_create_transaction _add_shadowsocks_menu; _pause_back ;;
-            2) _run_main_create_transaction _add_anytls; _pause_back ;;
-            3) _run_main_create_transaction _add_tuic; _pause_back ;;
-            4) _run_main_create_transaction _add_vless_ws_tls; _pause_back ;;
+            1) _run_main_create_transaction _add_anytls; _pause_back ;;
+            2) _run_main_create_transaction _add_tuic; _pause_back ;;
+            3) _run_main_create_transaction _add_vless_ws_tls; _pause_back ;;
+            4) _run_main_create_transaction _add_shadowsocks_menu; _pause_back ;;
             0) return ;;
             *) _error "无效输入，请重试。"; _pause_back ;;
         esac
@@ -9629,7 +9630,7 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision"
     echo -e "    ${GREEN}[2]${NC} Hysteria2"
     echo -e "    ${GREEN}[3]${NC} 一键临时argo (全自动)"
-    echo -e "    ${GREEN}[4]${NC} 更多协议 (SS-2022 / AnyTLS / TUIC / WS+TLS)"
+    echo -e "    ${GREEN}[4]${NC} 更多协议 (AnyTLS / TUIC / WS+TLS / SS-2022)"
     echo ""
     
     echo -e "  ${CYAN}【快捷功能】${NC}"
