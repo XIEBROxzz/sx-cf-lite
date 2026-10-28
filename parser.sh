@@ -912,6 +912,83 @@ _parse_trojan_uri() {
 # SX: auto 模式 —— 按链接 scheme 自动识别并分发到对应解析器
 # _fatal 在 _emit_auto 参数的命令替换里 exit 1 会被吞, 使 auto 拿着 {"error":...} 且 rc=0 返回
 # (调用方误当成功去跑 schema 校验)。此处复查 error 对象, 重新以非零码退出保持契约一致。
+_parse_anytls_uri() {
+    local link body authority query userinfo password endpoint server port
+    local security sni insecure fp pbk sid output tls_extra
+    link="$1"
+    [[ "$link" == anytls://* ]] || _fatal "链接必须以 anytls:// 开头"
+    body="${link#anytls://}"
+    body="${body%%#*}"
+    [[ -n "$body" ]] || _fatal "AnyTLS 链接为空"
+
+    if [[ "$body" == *\?* ]]; then
+        authority="${body%%\?*}"
+        query="${body#*\?}"
+    else
+        authority="$body"
+        query=""
+    fi
+
+    [[ "$authority" == *@* ]] || _fatal "AnyTLS 链接缺少密码或服务器地址"
+    userinfo="${authority%%@*}"
+    endpoint="${authority#*@}"
+    [[ "$endpoint" != *@* ]] || _fatal "AnyTLS 链接的服务器地址格式错误"
+
+    _url_decode "$userinfo" 0 || _fatal "AnyTLS 密码包含无效 URL 编码"
+    password="$DECODED_VALUE"
+    [[ -n "$password" ]] || _fatal "AnyTLS 密码为空"
+
+    _split_host_port "$endpoint" || _fatal "AnyTLS 服务器地址或端口无效"
+    server="$PARSED_SERVER"
+    port="$PARSED_PORT"
+
+    _parse_query "$query" || _fatal "AnyTLS 查询参数格式无效或包含重复参数"
+    _require_query_keys security sni insecure allowInsecure skip-cert-verify fp pbk sid type headerType
+
+    security="${QUERY_PARAMS[security]-tls}"
+    sni="${QUERY_PARAMS[sni]-}"
+    insecure="${QUERY_PARAMS[insecure]-${QUERY_PARAMS[allowInsecure]-${QUERY_PARAMS[skip-cert-verify]-}}}"
+    fp="${QUERY_PARAMS[fp]-}"
+    pbk="${QUERY_PARAMS[pbk]-}"
+    sid="${QUERY_PARAMS[sid]-}"
+
+    [[ -n "$sni" ]] || _fatal "AnyTLS 节点缺少 sni 参数"
+    _validate_server "$sni" || _fatal "AnyTLS SNI 无效"
+    case "$security" in
+        tls|reality) ;;
+        *) _fatal "AnyTLS security 仅支持 tls / reality" ;;
+    esac
+    case "$insecure" in
+        ""|0) insecure="false" ;;
+        1) insecure="true" ;;
+        *) _fatal "AnyTLS insecure 参数仅允许 0 或 1" ;;
+    esac
+
+    if [ "$security" == "reality" ]; then
+        [[ -n "$pbk" ]] || _fatal "AnyTLS Reality 节点缺少 pbk 参数"
+        tls_extra=$(jq -nc --arg pbk "$pbk" --arg sid "$sid" \
+            '{reality:{enabled:true,public_key:$pbk,short_id:$sid}}')
+    else
+        tls_extra='{}'
+    fi
+
+    if ! output=$(jq -nc \
+        --arg server "$server" \
+        --argjson port "$port" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        --argjson insecure "$insecure" \
+        --arg fp "$fp" \
+        --argjson extra "$tls_extra" \
+        '{type:"anytls",tag:"proxy",server:$server,server_port:$port,password:$password,
+          tls:({enabled:true,server_name:$sni,insecure:$insecure}
+               + (if $fp != "" then {utls:{enabled:true,fingerprint:$fp}} else {} end)
+               + $extra)}'); then
+        _fatal "生成 AnyTLS outbound 失败"
+    fi
+    printf '%s\n' "$output"
+}
+
 _emit_auto() {
     local mode="$1" json="$2"
     if ! printf '%s' "$json" | jq -e '.error == null' >/dev/null 2>&1; then
@@ -947,6 +1024,9 @@ _parse_auto() {
         trojan)
             _emit_auto "trojan" "$(_parse_trojan_uri "$link")"
             ;;
+        anytls)
+            _emit_auto "anytls" "$(_parse_anytls_uri "$link")"
+            ;;
         ss)
             userinfo="${link#ss://}"
             userinfo="${userinfo%%#*}"
@@ -977,8 +1057,7 @@ _parse_auto() {
         socks5|socks)
             _fatal "SOCKS5 链接导入请使用手动输入 [8][9]"
             ;;
-        *)
-            _fatal "暂不支持自动识别协议: $scheme:// (支持 vless/hysteria2/tuic/trojan/ss/http)"
+        *) _fatal "暂不支持自动识别协议: $scheme:// (支持 vless/hysteria2/tuic/trojan/anytls/ss/http)"
             ;;
     esac
 }
@@ -1016,7 +1095,7 @@ _read_link() {
 
 MODE="$1"
 case "$MODE" in
-    vless-reality-vision|vless-tcp|vless-ws-tls|ss-aes-128-gcm|ss-aes-256-gcm|ss-2022-aes-128-gcm|ss-2022-aes-256-gcm|https-proxy|hysteria2|tuic|trojan|auto) ;;
+    vless-reality-vision|vless-tcp|vless-ws-tls|ss-aes-128-gcm|ss-aes-256-gcm|ss-2022-aes-128-gcm|ss-2022-aes-256-gcm|https-proxy|hysteria2|tuic|trojan|anytls|auto) ;;
     *) _fatal "不支持的解析模式" ;;
 esac
 
@@ -1041,5 +1120,6 @@ case "$MODE" in
     hysteria2) _parse_hysteria2_uri "$LINK_INPUT" ;;
     tuic) _parse_tuic_uri "$LINK_INPUT" ;;
     trojan) _parse_trojan_uri "$LINK_INPUT" ;;
+    anytls) _parse_anytls_uri "$LINK_INPUT" ;;
     auto) _parse_auto "$LINK_INPUT" ;;
 esac
