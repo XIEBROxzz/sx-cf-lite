@@ -22,7 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
-#     1.44: VLESS-WS-TLS 简化: 伪装域名回车用默认, 证书固定自动自签名; [4] 菜单文案更新`n#     1.43: 手动节点不再输出"CF优选专用链接" (与 [2] 一键套CF 的自动配置冲突/误导), 只给直连链接
+#     1.45: 去掉手动节点的 "如何开启 Cloudflare CDN 优选" 长篇提示 (与 [2] 一键套CF 自动流程重复)`n#     1.44: VLESS-WS-TLS 简化: 伪装域名回车用默认, 证书固定自动自签名; [4] 菜单文案更新`n#     1.43: 手动节点不再输出"CF优选专用链接" (与 [2] 一键套CF 的自动配置冲突/误导), 只给直连链接
 #     1.42: SS-2022+ShadowTLS v3 建完补 sing-box JSON 配置 + 说明(无标准单行链接), 不再"看起来什么都没输出"
 #     1.41: parser.sh 新增 anytls:// 链接解析 (中转可直接粘贴导入 AnyTLS 落地)
 #     1.40: 恢复手动创建 4 个协议 (SS-2022 / AnyTLS / TUIC / VLESS-WS-TLS), 挂在 [1] 的 [4] 更多协议; 端口写法与 [1]/[2] 一致
@@ -62,7 +62,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.44"
+export SCRIPT_VERSION="1.45"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4207,24 +4207,6 @@ _show_node_link() {
     return 0
 }
 
-_show_cdn_guidance() {
-    local domain="$1"
-    local port="$2"
-    echo ""
-    echo -e "${YELLOW}══════════════════ 🔧 如何开启 Cloudflare CDN 优选 ══════════════════${NC}"
-    _info "如果您希望开启 CDN 并在之后使用优选域名/IP，请按照以下步骤配置："
-    _info "1. ${CYAN}【CF 后台】${NC}将该域名的解析记录开启小黄云 (${ORANGE}Proxied${NC})。"
-    _info "2. ${CYAN}【CF 后台】${NC}在 [SSL/TLS] 菜单中，将加密模式设为: ${GREEN}Full (完全)${NC}。"
-    if [ "$port" != "443" ]; then
-        _warn "3. 您的服务器监听的是 ${port} 端口。请在 [Rules] -> [Origin Rules] 中配置："
-        _warn "   - 主机名 包含 \"${domain}\" -> 重写到端口: ${port}"
-    else
-        _info "3. 您的服务器已监听 443 端口，无需设置 Origin Rules。"
-    fi
-    _info "4. ${CYAN}【客户端】${NC}修改配置：地址改为优选域名/IP，端口改为 ${GREEN}443${NC}。"
-    _info "   (注：Host/SNI 必须保持为您的域名 ${domain})"
-    echo -e "${YELLOW}══════════════════════════════════════════════════════════════════════${NC}"
-}
 
 _show_grpc_cdn_guidance() {
     local domain="$1"
@@ -4430,7 +4412,6 @@ _add_vless_ws_tls() {
     _success "客户端伪装域名 (sni/Host): ${camouflage_domain}"
     
     # CDN 指引 (仅在非批量模式下详细显示)
-    [ "$BATCH_MODE" != "true" ] && _show_cdn_guidance "${camouflage_domain}" "${port}"
 
     # IPv6 处理用于链接
     local link_ip="$client_server_addr"
@@ -4813,7 +4794,6 @@ _add_trojan_ws_tls() {
     _success "客户端伪装域名 (sni/Host): ${camouflage_domain}"
     
     # CDN 指引 (仅在非批量模式下详细显示)
-    [ "$BATCH_MODE" != "true" ] && _show_cdn_guidance "${camouflage_domain}" "${port}"
 
     # IPv6 处理用于链接
     local link_ip="$client_server_addr"
