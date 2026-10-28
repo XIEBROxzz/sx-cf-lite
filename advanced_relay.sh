@@ -1124,6 +1124,16 @@ _validate_imported_outbound() {
             and (.transport.headers.Host | type == "string" and length > 0)
             and (.transport.max_early_data? == null or (.transport.max_early_data | type == "number"))
             and (.transport.early_data_header_name? == null or .transport.early_data_header_name == "Sec-WebSocket-Protocol")
+        elif $mode == "anytls" then
+            only_keys(["type","tag","server","server_port","password","tls"])
+            and .type == "anytls"
+            and (.password | type == "string" and length > 0)
+            and (.tls.enabled == true)
+            and (.tls.server_name | type == "string" and length > 0)
+            and (.tls.insecure | type == "boolean")
+            and (((.tls | keys_unsorted) - ["enabled","server_name","insecure","utls","reality"]) | length) == 0
+            and (((.tls.utls? // null) == null) or ((((.tls.utls | keys_unsorted) - ["enabled","fingerprint"]) | length) == 0 and .tls.utls.enabled == true))
+            and (((.tls.reality? // null) == null) or ((((.tls.reality | keys_unsorted) - ["enabled","public_key","short_id"]) | length) == 0 and .tls.reality.enabled == true and (.tls.reality.public_key | type == "string" and length > 0)))
         elif $mode == "https-proxy" then
             (only_keys(["type","tag","server","server_port","tls"]) or only_keys(["type","tag","server","server_port","username","password","tls"]))
             and .type == "http"
@@ -1196,7 +1206,13 @@ _validate_imported_outbound() {
             and (.tls.enabled == true)
             and (.tls.server_name | type == "string" and length > 0)
             and (.tls.insecure | type == "boolean")
-            and (.transport? == null or (.transport | only_keys(["type","path","headers","max_early_data","early_data_header_name"]) and .transport.type == "ws" and (.transport.path | type == "string" and startswith("/") and (contains("?") | not)) and (.transport.headers | only_keys(["Host"])) and (.transport.headers.Host | type == "string" and length > 0)))
+            and (.transport? == null or (
+                    (.transport | only_keys(["type","path","headers","max_early_data","early_data_header_name"]))
+                    and .transport.type == "ws"
+                    and (.transport.path | type == "string" and startswith("/") and (contains("?") | not))
+                    and (.transport.headers | only_keys(["Host"]))
+                    and (.transport.headers.Host | type == "string" and length > 0)
+                ))
         else false end
     ' >/dev/null 2>&1
 }
@@ -1323,7 +1339,7 @@ _import_link_config() {
     echo '  ╚═══════════════════════════════════════╝'
     echo -e "${NC}"
     echo -e "    ${GREEN}[1]${NC} ${YELLOW}自动导入 (推荐 - 粘贴任意链接, 自动识别协议)${NC}"
-    echo -e "        支持: VLESS(Reality/TCP/WS+TLS) · Trojan · Hysteria2(hy2) · TUIC · Shadowsocks · HTTP(S)"
+    echo -e "        支持: VLESS(Reality/TCP/WS+TLS) · Trojan · Hysteria2(hy2) · TUIC · AnyTLS · Shadowsocks · HTTP(S)"
     echo ""
     echo -e "    ${GREEN}[2]${NC} HTTPS / HTTP 代理（手动输入）"
     echo -e "    ${GREEN}[3]${NC} SOCKS5 无认证（手动输入）"
@@ -1359,7 +1375,7 @@ _import_link_config() {
         _check_parser || { _pause_relay; return; }
         local PARSER_BIN="$_PARSER_PATH"
         if [ "$parser_mode" == "auto" ]; then
-            read -r -p "  请粘贴节点分享链接 (支持: VLESS/Trojan/Hysteria2(hy2)/TUIC/Shadowsocks/HTTP(S)): " share_link
+            read -r -p "  请粘贴节点分享链接 (支持: VLESS/Trojan/Hysteria2(hy2)/TUIC/AnyTLS/Shadowsocks/HTTP(S)): " share_link
             # 去首尾空白 (实测: 末尾空格会让解析器认不出协议前缀)
             share_link="${share_link#"${share_link%%[![:space:]]*}"}"
             share_link="${share_link%"${share_link##*[![:space:]]}"}"
@@ -2184,7 +2200,17 @@ _relay_bind_landing() {
         i=$((i+1)); entries+=("$rt")
         bound=$(jq -r --arg t "$rt" '[.route.rules[]? | select((((.inbound? // []) | if type == "array" then . else [.] end) | index($t)) != null) | select((.outbound? // "") != "") | .outbound] | unique | .[]' "$RELAY_CONFIG_FILE" 2>/dev/null)
         bound=$(_relay_out_names "$bound")
-        echo -e "    ${GREEN}[$i]${NC} ${YELLOW}${rnm}${NC} (${rty} :${rpo})${bound:+  ${CYAN}已对接: ${bound}${NC}}"
+        # SX: 标注该协议是否适合做中转前端 (客户端 -> 中转 这一段)
+        local _fhint=""
+        case "$rty" in
+            vless)         _fhint="${GREEN}← 推荐${NC}" ;;
+            trojan|anytls) _fhint="${GREEN}← 可用${NC}" ;;
+            hysteria2|tuic) _fhint="${YELLOW}← 需 UDP 通路${NC}" ;;
+            shadowsocks)   _fhint="${RED}← 不建议前端 (无 TLS 伪装)${NC}" ;;
+            vmess)         _fhint="${RED}← 不建议前端 (无 TLS)${NC}" ;;
+            *)             _fhint="" ;;
+        esac
+        echo -e "    ${GREEN}[$i]${NC} ${YELLOW}${rnm}${NC} (${rty} :${rpo})${bound:+  ${CYAN}已对接: ${bound}${NC}}${_fhint:+  ${_fhint}}"
     done <<< "$scan_rows"
     _flush_pending_stdin
     read -p "  选择中转入口 [1-$i] (0=返回): " epick

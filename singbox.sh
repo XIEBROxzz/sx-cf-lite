@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.49: 中转补 AnyTLS 导入校验 (此前 anytls 链接能解析但被 schema 拒); 修 Trojan-WS 校验表达式; 入口列表加"是否适合做前端"标注
 #     1.48: [4] 更多协议 新增 [4] Trojan + WS + TLS, SS-2022 顺延为 [5]
 #     1.47: [4] 更多协议 按直连推荐度重排并标注 (1 AnyTLS / 2 TUIC / 3 WS-TLS / 4 SS-2022)
 #     1.46: 修复 SS 链接端口为空 (client_port 被插进 if shadowtls 内部导致普通 SS 取不到端口 -> 客户端显示 -1)
@@ -67,7 +68,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.48"
+export SCRIPT_VERSION="1.49"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
