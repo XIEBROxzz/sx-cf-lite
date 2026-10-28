@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.46: 修复 SS 链接端口为空 (client_port 被插进 if shadowtls 内部导致普通 SS 取不到端口 -> 客户端显示 -1)
 #     1.45: 去掉手动节点的 "如何开启 Cloudflare CDN 优选" 长篇提示 (与 [2] 一键套CF 自动流程重复)
 #     1.44: VLESS-WS-TLS 简化: 伪装域名回车用默认, 证书固定自动自签名; [4] 菜单文案更新
 #     1.43: 手动节点不再输出"CF优选专用链接" (与 [2] 一键套CF 的自动配置冲突/误导), 只给直连链接
@@ -64,7 +65,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.45"
+export SCRIPT_VERSION="1.46"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -5770,8 +5771,8 @@ _add_shadowsocks_menu() {
     if [ "$use_multiplex" == "true" ]; then
         _info "Multiplex + Padding 已启用，客户端需配置对应选项"
     fi
-    if [ "$use_shadowtls" == "true" ]; then
     local client_port="${link_port:-$port}"
+    if [ "$use_shadowtls" == "true" ]; then
         _show_node_link "shadowsocks-shadowtls" "$name" "$link_ip" "$client_port" "$tag" "$method" "$password" "$shadowtls_password" "$shadowtls_sni" || return 1
     else
         _show_node_link "shadowsocks" "$name" "$link_ip" "$client_port" "$tag" "$method" "$password" || return 1
