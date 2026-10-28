@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.54: 修 AnyTLS 协议菜单显示原始转义码 (echo 少了 -e), 改为纯文本标注
 #     1.53: 端口统一写法提示从 [4] 移到 [1] 创建节点菜单 (所有入口同一套写法, 不必重复)
 #     1.52: [4] 更多协议 去掉逐行长标注, 改为顶部统一提示 (直连首选 Reality, 其余属补充协议)
 #     1.51: AnyTLS 协议选择重新编号为 1=Any-Reality / 2=AnyTLS / 3=两个都建 (逗号写法仍兼容)
@@ -72,7 +73,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.53"
+export SCRIPT_VERSION="1.54"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4949,7 +4950,7 @@ _add_anytls() {
     else
         _info "--- 添加 AnyTLS / Any-Reality 节点 ---"
         echo "请选择节点协议:"
-        echo "  1) Any-Reality   ${YELLOW}← 默认, 推荐 (抗 TLS-in-TLS 指纹)${NC}"
+        echo "  1) Any-Reality   ← 默认, 推荐 (抗 TLS-in-TLS 指纹)"
         echo "  2) AnyTLS (自签证书, 可用但特征弱)"
         echo "  3) 同时创建 AnyTLS + Any-Reality"
         read -p "请选择 [1-3] (默认: 1=Any-Reality): " _mode_sel
