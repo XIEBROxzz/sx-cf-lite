@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.55: 新增 [6] 伪装域名(SNI)优选 (持久化到 default_sni, 所有直连创建默认用它); 修 DNS 查看一闪而过
 #     1.54: 修 AnyTLS 协议菜单显示原始转义码 (echo 少了 -e), 改为纯文本标注
 #     1.53: 端口统一写法提示从 [4] 移到 [1] 创建节点菜单 (所有入口同一套写法, 不必重复)
 #     1.52: [4] 更多协议 去掉逐行长标注, 改为顶部统一提示 (直连首选 Reality, 其余属补充协议)
@@ -73,13 +74,20 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.54"
+export SCRIPT_VERSION="1.55"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
+
+# SX: 伪装域名(SNI)优选 —— 若用户保存过默认值, 开机即用
+if [ -s "${SINGBOX_DIR}/default_sni" ]; then
+    _SNI_SAVED=$(head -n1 "${SINGBOX_DIR}/default_sni" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$_SNI_SAVED" ] && export DEFAULT_SNI="$_SNI_SAVED"
+    unset _SNI_SAVED
+fi
 SINGBOX_FIXED_VERSION="1.13.21"
 SINGBOX_CORE_LOCK_FILE="${SINGBOX_DIR}/core-version.lock"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main"
@@ -4940,12 +4948,12 @@ _add_anytls() {
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     local link_port=""
-    local server_name="www.amd.com"
+    local server_name="$DEFAULT_SNI"
     local mode_choice="1"
 
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
-        server_name="${BATCH_SNI:-www.amd.com}"
+        server_name="${BATCH_SNI:-$DEFAULT_SNI}"
         mode_choice="${BATCH_ANYTLS_MODE:-1}"
     else
         _info "--- 添加 AnyTLS / Any-Reality 节点 ---"
@@ -4995,8 +5003,8 @@ _add_anytls() {
             fi
             break
         done
-        read -p "请输入伪装域名/SNI (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名/SNI (默认: ${DEFAULT_SNI}): " camouflage_domain
+        server_name=${camouflage_domain:-"$DEFAULT_SNI"}
     fi
 
     local password=""
@@ -5064,7 +5072,7 @@ _add_vless_reality() {
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
-    local server_name="www.amd.com"
+    local server_name="$DEFAULT_SNI"
     local port=""
     local link_port=""
     local name=""
@@ -5080,8 +5088,8 @@ _add_vless_reality() {
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
+        server_name=${camouflage_domain:-"$DEFAULT_SNI"}
         while true; do
             read -p "填端口 (内部:暴露, 单填=内外一致, 回车=随机 30000-50000): " _port_raw
             if [ -z "$(printf "%s" "$_port_raw" | tr -d "[:space:]")" ]; then
@@ -5182,7 +5190,7 @@ _add_hysteria2() {
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     local link_port=""
-    local server_name="www.amd.com"
+    local server_name="$DEFAULT_SNI"
     local obfs_password=""
     local port_hopping=""
     local use_multiport="false"
@@ -5244,8 +5252,8 @@ _add_hysteria2() {
             _check_port_conflict "$port" "tcp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
+        server_name=${camouflage_domain:-"$DEFAULT_SNI"}
     fi
 
     local tag="hy2-in-${port}"
@@ -5399,11 +5407,11 @@ _add_tuic() {
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     local link_port=""
-    local server_name="www.amd.com"
+    local server_name="$DEFAULT_SNI"
 
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
-        server_name="${BATCH_SNI:-www.amd.com}"
+        server_name="${BATCH_SNI:-$DEFAULT_SNI}"
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
@@ -5425,8 +5433,8 @@ _add_tuic() {
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.amd.com"}
+        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
+        server_name=${camouflage_domain:-"$DEFAULT_SNI"}
     fi
 
     local client_port="${link_port:-$port}"
@@ -5589,11 +5597,11 @@ _add_shadowsocks_menu() {
     fi
     
     local shadowtls_password=""
-    local shadowtls_sni="www.amd.com"
+    local shadowtls_sni="$DEFAULT_SNI"
     if [ "$use_shadowtls" == "true" ]; then
         shadowtls_password=$(${SINGBOX_BIN} generate rand --hex 16)
-        read -p "请输入 ShadowTLS 伪装白名单域名 (默认: www.amd.com): " custom_sni
-        shadowtls_sni=${custom_sni:-www.amd.com}
+        read -p "请输入 ShadowTLS 伪装白名单域名 (默认: ${DEFAULT_SNI}): " custom_sni
+        shadowtls_sni=${custom_sni:-$DEFAULT_SNI}
     fi
 
     local tag="${name_prefix}-in-${port}"
@@ -6701,6 +6709,7 @@ _dns_config_menu() {
                 echo ""
                 jq '.dns' "$CONFIG_FILE" 2>/dev/null || _error "无法读取 DNS 配置。"
                 echo ""
+                _pause_back   # SX: 查看结果需要停留, 否则被下一轮 clear 擦掉
                 continue
                 ;;
             0) return ;;
@@ -9570,6 +9579,90 @@ _show_more_protocols_menu() {
     done
 }
 
+# SX: 伪装域名(SNI)优选 —— 设定后成为所有直连创建流程的默认 SNI
+_sni_connectivity_test() {
+    local d="$1"
+    _info "正在检测 ${d}:443 的 TLS 握手..."
+    if ! command -v openssl >/dev/null 2>&1; then
+        _warn "缺少 openssl, 跳过连通性检测"
+        return 1
+    fi
+    local out
+    out=$(echo | timeout 8 openssl s_client -connect "${d}:443" -servername "${d}" 2>/dev/null)
+    if printf '%s' "$out" | grep -q "BEGIN CERTIFICATE"; then
+        local proto
+        proto=$(printf '%s' "$out" | grep -oE "Protocol *: *[A-Za-z0-9.]+" | head -1)
+        _success "握手正常: ${d}:443 ${proto:+(${proto##*: })}"
+        return 0
+    fi
+    _error "握手失败: ${d}:443 不可达, 或该站点不支持 SNI / TLS"
+    return 1
+}
+
+_set_default_sni() {
+    while true; do
+        clear
+        echo -e "  ${CYAN}╔═══════════════════════════════════════╗"
+        echo -e "  ║         伪装域名 (SNI) 优选           ║"
+        echo -e "  ╚═══════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "  当前默认: ${GREEN}${DEFAULT_SNI}${NC}"
+        echo ""
+        echo -e "  ${YELLOW}作用: 之后新建的直连节点, 伪装域名默认都用它${NC}"
+        echo -e "  ${YELLOW}     (Reality / WS+TLS / Trojan / AnyTLS / HY2 全部生效)${NC}"
+        echo -e "  ${YELLOW}要求: 真实可访问的 TLS 1.3 站点, 且国内能直连${NC}"
+        echo ""
+        echo -e "  ${CYAN}【常用预设】${NC}"
+        echo -e "    ${GREEN}[1]${NC} www.amd.com          (默认)"
+        echo -e "    ${GREEN}[2]${NC} www.microsoft.com"
+        echo -e "    ${GREEN}[3]${NC} www.apple.com"
+        echo -e "    ${GREEN}[4]${NC} www.cloudflare.com"
+        echo -e "    ${GREEN}[5]${NC} aws.amazon.com"
+        echo -e "    ${GREEN}[6]${NC} dl.google.com"
+        echo ""
+        echo -e "    ${GREEN}[7]${NC} 自定义域名"
+        echo -e "    ${GREEN}[8]${NC} 检测当前默认域名的连通性"
+        echo ""
+        echo -e "    ${YELLOW}[0]${NC} 返回"
+        echo ""
+        local c sni=""
+        read -p "  请输入选项 [0-8]: " c
+        case "$c" in
+            1) sni="www.amd.com" ;;
+            2) sni="www.microsoft.com" ;;
+            3) sni="www.apple.com" ;;
+            4) sni="www.cloudflare.com" ;;
+            5) sni="aws.amazon.com" ;;
+            6) sni="dl.google.com" ;;
+            7) read -p "  请输入伪装域名 (如 www.example.com): " sni ;;
+            8) _sni_connectivity_test "$DEFAULT_SNI"; _pause_back; continue ;;
+            0) return ;;
+            *) _error "无效输入"; _pause_back; continue ;;
+        esac
+        sni=$(printf '%s' "$sni" | tr -d '[:space:]')
+        if [ -z "$sni" ]; then
+            _error "域名不能为空"; _pause_back; continue
+        fi
+        if [[ "$sni" =~ ^[0-9.]+$ ]]; then
+            _error "这里要填域名, 不是 IP: ${sni}"; _pause_back; continue
+        fi
+        if [[ ! "$sni" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || [[ "$sni" != *.* ]]; then
+            _error "域名格式不对: ${sni}"; _pause_back; continue
+        fi
+        mkdir -p "$SINGBOX_DIR" 2>/dev/null
+        if printf '%s\n' "$sni" > "${SINGBOX_DIR}/default_sni"; then
+            export DEFAULT_SNI="$sni"
+            _success "默认伪装域名已设为: ${sni}"
+            _info "之后新建的直连节点都会默认用它 (已在运行的节点不受影响)"
+            _info "建议顺手测一下: 菜单 [8] 检测连通性"
+        else
+            _error "写入失败: ${SINGBOX_DIR}/default_sni"
+        fi
+        _pause_back
+        return 0
+    done
+}
+
 _show_add_node_menu() {
     [ -z "$server_ip" ] && _init_server_ip
     clear
@@ -9590,6 +9683,10 @@ _show_add_node_menu() {
     echo -e "  ${CYAN}【快捷功能】${NC}"
     echo -e "    ${GREEN}[5]${NC} 三合一 (填一个端口, 直连双节点+临时Argo)"
     echo ""
+
+    echo -e "  ${CYAN}【其他】${NC}"
+    echo -e "    ${GREEN}[6]${NC} 伪装域名 (SNI) 优选: ${CYAN}${DEFAULT_SNI}${NC}"
+    echo ""
     echo -e "  ${YELLOW}端口统一写法: 单填=内外一致 / 内部:暴露 / 回车=随机 30000-50000${NC}"
     echo ""
     
@@ -9597,7 +9694,7 @@ _show_add_node_menu() {
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
     
-    read -p "  请输入选项 [0-5]: " choice
+    read -p "  请输入选项 [0-6]: " choice
 
     case $choice in
         # SX: 建完节点会打印链接, 主菜单下一轮 clear 会瞬间擦掉 → 每个分支后停留
@@ -9607,6 +9704,7 @@ _show_add_node_menu() {
         4) _show_more_protocols_menu ;;
         # 三合一函数尾部自带 _pause_back, 这里不重复
         5) _run_main_create_transaction _add_trio_quick ;;
+        6) _set_default_sni ;;
         0) return ;;
         *) _error "无效输入，请重试。"; _pause_back; return 1 ;;
     esac
