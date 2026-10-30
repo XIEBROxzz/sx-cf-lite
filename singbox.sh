@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.58: SNI 预设列表加内置兜底 + 紧凑布局 (18 行内), 修只显示 [22] 的问题
 #     1.57: SNI 优选菜单改为 1=预设列表(内含一键检测全部) / 2=自定义 / 3=检测当前, 全数字编号
 #     1.56: SNI 优选取代预设为 pypi/crates/mozilla/debian/alpine/rubygems/brew/rust/cpan + 名校; 检测增加 TLS 握手延迟(ms) 与批量测速
 #     1.55: 新增 [6] 伪装域名(SNI)优选 (持久化到 default_sni, 所有直连创建默认用它); 修 DNS 查看一闪而过
@@ -76,7 +77,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.57"
+export SCRIPT_VERSION="1.58"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -9661,11 +9662,12 @@ _sni_connectivity_test() {
 # SX: 批量测速所有预设, 按 TLS 握手耗时从快到慢列出
 _sni_probe_all() {
     echo ""
-    _info "正在逐个检测 ${#_SNI_PRESETS[@]} 个预设 (约 10-40 秒)..."
-    echo ""
     local d r name proto tls total
     local -a rows=()
-    for d in "${_SNI_PRESETS[@]}"; do
+    local -a _pl=(); mapfile -t _pl < <(_sni_preset_list)
+    _info "正在逐个检测 ${#_pl[@]} 个预设 (约 10-40 秒)..."
+    echo ""
+    for d in "${_pl[@]}"; do
         if r=$(_sni_probe "$d"); then
             IFS='|' read -r name proto tls total <<< "$r"
             rows+=("${tls}|${name}|${proto}|${total}")
@@ -9708,22 +9710,52 @@ _sni_save() {
     return 0
 }
 
+# SX: 预设列表(内置兜底) —— 全局数组被清空时仍可正常显示
+_sni_preset_list() {
+    if [ "${#_SNI_PRESETS[@]}" -gt 0 ]; then
+        printf '%s\n' "${_SNI_PRESETS[@]}"
+        return 0
+    fi
+    cat <<'LIST'
+www.amd.com
+www.microsoft.com
+pypi.org
+crates.io
+addons.mozilla.org
+deb.debian.org
+dl-cdn.alpinelinux.org
+rubygems.org
+formulae.brew.sh
+static.rust-lang.org
+cpan.org
+www.stanford.edu
+www.harvard.edu
+www.cornell.edu
+www.cam.ac.uk
+www.ethz.ch
+www.kyoto-u.ac.jp
+www.nus.edu.sg
+www.hku.hk
+www.hkust.edu.hk
+www.utoronto.ca
+LIST
+}
+
 # SX: 预设列表子菜单 — 选编号即设为默认, 22 = 一键检测全部
 _sni_preset_menu() {
+    local -a _list=()
+    mapfile -t _list < <(_sni_preset_list)
+    local n=${#_list[@]}
     while true; do
         clear
-        echo -e "  ${CYAN}╔═══════════════════════════════════════╗"
-        echo -e "  ║        预设伪装域名 (SNI) 列表        ║"
-        echo -e "  ╚═══════════════════════════════════════╝${NC}"
+        echo -e "  ${CYAN}预设伪装域名 (SNI) 列表${NC}   当前默认: ${GREEN}${DEFAULT_SNI}${NC}"
         echo ""
-        echo -e "  当前默认: ${GREEN}${DEFAULT_SNI}${NC}"
-        echo ""
-        local i n=${#_SNI_PRESETS[@]} half=$(( (n + 1) / 2 )) ln rn l r
+        local i half=$(( (n + 1) / 2 )) ln rn l r
         for ((i=0; i<half; i++)); do
             ln=$((i+1)); rn=$((i+half+1))
-            l="${_SNI_PRESETS[$i]}"
+            l="${_list[$i]}"
             if [ "$rn" -le "$n" ]; then
-                r="${_SNI_PRESETS[$((i+half))]}"
+                r="${_list[$((i+half))]}"
                 printf '    \033[0;32m[%2d]\033[0m %-28s \033[0;32m[%2d]\033[0m %s\n' "$ln" "$l" "$rn" "$r"
             else
                 printf '    \033[0;32m[%2d]\033[0m %s\n' "$ln" "$l"
@@ -9731,7 +9763,6 @@ _sni_preset_menu() {
         done
         echo ""
         echo -e "    ${GREEN}[22]${NC} 一键检测全部 (按延迟排序, 约 10-40 秒)"
-        echo ""
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local c
@@ -9741,19 +9772,14 @@ _sni_preset_menu() {
             22) _sni_probe_all; _pause_back; continue ;;
             *)
                 if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "$n" ]; then
-                    if _sni_save "${_SNI_PRESETS[$((c-1))]}"; then
-                        _pause_back
-                        return 0
-                    fi
-                    _pause_back
-                    continue
+                    _sni_save "${_list[$((c-1))]}" && { _pause_back; return 0; }
+                    _pause_back; continue
                 fi
                 _error "无效输入"; _pause_back; continue
                 ;;
         esac
     done
 }
-
 _set_default_sni() {
     while true; do
         clear
