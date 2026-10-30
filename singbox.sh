@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.56: SNI 优选取代预设为 pypi/crates/mozilla/debian/alpine/rubygems/brew/rust/cpan + 名校; 检测增加 TLS 握手延迟(ms) 与批量测速
 #     1.55: 新增 [6] 伪装域名(SNI)优选 (持久化到 default_sni, 所有直连创建默认用它); 修 DNS 查看一闪而过
 #     1.54: 修 AnyTLS 协议菜单显示原始转义码 (echo 少了 -e), 改为纯文本标注
 #     1.53: 端口统一写法提示从 [4] 移到 [1] 创建节点菜单 (所有入口同一套写法, 不必重复)
@@ -74,7 +75,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.55"
+export SCRIPT_VERSION="1.56"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -9580,23 +9581,107 @@ _show_more_protocols_menu() {
 }
 
 # SX: 伪装域名(SNI)优选 —— 设定后成为所有直连创建流程的默认 SNI
+# 预设列表: 只选"国内可直连 + TLS1.3 + 不带 SNI 白名单"的真实站点
+_SNI_PRESETS=(
+    "www.amd.com"
+    "www.microsoft.com"
+    "pypi.org"
+    "crates.io"
+    "addons.mozilla.org"
+    "deb.debian.org"
+    "dl-cdn.alpinelinux.org"
+    "rubygems.org"
+    "formulae.brew.sh"
+    "static.rust-lang.org"
+    "cpan.org"
+    "www.stanford.edu"
+    "www.harvard.edu"
+    "www.cornell.edu"
+    "www.cam.ac.uk"
+    "www.ethz.ch"
+    "www.kyoto-u.ac.jp"
+    "www.nus.edu.sg"
+    "www.hku.hk"
+    "www.hkust.edu.hk"
+    "www.utoronto.ca"
+)
+
+# SX: 测单个域名的 443 握手 + 延迟 (TLS 握手耗时 ms)
+_sni_probe() {
+    local d="$1"
+    local proto="" tls_ms="" total_ms="" out t0 t1
+    if command -v openssl >/dev/null 2>&1; then
+        t0=$(date +%s%N 2>/dev/null)
+        out=$(echo | timeout 8 openssl s_client -connect "${d}:443" -servername "${d}" 2>/dev/null)
+        t1=$(date +%s%N 2>/dev/null)
+        if ! printf '%s' "$out" | grep -q "BEGIN CERTIFICATE"; then
+            return 1
+        fi
+        proto=$(printf '%s' "$out" | grep -oE "Protocol *: *[A-Za-z0-9.]+" | head -1 | sed 's/.*: *//')
+        if [[ "$t0" =~ ^[0-9]+$ && "$t1" =~ ^[0-9]+$ ]] && [ "$t1" -gt "$t0" ]; then
+            tls_ms=$(( (t1 - t0) / 1000000 ))
+        fi
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        local cur ta tt
+        cur=$(curl -sS -o /dev/null --max-time 8 -w '%{time_appconnect} %{time_total}' "https://${d}/" 2>/dev/null)
+        if [ -n "$cur" ]; then
+            read -r ta tt <<< "$cur"
+            tls_ms=$(awk -v s="$ta" 'BEGIN{ if (s>0) printf "%.0f", s*1000 }')
+            total_ms=$(awk -v s="$tt" 'BEGIN{ if (s>0) printf "%.0f", s*1000 }')
+        fi
+    fi
+    printf '%s|%s|%s|%s' "${d}" "${proto:-?}" "${tls_ms:-?}" "${total_ms:-?}"
+    return 0
+}
+
 _sni_connectivity_test() {
     local d="$1"
-    _info "正在检测 ${d}:443 的 TLS 握手..."
+    _info "正在检测 ${d}:443 ..."
     if ! command -v openssl >/dev/null 2>&1; then
         _warn "缺少 openssl, 跳过连通性检测"
         return 1
     fi
-    local out
-    out=$(echo | timeout 8 openssl s_client -connect "${d}:443" -servername "${d}" 2>/dev/null)
-    if printf '%s' "$out" | grep -q "BEGIN CERTIFICATE"; then
-        local proto
-        proto=$(printf '%s' "$out" | grep -oE "Protocol *: *[A-Za-z0-9.]+" | head -1)
-        _success "握手正常: ${d}:443 ${proto:+(${proto##*: })}"
+    local r
+    if r=$(_sni_probe "$d"); then
+        local name proto tls total
+        IFS='|' read -r name proto tls total <<< "$r"
+        _success "握手正常: ${name}  协议=${proto}  TLS耗时=${tls}ms  总耗时=${total}ms"
+        case "$proto" in
+            TLSv1.3) ;;
+            *) _warn "该站点协商到 ${proto} (Reality 需要 TLS 1.3, 可能不可用)" ;;
+        esac
         return 0
     fi
-    _error "握手失败: ${d}:443 不可达, 或该站点不支持 SNI / TLS"
+    _error "握手失败: ${d}:443 不可达, 或该站点拒绝 SNI / 不支持 TLS"
     return 1
+}
+
+# SX: 批量测速所有预设, 按 TLS 握手耗时从快到慢列出
+_sni_probe_all() {
+    echo ""
+    _info "正在逐个检测 ${#_SNI_PRESETS[@]} 个预设 (约 10-40 秒)..."
+    echo ""
+    local d r name proto tls total
+    local -a rows=()
+    for d in "${_SNI_PRESETS[@]}"; do
+        if r=$(_sni_probe "$d"); then
+            IFS='|' read -r name proto tls total <<< "$r"
+            rows+=("${tls}|${name}|${proto}|${total}")
+        else
+            rows+=("999999|${d}|失败|-")
+        fi
+    done
+    local row
+    printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1n | while IFS='|' read -r tls name proto total; do
+        if [ "$tls" = "999999" ]; then
+            printf '  %-32s %s\n' "$name" "${RED}握手失败${NC}"
+        else
+            printf '  %-32s TLS %5sms   总 %5sms   %s\n' "$name" "$tls" "$total" "$proto"
+        fi
+    done
+    echo ""
+    _info "提示: 数字越小越快; 选一个延迟低且稳定的, 再用 [7]/[C] 之外的预设编号设置"
 }
 
 _set_default_sni() {
@@ -9613,31 +9698,38 @@ _set_default_sni() {
         echo -e "  ${YELLOW}要求: 真实可访问的 TLS 1.3 站点, 且国内能直连${NC}"
         echo ""
         echo -e "  ${CYAN}【常用预设】${NC}"
-        echo -e "    ${GREEN}[1]${NC} www.amd.com          (默认)"
-        echo -e "    ${GREEN}[2]${NC} www.microsoft.com"
-        echo -e "    ${GREEN}[3]${NC} www.apple.com"
-        echo -e "    ${GREEN}[4]${NC} www.cloudflare.com"
-        echo -e "    ${GREEN}[5]${NC} aws.amazon.com"
-        echo -e "    ${GREEN}[6]${NC} dl.google.com"
+        local i n=${#_SNI_PRESETS[@]} half=$(( (n + 1) / 2 )) ln rn l r
+        for ((i=0; i<half; i++)); do
+            ln=$((i+1)); rn=$((i+half+1))
+            l="${_SNI_PRESETS[$i]}"
+            if [ "$rn" -le "$n" ]; then
+                r="${_SNI_PRESETS[$((i+half))]}"
+                printf '    \033[0;32m[%2d]\033[0m %-28s \033[0;32m[%2d]\033[0m %s\n' "$ln" "$l" "$rn" "$r"
+            else
+                printf '    \033[0;32m[%2d]\033[0m %s\n' "$ln" "$l"
+            fi
+        done
         echo ""
-        echo -e "    ${GREEN}[7]${NC} 自定义域名"
-        echo -e "    ${GREEN}[8]${NC} 检测当前默认域名的连通性"
+        echo -e "    ${GREEN}[C]${NC} 自定义域名"
+        echo -e "    ${GREEN}[T]${NC} 检测当前默认域名的连通性与延迟"
+        echo -e "    ${GREEN}[A]${NC} 批量测速所有预设 (选最快的那个)"
         echo ""
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local c sni=""
-        read -p "  请输入选项 [0-8]: " c
+        read -p "  请输入选项 [1-$n / C / T / A / 0]: " c
         case "$c" in
-            1) sni="www.amd.com" ;;
-            2) sni="www.microsoft.com" ;;
-            3) sni="www.apple.com" ;;
-            4) sni="www.cloudflare.com" ;;
-            5) sni="aws.amazon.com" ;;
-            6) sni="dl.google.com" ;;
-            7) read -p "  请输入伪装域名 (如 www.example.com): " sni ;;
-            8) _sni_connectivity_test "$DEFAULT_SNI"; _pause_back; continue ;;
             0) return ;;
-            *) _error "无效输入"; _pause_back; continue ;;
+            C|c) read -p "  请输入伪装域名 (如 www.example.com): " sni ;;
+            T|t) _sni_connectivity_test "$DEFAULT_SNI"; _pause_back; continue ;;
+            A|a) _sni_probe_all; _pause_back; continue ;;
+            *)
+                if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "$n" ]; then
+                    sni="${_SNI_PRESETS[$((c-1))]}"
+                else
+                    _error "无效输入"; _pause_back; continue
+                fi
+                ;;
         esac
         sni=$(printf '%s' "$sni" | tr -d '[:space:]')
         if [ -z "$sni" ]; then
@@ -9654,7 +9746,7 @@ _set_default_sni() {
             export DEFAULT_SNI="$sni"
             _success "默认伪装域名已设为: ${sni}"
             _info "之后新建的直连节点都会默认用它 (已在运行的节点不受影响)"
-            _info "建议顺手测一下: 菜单 [8] 检测连通性"
+            _info "建议按 [T] 测一下这个域名的握手与延迟"
         else
             _error "写入失败: ${SINGBOX_DIR}/default_sni"
         fi
