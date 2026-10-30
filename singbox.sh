@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.59: SNI 预设列表按实测总延迟升序编号 (失败排最后), 带延迟缓存与 [22] 重新实测
 #     1.58: SNI 预设列表加内置兜底 + 紧凑布局 (18 行内), 修只显示 [22] 的问题
 #     1.57: SNI 优选菜单改为 1=预设列表(内含一键检测全部) / 2=自定义 / 3=检测当前, 全数字编号
 #     1.56: SNI 优选取代预设为 pypi/crates/mozilla/debian/alpine/rubygems/brew/rust/cpan + 名校; 检测增加 TLS 握手延迟(ms) 与批量测速
@@ -77,7 +78,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.58"
+export SCRIPT_VERSION="1.59"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -9659,34 +9660,40 @@ _sni_connectivity_test() {
     return 1
 }
 
-# SX: 批量测速所有预设, 按 TLS 握手耗时从快到慢列出
-_sni_probe_all() {
-    echo ""
+# SX: 延迟缓存 (总耗时升序; 失败排最后)
+_SNI_CACHE="${SINGBOX_DIR}/sni_latency"
+
+# 实测全部预设并写缓存: 每行 "排序键|域名|TLS耗时|总耗时|协议|状态"
+_sni_probe_all_save() {
     local d r name proto tls total
-    local -a rows=()
+    local -a out=()
     local -a _pl=(); mapfile -t _pl < <(_sni_preset_list)
-    _info "正在逐个检测 ${#_pl[@]} 个预设 (约 10-40 秒)..."
+    _info "正在实测 ${#_pl[@]} 个预设的延迟 (约 10-40 秒, 请稍候)..."
     echo ""
+    local i=0
     for d in "${_pl[@]}"; do
+        i=$((i+1))
+        printf '  [%2d/%d] %-30s ' "$i" "${#_pl[@]}" "$d"
         if r=$(_sni_probe "$d"); then
             IFS='|' read -r name proto tls total <<< "$r"
-            rows+=("${tls}|${name}|${proto}|${total}")
+            [ "$total" = "?" ] && total=999998
+            printf '总 %5sms\n' "$total"
+            out+=("${total}|${name}|${tls}|${total}|${proto}|ok")
         else
-            rows+=("999999|${d}|失败|-")
+            printf '失败\n'
+            out+=("999999|${d}|-|-|-|fail")
         fi
     done
-    local row
-    printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1n | while IFS='|' read -r tls name proto total; do
-        if [ "$tls" = "999999" ]; then
-            printf '  %-32s %s\n' "$name" "${RED}握手失败${NC}"
-        else
-            printf '  %-32s TLS %5sms   总 %5sms   %s\n' "$name" "$tls" "$total" "$proto"
-        fi
-    done
+    printf '%s\n' "${out[@]}" > "$_SNI_CACHE" 2>/dev/null
     echo ""
-    _info "提示: 数字越小越快; 挑一个延迟低且稳定的, 回到预设列表按对应编号设为默认"
+    _success "测速完成, 已按总延迟从低到高排序"
 }
 
+# 按缓存排序输出 (失败在最后)
+_sni_sorted_rows() {
+    [ -s "$_SNI_CACHE" ] || return 0
+    sort -t'|' -k1,1n "$_SNI_CACHE"
+}
 # SX: 校验并保存默认伪装域名
 _sni_save() {
     local sni
@@ -9741,38 +9748,66 @@ www.utoronto.ca
 LIST
 }
 
-# SX: 预设列表子菜单 — 选编号即设为默认, 22 = 一键检测全部
+# SX: 预设列表子菜单 — 按实测总延迟从低到高编号; 失败排最后
 _sni_preset_menu() {
-    local -a _list=()
-    mapfile -t _list < <(_sni_preset_list)
-    local n=${#_list[@]}
     while true; do
+        if [ ! -s "$_SNI_CACHE" ]; then
+            clear
+            _info "首次进入, 需要先实测各预设的延迟"
+            echo ""
+            _sni_probe_all_save
+            _pause_back
+        fi
+
+        local -a rows=()
+        mapfile -t rows < <(_sni_sorted_rows)
+        local n=${#rows[@]}
+
         clear
-        echo -e "  ${CYAN}预设伪装域名 (SNI) 列表${NC}   当前默认: ${GREEN}${DEFAULT_SNI}${NC}"
+        echo -e "  ${CYAN}预设伪装域名 (SNI)${NC}   当前默认: ${GREEN}${DEFAULT_SNI}${NC}"
+        echo -e "  ${YELLOW}按实测总延迟从低到高排序, 失败的排最后${NC}"
         echo ""
-        local i half=$(( (n + 1) / 2 )) ln rn l r
+        local i half=$(( (n + 1) / 2 )) ln rn d1 d2 tot1 tot2 s1 s2 v1 v2
         for ((i=0; i<half; i++)); do
             ln=$((i+1)); rn=$((i+half+1))
-            l="${_list[$i]}"
+            IFS='|' read -r _key d1 _t1 tot1 _p1 s1 <<< "${rows[$i]}"
+            if [ "$s1" = "fail" ]; then v1="失败"; else v1="${tot1}ms"; fi
             if [ "$rn" -le "$n" ]; then
-                r="${_list[$((i+half))]}"
-                printf '    \033[0;32m[%2d]\033[0m %-28s \033[0;32m[%2d]\033[0m %s\n' "$ln" "$l" "$rn" "$r"
+                IFS='|' read -r _key2 d2 _t2 tot2 _p2 s2 <<< "${rows[$((i+half))]}"
+                if [ "$s2" = "fail" ]; then v2="失败"; else v2="${tot2}ms"; fi
+                if [ "$s2" = "fail" ]; then
+                    printf '    \033[0;32m[%2d]\033[0m %-22s %6s    \033[0;32m[%2d]\033[0m %-22s \033[0;31m%s\033[0m\n' \
+                        "$ln" "$d1" "$v1" "$rn" "$d2" "失败"
+                else
+                    printf '    \033[0;32m[%2d]\033[0m %-22s %6s    \033[0;32m[%2d]\033[0m %-22s %6s\n' \
+                        "$ln" "$d1" "$v1" "$rn" "$d2" "$v2"
+                fi
             else
-                printf '    \033[0;32m[%2d]\033[0m %s\n' "$ln" "$l"
+                printf '    \033[0;32m[%2d]\033[0m %-22s %6s\n' "$ln" "$d1" "$v1"
             fi
         done
         echo ""
-        echo -e "    ${GREEN}[22]${NC} 一键检测全部 (按延迟排序, 约 10-40 秒)"
+        echo -e "    ${YELLOW}注: 显示 = 总耗时 (TLS+HTTP), 排序也按它${NC}"
+        echo -e "    ${GREEN}[22]${NC} 重新实测全部 (更新排序)"
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local c
         read -p "  选编号即设为默认 [1-$n / 22 / 0]: " c
         case "$c" in
             0) return ;;
-            22) _sni_probe_all; _pause_back; continue ;;
+            22) _sni_probe_all_save; _pause_back; continue ;;
             *)
                 if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "$n" ]; then
-                    _sni_save "${_list[$((c-1))]}" && { _pause_back; return 0; }
+                    local pick="${rows[$((c-1))]}"
+                    local _k _d _t _tt _p _s
+                    IFS='|' read -r _k _d _t _tt _p _s <<< "$pick"
+                    if [ "$_s" = "fail" ]; then
+                        _warn "${_d} 上次握手失败, 仍要设为默认吗?"
+                        local yn
+                        read -p "  确认设置? [y/N]: " yn
+                        [[ "$yn" =~ ^[Yy]$ ]] || { _pause_back; continue; }
+                    fi
+                    _sni_save "$_d" && { _pause_back; return 0; }
                     _pause_back; continue
                 fi
                 _error "无效输入"; _pause_back; continue
@@ -9780,6 +9815,7 @@ _sni_preset_menu() {
         esac
     done
 }
+
 _set_default_sni() {
     while true; do
         clear
