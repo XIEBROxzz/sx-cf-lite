@@ -22,6 +22,7 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.57: SNI 优选菜单改为 1=预设列表(内含一键检测全部) / 2=自定义 / 3=检测当前, 全数字编号
 #     1.56: SNI 优选取代预设为 pypi/crates/mozilla/debian/alpine/rubygems/brew/rust/cpan + 名校; 检测增加 TLS 握手延迟(ms) 与批量测速
 #     1.55: 新增 [6] 伪装域名(SNI)优选 (持久化到 default_sni, 所有直连创建默认用它); 修 DNS 查看一闪而过
 #     1.54: 修 AnyTLS 协议菜单显示原始转义码 (echo 少了 -e), 改为纯文本标注
@@ -75,7 +76,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.56"
+export SCRIPT_VERSION="1.57"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -9684,6 +9685,75 @@ _sni_probe_all() {
     _info "提示: 数字越小越快; 选一个延迟低且稳定的, 再用 [7]/[C] 之外的预设编号设置"
 }
 
+# SX: 校验并保存默认伪装域名
+_sni_save() {
+    local sni
+    sni=$(printf '%s' "$1" | tr -d '[:space:]')
+    if [ -z "$sni" ]; then
+        _error "域名不能为空"; return 1
+    fi
+    if [[ "$sni" =~ ^[0-9.]+$ ]]; then
+        _error "这里要填域名, 不是 IP: ${sni}"; return 1
+    fi
+    if [[ ! "$sni" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || [[ "$sni" != *.* ]]; then
+        _error "域名格式不对: ${sni}"; return 1
+    fi
+    mkdir -p "$SINGBOX_DIR" 2>/dev/null
+    if ! printf '%s\n' "$sni" > "${SINGBOX_DIR}/default_sni"; then
+        _error "写入失败: ${SINGBOX_DIR}/default_sni"; return 1
+    fi
+    export DEFAULT_SNI="$sni"
+    _success "默认伪装域名已设为: ${sni}"
+    _info "之后新建的直连节点都会默认用它 (已在运行的节点不受影响)"
+    return 0
+}
+
+# SX: 预设列表子菜单 — 选编号即设为默认, 22 = 一键检测全部
+_sni_preset_menu() {
+    while true; do
+        clear
+        echo -e "  ${CYAN}╔═══════════════════════════════════════╗"
+        echo -e "  ║        预设伪装域名 (SNI) 列表        ║"
+        echo -e "  ╚═══════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "  当前默认: ${GREEN}${DEFAULT_SNI}${NC}"
+        echo ""
+        local i n=${#_SNI_PRESETS[@]} half=$(( (n + 1) / 2 )) ln rn l r
+        for ((i=0; i<half; i++)); do
+            ln=$((i+1)); rn=$((i+half+1))
+            l="${_SNI_PRESETS[$i]}"
+            if [ "$rn" -le "$n" ]; then
+                r="${_SNI_PRESETS[$((i+half))]}"
+                printf '    \033[0;32m[%2d]\033[0m %-28s \033[0;32m[%2d]\033[0m %s\n' "$ln" "$l" "$rn" "$r"
+            else
+                printf '    \033[0;32m[%2d]\033[0m %s\n' "$ln" "$l"
+            fi
+        done
+        echo ""
+        echo -e "    ${GREEN}[22]${NC} 一键检测全部 (按延迟排序, 约 10-40 秒)"
+        echo ""
+        echo -e "    ${YELLOW}[0]${NC} 返回"
+        echo ""
+        local c
+        read -p "  选编号即设为默认 [1-$n / 22 / 0]: " c
+        case "$c" in
+            0) return ;;
+            22) _sni_probe_all; _pause_back; continue ;;
+            *)
+                if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "$n" ]; then
+                    if _sni_save "${_SNI_PRESETS[$((c-1))]}"; then
+                        _pause_back
+                        return 0
+                    fi
+                    _pause_back
+                    continue
+                fi
+                _error "无效输入"; _pause_back; continue
+                ;;
+        esac
+    done
+}
+
 _set_default_sni() {
     while true; do
         clear
@@ -9697,61 +9767,28 @@ _set_default_sni() {
         echo -e "  ${YELLOW}     (Reality / WS+TLS / Trojan / AnyTLS / HY2 全部生效)${NC}"
         echo -e "  ${YELLOW}要求: 真实可访问的 TLS 1.3 站点, 且国内能直连${NC}"
         echo ""
-        echo -e "  ${CYAN}【常用预设】${NC}"
-        local i n=${#_SNI_PRESETS[@]} half=$(( (n + 1) / 2 )) ln rn l r
-        for ((i=0; i<half; i++)); do
-            ln=$((i+1)); rn=$((i+half+1))
-            l="${_SNI_PRESETS[$i]}"
-            if [ "$rn" -le "$n" ]; then
-                r="${_SNI_PRESETS[$((i+half))]}"
-                printf '    \033[0;32m[%2d]\033[0m %-28s \033[0;32m[%2d]\033[0m %s\n' "$ln" "$l" "$rn" "$r"
-            else
-                printf '    \033[0;32m[%2d]\033[0m %s\n' "$ln" "$l"
-            fi
-        done
-        echo ""
-        echo -e "    ${GREEN}[C]${NC} 自定义域名"
-        echo -e "    ${GREEN}[T]${NC} 检测当前默认域名的连通性与延迟"
-        echo -e "    ${GREEN}[A]${NC} 批量测速所有预设 (选最快的那个)"
+        echo -e "    ${GREEN}[1]${NC} 默认预设列表 (进入后可一键检测全部)"
+        echo -e "    ${GREEN}[2]${NC} 自定义伪装域名"
+        echo -e "    ${GREEN}[3]${NC} 检测当前默认域名的连通性与延迟"
         echo ""
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
-        local c sni=""
-        read -p "  请输入选项 [1-$n / C / T / A / 0]: " c
+        local c
+        read -p "  请输入选项 [0-3]: " c
         case "$c" in
-            0) return ;;
-            C|c) read -p "  请输入伪装域名 (如 www.example.com): " sni ;;
-            T|t) _sni_connectivity_test "$DEFAULT_SNI"; _pause_back; continue ;;
-            A|a) _sni_probe_all; _pause_back; continue ;;
-            *)
-                if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "$n" ]; then
-                    sni="${_SNI_PRESETS[$((c-1))]}"
-                else
-                    _error "无效输入"; _pause_back; continue
+            1) _sni_preset_menu ;;
+            2)
+                local sni
+                read -p "  请输入伪装域名 (如 www.example.com): " sni
+                if _sni_save "$sni"; then
+                    _info "建议按 [3] 测一下握手与延迟"
                 fi
+                _pause_back
                 ;;
+            3) _sni_connectivity_test "$DEFAULT_SNI"; _pause_back ;;
+            0) return ;;
+            *) _error "无效输入"; _pause_back ;;
         esac
-        sni=$(printf '%s' "$sni" | tr -d '[:space:]')
-        if [ -z "$sni" ]; then
-            _error "域名不能为空"; _pause_back; continue
-        fi
-        if [[ "$sni" =~ ^[0-9.]+$ ]]; then
-            _error "这里要填域名, 不是 IP: ${sni}"; _pause_back; continue
-        fi
-        if [[ ! "$sni" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || [[ "$sni" != *.* ]]; then
-            _error "域名格式不对: ${sni}"; _pause_back; continue
-        fi
-        mkdir -p "$SINGBOX_DIR" 2>/dev/null
-        if printf '%s\n' "$sni" > "${SINGBOX_DIR}/default_sni"; then
-            export DEFAULT_SNI="$sni"
-            _success "默认伪装域名已设为: ${sni}"
-            _info "之后新建的直连节点都会默认用它 (已在运行的节点不受影响)"
-            _info "建议按 [T] 测一下这个域名的握手与延迟"
-        else
-            _error "写入失败: ${SINGBOX_DIR}/default_sni"
-        fi
-        _pause_back
-        return 0
     done
 }
 
