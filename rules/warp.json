@@ -93,7 +93,9 @@
         "labstailwind.pa.googleapis.com",
         "aisandbox-pa.googleapis.com",
         "ip.sb",
-        "api64.ipify.org"
+        "api64.ipify.org",
+        "speedtest.net",
+        "ooklaserver.net"
       ]
     },
     {
