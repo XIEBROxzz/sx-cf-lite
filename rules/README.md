@@ -3,7 +3,7 @@
 两份，**互不重叠**，各绑一个落地：
 
 - **`landing.json`（50 域名 + 148 IP 段）** — 走**日常/主力**落地（速度快的那台）。Google 全家桶都在这里：YouTube 整站、Google 搜索、**Google Play 商店与下载**、Google 账号/静态资源，外加 Gemini。
-- **`landing-v2.json`（40 域名）** — 只放对 IP 要求高的 AI：ChatGPT / Claude / Grok / Perplexity / Poe / Character / Copilot，以及 Google 的 NotebookLM / Labs / Jules / Flow / Opal / Antigravity / Stitch / DeepMind。
+- **`landing-v2.json`（41 域名）** — 只放对 IP 要求高的 AI：ChatGPT / Claude / Grok / Perplexity / Poe / Character / Copilot，以及 Google 的 NotebookLM / Labs / Jules / Flow / Opal / Antigravity / Stitch / DeepMind。
 
 > `landing.json` 里那 148 条 `ip_cidr` 是 Google 官方前缀（取自 https://www.gstatic.com/ipranges/goog.json ）：Play 取包经常 302 到 **IP 直连**，域名规则接不住，这一组兜住。它只对"目标已经是 IP"的连接生效，不影响普通域名分流。
 >
@@ -23,7 +23,9 @@ https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing-v2.jso
 https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/warp.json
 ```
 
-> `rules/warp.json` 是 **WARP 专用**（89 域名 = 上面两份的并集，去掉探针）：只在 `[9] WARP 出站管理 → [2] → [2] 自定义规则` 里用，回车即默认。不要拿它给落地绑，也不要拿 `landing.json` 给 WARP 用（tag 会撞名）。
+> `rules/warp.json` 是 **WARP 专用**（90 域名）：只在 `[9] WARP 出站管理 → [2] → [2] 自定义规则` 里用，回车即默认。不要拿它给落地绑，也不要拿 `landing.json` 给 WARP 用（tag 会撞名）。
+>
+> 构成 = `landing.json` ∪ `landing-v2.json`（50 + 41 = 91，两份无交集）**去掉 `api.ipify.org`**，即 90 条。注意两点：`ip.sb` 仍然保留（它同时是 landing 的探针域名）；`landing.json` 那 148 条 `ip_cidr` **没有**搬进来，所以「Play 302 到 IP 直连」这类流量走 WARP 规则集是接不住的。
 
 ## 改完怎么一眼看出生效
 
@@ -55,7 +57,9 @@ https://chatgpt.com/cdn-cgi/trace
 curl -s https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing.json \
   | jq '{域名:(.rules[0].domain_suffix|length),IP段:(.rules[1].ip_cidr|length)}'   # 50 / 148
 curl -s https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/landing-v2.json \
-  | jq '{域名:(.rules[0].domain_suffix|length)}'                                   # 40
+  | jq '{域名:(.rules[0].domain_suffix|length)}'                                   # 41
+curl -s https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/warp.json \
+  | jq '{域名:(.rules[0].domain_suffix|length)}'                                   # 90
 ```
 
 > raw 有几分钟 CDN 缓存，刚推送时可能拉不到新版，等一会儿再重启。
@@ -88,10 +92,10 @@ EOF
 
 落地发不出 UDP 时**不要开** `[U]`：DNS 会被送过去解析不出来，表现是所有网站都打不开。
 
-## WARP 专用（`rules/warp.json`，89 域名）
+## WARP 专用（`rules/warp.json`，90 域名）
 
 `[9] WARP 出站管理 → [2] 启用接管并设置规则 → [2] 自定义规则` 里**直接回车**就会用这份，
-它是 `landing.json` + `landing-v2.json` 的并集（去掉探针域名），所以一处规则同时覆盖：
+它是 `landing.json` + `landing-v2.json` 的并集（91 条，去掉 `api.ipify.org` 后 90 条），所以一处规则同时覆盖：
 
 - YouTube 整站 + YT 音乐、Google 搜索、Google Play（含下载 CDN）
 - Gemini 与 Google 其他 AI、主流 AI（OpenAI/Claude/Grok/...）
