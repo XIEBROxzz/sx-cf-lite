@@ -22,8 +22,9 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
-#     1.67: 本机地址一览 + 节点地址探测偏好 —— 主菜单 / [14] DNS / [16] 头部显示
-#           本机 IPv4+IPv6 (读网卡全局地址, 瞬时, 内网地址标注 "(内网)");
+#     1.67: 本机公网 IP 一览 + 节点地址探测偏好 —— 主菜单 / [14] DNS / [16] 头部显示
+#           显示「公网」IPv4+IPv6 (curl 探测, 缓存 public_ip.cache 10 分钟; 探测失败才退回
+#           网卡地址并标注 "(网卡)") —— NAT 小鸡网卡上只有 10.x, 不能拿它当本机 IP;
 #           [16]→[B] 新增「入口: 节点地址探测」IPv4/IPv6 优先 (状态文件 node_ip_pref),
 #           解决「设了 v6 优先但创建节点默认 IP 仍是 v4」—— 节点地址来自 _get_public_ip
 #           的 curl 探测, 与 DNS 策略无关; 现在按该偏好先探测对应族, 失败回退另一族
@@ -298,8 +299,11 @@ _ss_base64_encode() {
     printf '%s' "$1" | base64 | tr -d '\n\r ' | sed 's/=//g'
 }
 
-# ── 本机地址 (读网卡全局地址, 瞬时完成, 绝不发网络请求) ──────────────
-# SX: 菜单每帧都会调用, 所以这里只用 `ip` 命令, 不走 curl
+# ── 本机公网地址 (探测 + 缓存) / 网卡地址 (兜底) ──────────────────
+# SX: 显示的是「公网」IP —— NAT 小鸡网卡上只有 10.x, 拿网卡地址当本机 IP 会误导。
+#     探测有网络开销, 所以缓存到 public_ip.cache (10 分钟), 菜单渲染只读文件不探测。
+
+# 网卡全局地址 (瞬时, 不走网络) —— 只在公网探测失败时兜底
 _local_iface_addr() {
     local fam="$1" addr=""
     command -v ip >/dev/null 2>&1 || { printf ''; return; }
@@ -309,25 +313,73 @@ _local_iface_addr() {
     printf '%s' "$addr"
 }
 
-# SX: 内网地址标注 —— NAT 小鸡网卡上只有 10.x, 不标注会让人误以为公网 IP 变了
-_local_ip_is_private() {
-    case "$1" in
-        "") return 1 ;;
-        10.*|192.168.*|127.*) return 0 ;;
-        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
-        100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
-        fd*|fc*|fe80*) return 0 ;;
-        *) return 1 ;;
-    esac
+_PUB_IP_CACHE_TTL=600   # 秒; 公网 IP 变化不频繁, 10 分钟足够
+
+_public_ip_cache_file() { printf '%s/public_ip.cache' "$SINGBOX_DIR"; }
+
+# 缓存是否新鲜 (顺带把 ts 读进 _PUB_CACHE_TS)
+_public_ip_cache_fresh() {
+    local f ts now
+    _PUB_CACHE_TS=""
+    f=$(_public_ip_cache_file)
+    [ -s "$f" ] || return 1
+    ts=$(sed -n 's/^ts=//p' "$f" 2>/dev/null | head -n 1)
+    [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+    now=$(date +%s 2>/dev/null) || return 1
+    [ $((now - ts)) -le "$_PUB_IP_CACHE_TTL" ] || return 1
+    _PUB_CACHE_TS="$ts"
+    return 0
 }
 
-# 输出一行: "IPv4 1.2.3.4   IPv6 2400:xxxx::1" —— 缺哪族显示「无」
+# 读缓存的一族 ($1=4|6) —— 过期也照样返回上次结果, 免得缓存过期后菜单变空白
+_public_ip_cached() {
+    local fam="$1" f v
+    f=$(_public_ip_cache_file)
+    [ -s "$f" ] || return 0
+    v=$(sed -n "s/^v${fam}=//p" "$f" 2>/dev/null | head -n 1)
+    printf '%s' "$v"
+}
+
+# 探测两族并原子写缓存 (空值也会写入 —— "探测过但没有 v6" 与 "没探测过" 必须能区分)
+_public_ip_refresh() {
+    local f tmp v4 v6
+    f=$(_public_ip_cache_file)
+    mkdir -p "$SINGBOX_DIR" 2>/dev/null
+    tmp="${f}.tmp.$$"
+    v4=$(_probe_ip_family 4)
+    v6=$(_probe_ip_family 6)
+    {
+        printf 'v4=%s\n' "$v4"
+        printf 'v6=%s\n' "$v6"
+        printf 'ts=%s\n' "$(date +%s 2>/dev/null)"
+    } > "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$f" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+    return 0
+}
+
+# 菜单进入时调一次: 缓存新鲜则秒过, 否则同步探测一次 (最多 ~4s, 有提示)
+_ensure_public_ip_cache() {
+    _public_ip_cache_fresh && return 0
+    _info "正在探测本机公网 IP (IPv4 / IPv6)..."
+    _public_ip_refresh || _warn "公网 IP 探测失败, 将显示网卡地址"
+    return 0
+}
+
+# 输出一行: "IPv4 1.2.3.4   IPv6 2400:xxxx::1" —— 纯读缓存, 不发网络请求
 _local_ip_line() {
     local v4 v6
-    v4=$(_local_iface_addr 4)
-    v6=$(_local_iface_addr 6)
-    if [ -n "$v4" ] && _local_ip_is_private "$v4"; then v4="${v4} (内网)"; fi
-    if [ -n "$v6" ] && _local_ip_is_private "$v6"; then v6="${v6} (内网)"; fi
+    v4=$(_public_ip_cached 4)
+    v6=$(_public_ip_cached 6)
+    # 公网探测不到 (无网络/无该族出口) 时退回网卡地址, 并标注来源
+    if [ -z "$v4" ]; then
+        v4=$(_local_iface_addr 4)
+        [ -n "$v4" ] && v4="${v4} (网卡)"
+    fi
+    if [ -z "$v6" ]; then
+        v6=$(_local_iface_addr 6)
+        [ -n "$v6" ] && v6="${v6} (网卡)"
+    fi
     printf 'IPv4 %s   IPv6 %s' "${v4:-无}" "${v6:-无}"
 }
 
@@ -361,8 +413,13 @@ _get_public_ip() {
     local pref ip first second
     pref=$(_node_ip_pref)
     if [ "$pref" = "ipv6" ]; then first=6; second=4; else first=4; second=6; fi
-    ip=$(_probe_ip_family "$first")
-    [ -z "$ip" ] && ip=$(_probe_ip_family "$second")
+    # 优先用菜单启动时探好的缓存, 避免创建节点时再等一轮 curl
+    ip=$(_public_ip_cached "$first")
+    [ -z "$ip" ] && ip=$(_public_ip_cached "$second")
+    if [ -z "$ip" ]; then
+        ip=$(_probe_ip_family "$first")
+        [ -z "$ip" ] && ip=$(_probe_ip_family "$second")
+    fi
     server_ip="$ip"
     echo "$ip"
 }
@@ -11122,6 +11179,8 @@ main() {
         _warn "sing-box 核心未安装。请通过主菜单【核心管理】进行安装。"
     fi
     
+    # SX: 公网 IP 探测放在进菜单前 —— 消息能留住, 菜单第一帧就能显示真实公网地址
+    _ensure_public_ip_cache
     _main_menu
 }
 

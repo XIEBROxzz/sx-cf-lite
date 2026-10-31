@@ -5138,7 +5138,8 @@ _node_ip_pref_set() {
     return 0
 }
 
-# SX: 本机地址一览 (读网卡, 瞬时; 双栈有则都显示) —— 与 singbox.sh 同名函数保持一致
+# SX: 本机公网地址 (探测 + 缓存) / 网卡地址 (兜底) —— 与 singbox.sh 同名函数保持一致
+#     显示公网 IP 而不是网卡地址: NAT 小鸡网卡上只有 10.x, 拿它当本机 IP 会误导
 _local_iface_addr() {
     local fam="$1" addr=""
     command -v ip >/dev/null 2>&1 || { printf ''; return; }
@@ -5148,23 +5149,79 @@ _local_iface_addr() {
     printf '%s' "$addr"
 }
 
-_local_ip_is_private() {
-    case "$1" in
-        "") return 1 ;;
-        10.*|192.168.*|127.*) return 0 ;;
-        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
-        100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
-        fd*|fc*|fe80*) return 0 ;;
-        *) return 1 ;;
+_PUB_IP_CACHE_TTL=600
+
+_public_ip_cache_file() { printf '%s/public_ip.cache' "${SINGBOX_DIR}"; }
+
+_public_ip_cache_fresh() {
+    local f ts now
+    _PUB_CACHE_TS=""
+    f=$(_public_ip_cache_file)
+    [ -s "$f" ] || return 1
+    ts=$(sed -n 's/^ts=//p' "$f" 2>/dev/null | head -n 1)
+    [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+    now=$(date +%s 2>/dev/null) || return 1
+    [ $((now - ts)) -le "$_PUB_IP_CACHE_TTL" ] || return 1
+    _PUB_CACHE_TS="$ts"
+    return 0
+}
+
+_public_ip_cached() {
+    local fam="$1" f v
+    f=$(_public_ip_cache_file)
+    [ -s "$f" ] || return 0
+    v=$(sed -n "s/^v${fam}=//p" "$f" 2>/dev/null | head -n 1)
+    printf '%s' "$v"
+}
+
+_probe_ip_family() {
+    local fam="$1" ip=""
+    ip=$(timeout 5 curl -fsS"$fam" --max-time 2 https://icanhazip.com 2>/dev/null)
+    [ -z "$ip" ] && ip=$(timeout 5 curl -fsS"$fam" --max-time 2 https://ipinfo.io/ip 2>/dev/null)
+    ip=$(printf '%s' "$ip" | tr -d '\r\n' | awk '{print $1}')
+    case "$fam" in
+        4) printf '%s' "$ip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' && printf '%s' "$ip" ;;
+        6) printf '%s' "$ip" | grep -qE '^[0-9a-fA-F:]+$'          && printf '%s' "$ip" ;;
     esac
+    return 0
+}
+
+_public_ip_refresh() {
+    local f tmp v4 v6
+    f=$(_public_ip_cache_file)
+    mkdir -p "${SINGBOX_DIR}" 2>/dev/null
+    tmp="${f}.tmp.$$"
+    v4=$(_probe_ip_family 4)
+    v6=$(_probe_ip_family 6)
+    {
+        printf 'v4=%s\n' "$v4"
+        printf 'v6=%s\n' "$v6"
+        printf 'ts=%s\n' "$(date +%s 2>/dev/null)"
+    } > "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$f" 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+    return 0
+}
+
+_ensure_public_ip_cache() {
+    _public_ip_cache_fresh && return 0
+    _info "正在探测本机公网 IP (IPv4 / IPv6)..."
+    _public_ip_refresh || _warn "公网 IP 探测失败, 将显示网卡地址"
+    return 0
 }
 
 _local_ip_line() {
     local v4 v6
-    v4=$(_local_iface_addr 4)
-    v6=$(_local_iface_addr 6)
-    if [ -n "$v4" ] && _local_ip_is_private "$v4"; then v4="${v4} (内网)"; fi
-    if [ -n "$v6" ] && _local_ip_is_private "$v6"; then v6="${v6} (内网)"; fi
+    v4=$(_public_ip_cached 4)
+    v6=$(_public_ip_cached 6)
+    if [ -z "$v4" ]; then
+        v4=$(_local_iface_addr 4)
+        [ -n "$v4" ] && v4="${v4} (网卡)"
+    fi
+    if [ -z "$v6" ]; then
+        v6=$(_local_iface_addr 6)
+        [ -n "$v6" ] && v6="${v6} (网卡)"
+    fi
     printf 'IPv4 %s   IPv6 %s' "${v4:-无}" "${v6:-无}"
 }
 
@@ -5438,6 +5495,8 @@ _menu() {
     _check_deps || return 1
     _install_yq || return 1
     _init_relay_dirs || return 1
+    # SX: 公网 IP 探测放在进菜单前 —— 消息能留住, 菜单第一帧就能显示真实公网地址
+    _ensure_public_ip_cache
 
     while true; do
         clear
