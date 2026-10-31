@@ -25,7 +25,7 @@ https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/rules/warp.json
 
 > `rules/warp.json` 是 **WARP 专用**（91 域名 + 148 IP 段）：只在 `[9] WARP 出站管理 → [2] → [2] 自定义规则` 里用，回车即默认。不要拿它给落地绑，也不要拿 `landing.json` 给 WARP 用（tag 会撞名）。
 >
-> 构成 = `landing.json` ∪ `landing-v2.json` 的**完整聚合**：50 + 41 = 91 条域名（两份交集为 0，直接并起来不会冲突）+ `landing.json` 原封搬来的 148 条 `ip_cidr`。`ip.sb`（landing 探针域名）与 `api.ipify.org`（WARP 出口探针）都在里面。所以「Play 302 到 IP 直连」这类纯 IP 连接现在也能被 WARP 规则集接住。
+> 构成 = `landing.json` ∪ `landing-v2.json` 的**完整聚合**：50 + 41 = 91 条域名（两份交集为 0，直接并起来不会冲突）+ `landing.json` 原封搬来的 148 条 `ip_cidr`。`ip.sb`（landing 探针域名）与 `api64.ipify.org`（WARP 出口探针）都在里面。所以「Play 302 到 IP 直连」这类纯 IP 连接现在也能被 WARP 规则集接住。
 
 ## 改完怎么一眼看出生效
 
