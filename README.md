@@ -1,6 +1,6 @@
 # SX-CF-lite
 
-sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.62**
+sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.63**
 
 > 基于 [0xdabiaoge/singbox-lite](https://github.com/0xdabiaoge/singbox-lite) 地基 + Joey [xray-cf-lite](https://github.com/byJoey/xray-cf-lite) 的 CF 套皮整合魔改。
 
@@ -67,4 +67,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/in
 **注意**
 
 - 本证书是**源站证书**，对应解析必须保持 DNS only；如需 CDN 回源请继续用主菜单 `[2] 一键套CF`。
-- 卸载脚本时会清理 acme.sh 续期任务和本地证书，但**不会删除 Cloudflare DNS 记录**。
+- **删除节点不会清理证书**：已申请证书（`certs/<域名>.pem|.key`）、`managed.json` 索引、Cloudflare 邮箱/Key、云端解析都原样保留，可直接给新节点复用。只有每个节点专属的自签证书（`<tag>.pem`）会随节点删除，下次创建会自动重建。
+- **卸载脚本才做一次性清理**：云端解析 → 本地证书/私钥 → acme.sh 续期记录 → CF 凭据。云端只删仍指向本机的记录；记录已被改到别的机器时会逐条询问，避免拆掉别处的解析。

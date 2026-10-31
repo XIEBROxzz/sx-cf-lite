@@ -22,6 +22,9 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.63: 删除节点只清节点本身 —— 已申请证书 (certs/) 与 CF 邮箱/Key 一律保留, 云端解析不动
+#           (自签证书仍随节点删除: 每个节点独有, 下次创建自动重建); 卸载脚本改为一次性清理
+#           云端解析 + 本地证书/私钥/acme.sh 记录/CF 凭据 (云端只删仍指向本机的记录)
 #     1.62: AnyTLS 协议选择文案去掉 "可用但特征弱" 的误导性评价, 改为 "自签证书 / 已申请证书"
 #           (该协议并不弱, 且本来就支持复用 [6] 申请的证书)
 #     1.61: 一键申请证书的邮箱提示改为 "Cloudflare 邮箱 (账号邮箱)" (本就是 CF 账号邮箱, 兼作
@@ -85,7 +88,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.62"
+export SCRIPT_VERSION="1.63"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -3734,7 +3737,8 @@ _uninstall() {
         fi
     fi
 
-    _cert_cleanup_for_uninstall 2>/dev/null || true
+    # SX: 不再吞掉 stderr —— 云端清理会逐条提示进度, 解析指向他机时还要询问
+    _cert_cleanup_for_uninstall || true
 
     rm -rf "${SINGBOX_DIR}"
     rm -f "${LOG_FILE}"
@@ -4777,9 +4781,71 @@ _cert_delete() {
     _warn "如需删除解析，请到 Cloudflare 后台移除 ${domain} 的 A/AAAA 记录。"
 }
 
+# SX: 卸载时清理云端 —— 删除 [6] 申请证书时写入的 A/AAAA 解析
+# 只删「仍指向本机」的记录; 已改指其他机器时逐条询问, 避免拆掉别处的解析
+_cert_cloud_cleanup_for_uninstall() {
+    local cred cemail ckey myip domain cert kp iemail zid rid resp content ans
+    local removed=0 kept=0
+    [ -s "$CERT_INDEX_FILE" ] || return 0
+    cred=$(_cert_cf_saved_cred 2>/dev/null) || cred=""
+    if [ -z "$cred" ]; then
+        _warn "未找到 Cloudflare 凭据, 云端解析未清理 (需到 CF 后台手动删除)。"
+        return 0
+    fi
+    cemail="${cred%%$'\t'*}"
+    ckey="${cred#*$'\t'}"
+    _CERT_CF_AUTH_TYPE="key"
+    _CERT_CF_EMAIL="$cemail"
+    _CERT_CF_KEY="$ckey"
+    myip=$(_get_public_ip 2>/dev/null) || myip=""
+    _info "正在清理 Cloudflare 云端解析..."
+    while IFS=$'\t' read -r domain cert kp iemail zid rid; do
+        [ -n "$domain" ] || continue
+        if [ -z "$zid" ] || [ -z "$rid" ]; then
+            _warn "  ${domain}: 索引缺少 Zone/Record 信息, 跳过 (需手动删除解析)。"
+            kept=$((kept + 1))
+            continue
+        fi
+        resp=$(_cert_cf_api GET "/zones/${zid}/dns_records/${rid}" 2>/dev/null) || resp=""
+        if ! printf '%s' "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
+            _warn "  ${domain}: 解析记录已不存在或无权访问, 跳过。"
+            kept=$((kept + 1))
+            continue
+        fi
+        content=$(printf '%s' "$resp" | jq -r '.result.content // ""')
+        if [ -n "$myip" ] && [ "$content" != "$myip" ]; then
+            _warn "  ${domain}: 解析当前指向 ${content}, 与本机 ${myip} 不一致。"
+            # 从 /dev/tty 读, 否则会吃掉循环正在读的索引行; 无终端时按「不删」处理
+            ans=""
+            if (exec 3</dev/tty) 2>/dev/null; then
+                printf '    仍要删除这条解析? (y/N): '
+                read -r ans <&3 || ans=""
+                exec 3<&-
+            fi
+            if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+                kept=$((kept + 1))
+                continue
+            fi
+        fi
+        resp=$(_cert_cf_api DELETE "/zones/${zid}/dns_records/${rid}" 2>/dev/null) || resp=""
+        if printf '%s' "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
+            _success "  ${domain}: 云端解析已删除 (${content:-记录})"
+            removed=$((removed + 1))
+        else
+            _warn "  ${domain}: 云端解析删除失败, 请到 CF 后台手动删除。"
+            kept=$((kept + 1))
+        fi
+    done < <(_cert_list_index)
+    _CERT_CF_KEY=""
+    _CERT_CF_EMAIL=""
+    _info "云端解析清理完成: 已删除 ${removed} 条, 保留/跳过 ${kept} 条。"
+}
+
 _cert_cleanup_for_uninstall() {
     local acme domain cert key email
     [ -s "$CERT_INDEX_FILE" ] || return 0
+    # 先删云端解析 (需要索引里的 zone_id/record_id), 再清本地文件与 acme.sh 记录
+    _cert_cloud_cleanup_for_uninstall 2>/dev/null || true
     acme="$(_cert_acme_bin)"
     while IFS=$'\t' read -r domain cert key email; do
         [ -n "$domain" ] || continue
@@ -4791,7 +4857,7 @@ _cert_cleanup_for_uninstall() {
     if command -v crontab >/dev/null 2>&1; then
         crontab -l 2>/dev/null | grep -vF '# sx-cf-lite acme renew' | crontab - 2>/dev/null || true
     fi
-    _info "已清理受管证书的 acme.sh 续期任务 (Cloudflare DNS 记录保留)。"
+    _info "已清理受管证书的 acme.sh 续期任务与本地证书文件。"
 }
 
 _cert_menu() {
@@ -6952,8 +7018,13 @@ _delete_one_main_node_locked() (
         _error "服务重启失败，正在恢复删除前状态。"
         return 1
     fi
-    _safe_remove_main_credential "$cert_path"
-    _safe_remove_main_credential "$key_path"
+    # SX: 已申请证书 (certs/) 与 CF 凭据不随节点删除清理 —— 卸载时才统一清理
+    if [ -n "$cert_path" ] && [[ "$cert_path" == "$CERT_STORE_DIR/"* ]]; then
+        _info "已申请证书已保留 (不随节点删除, 可在 [7] 证书管理复用): ${cert_path##*/}"
+    else
+        _safe_remove_main_credential "$cert_path"
+        _safe_remove_main_credential "$key_path"
+    fi
     delete_committed=1
     trap - EXIT INT TERM
     rm -rf -- "$backup_dir" || _warn "删除事务快照目录清理失败: $backup_dir"
@@ -7067,7 +7138,16 @@ _delete_all_main_nodes_locked() (
         return 1
     fi
 
-    sort -u "$credential_paths_file" | while IFS= read -r path; do _safe_remove_main_credential "$path"; done
+    # SX: 已申请证书 (certs/) 与 CF 凭据保留, 卸载时才统一清理
+    local kept_managed=0
+    while IFS= read -r path; do
+        if [ -n "$path" ] && [[ "$path" == "$CERT_STORE_DIR/"* ]]; then
+            kept_managed=$((kept_managed + 1))
+            continue
+        fi
+        _safe_remove_main_credential "$path"
+    done < <(sort -u "$credential_paths_file")
+    [ "$kept_managed" -gt 0 ] && _info "已申请证书已保留 (不随节点删除): ${kept_managed} 个文件"
     delete_all_committed=1
     trap - EXIT INT TERM
     rm -rf -- "$backup_dir" || _warn "批量删除事务快照目录清理失败: $backup_dir"
