@@ -2575,8 +2575,16 @@ _clear_all_relays() {
             _nft_apply_redirect_rule delete "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$port" "singboxlite-relay-hop-${tag}"
         fi
     done <<< "$cleanup_rows"
+    local _main_tags_guard
+    _main_tags_guard=$(jq -r '[.inbounds[]?.tag // ""] | join(" ")' "$MAIN_CONFIG_FILE" 2>/dev/null || printf '')
     while IFS= read -r tag; do
         [ -n "$tag" ] || continue
+        # SX: 主/中转 tag 命名同构 (xxx-in-端口), 极端情况下可能同名 —— 属主节点则保留证书,
+        #     删错会让主节点重启时 read certificate 失败 (整机节点全废)
+        if [ -n "$_main_tags_guard" ] && printf '%s' "$_main_tags_guard" | grep -qw -- "$tag"; then
+            _warn "证书 ${tag}.pem/.key 属主配置节点, 已跳过删除"
+            continue
+        fi
         rm -f -- "${RELAY_AUX_DIR}/${tag}.pem" "${RELAY_AUX_DIR}/${tag}.key"
     done < <(printf '%s' "$relay_tags" | jq -r '.[]' 2>/dev/null)
     _save_nftables_rules
