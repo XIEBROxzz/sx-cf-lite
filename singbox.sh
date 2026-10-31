@@ -22,6 +22,8 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.60: 更多协议新增 [6] 一键申请证书 (Cloudflare 自动解析 + acme.sh DNS-01 + 自动续期)
+#           + [7] 证书管理; 创建需要证书的节点可选「使用已申请证书和域名」
 #     1.59: SNI 预设列表按实测总延迟升序编号 (失败排最后), 带延迟缓存与 [22] 重新实测
 #     1.58: SNI 预设列表加内置兜底 + 紧凑布局 (18 行内), 修只显示 [22] 的问题
 #     1.57: SNI 优选菜单改为 1=预设列表(内含一键检测全部) / 2=自定义 / 3=检测当前, 全数字编号
@@ -78,13 +80,19 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.59"
+export SCRIPT_VERSION="1.60"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
+# SX: 自动证书 (Cloudflare DNS-01 + acme.sh) 落位
+CERT_STORE_DIR="${SINGBOX_DIR}/certs"
+CERT_INDEX_FILE="${CERT_STORE_DIR}/managed.json"
+CERT_RELOAD_SCRIPT="${SINGBOX_DIR}/cert-reload.sh"
+ACME_HOME="${ACME_HOME:-${HOME:-/root}/.acme.sh}"
+CF_API_BASE="https://api.cloudflare.com/client/v4"
 
 # SX: 伪装域名(SNI)优选 —— 若用户保存过默认值, 开机即用
 if [ -s "${SINGBOX_DIR}/default_sni" ]; then
@@ -3078,7 +3086,8 @@ _argo_keepalive() {
     exec 7>&-
 }
 
-_ensure_argo_cron() {
+_ensure_cron_service() {
+    local purpose="${1:-后台任务}"
     local cron_pkg="cron"
     local services=(cron crond cronie)
     local service_name started=false
@@ -3092,9 +3101,9 @@ _ensure_argo_cron() {
     fi
 
     if ! command -v crontab &>/dev/null; then
-        _info "正在按需安装 Argo 守护依赖: ${cron_pkg}..."
+        _info "正在按需安装${purpose}依赖: ${cron_pkg}..."
         if ! _pkg_install "$cron_pkg" || ! command -v crontab &>/dev/null; then
-            _error "安装 Argo 守护依赖失败，未创建不受守护的隧道节点。"
+            _error "安装${purpose}依赖失败。"
             return 1
         fi
     fi
@@ -3130,9 +3139,13 @@ _ensure_argo_cron() {
     esac
 
     if [ "$started" != true ]; then
-        _error "Cron 服务启动失败，无法启用 Argo 自动守护。"
+        _error "Cron 服务启动失败，无法启用${purpose}。"
         return 1
     fi
+}
+
+_ensure_argo_cron() {
+    _ensure_cron_service "Argo 守护"
 }
 
 _enable_argo_watchdog() {
@@ -3716,6 +3729,8 @@ _uninstall() {
         fi
     fi
 
+    _cert_cleanup_for_uninstall 2>/dev/null || true
+
     rm -rf "${SINGBOX_DIR}"
     rm -f "${LOG_FILE}"
 
@@ -4049,6 +4064,658 @@ EOF
 # 注意: _atomic_modify_json, _atomic_modify_yaml, _get_proxy_field, _add_node_to_yaml, _remove_node_from_yaml
 # 均在上方统一定义，此处不再重复定义以避免不一致
 
+# ── SX: 自动证书 (Cloudflare DNS-01 + acme.sh) ─────────────────────
+# 证书落位: ${CERT_STORE_DIR}/<域名>.pem / .key
+# 索引: ${CERT_INDEX_FILE} (只存域名/路径/Zone/Record; API 凭据由 acme.sh 存在 ~/.acme.sh/<域名>/)
+# 续期: acme.sh cron --cron; 续期后由 --reloadcmd 调 cert-reload.sh 重启主服务
+
+_cert_ensure_layout() {
+    mkdir -p "$CERT_STORE_DIR" || return 1
+    chmod 700 "$CERT_STORE_DIR" 2>/dev/null || true
+    if [ ! -s "$CERT_INDEX_FILE" ]; then
+        printf '{}\n' > "$CERT_INDEX_FILE" || return 1
+        chmod 600 "$CERT_INDEX_FILE" 2>/dev/null || true
+    fi
+    return 0
+}
+
+_cert_index_count() {
+    _cert_ensure_layout >/dev/null 2>&1 || { printf '0'; return; }
+    jq -r 'if type == "object" then (to_entries | length) else 0 end' "$CERT_INDEX_FILE" 2>/dev/null || printf '0'
+}
+
+_cert_list_index() {
+    _cert_ensure_layout >/dev/null 2>&1 || return 1
+    jq -r 'to_entries[]? | [.key, (.value.cert_path // ""), (.value.key_path // ""), (.value.email // ""), (.value.zone_id // ""), (.value.record_id // "")] | @tsv' "$CERT_INDEX_FILE" 2>/dev/null
+}
+
+_cert_not_after() {
+    [ -s "$1" ] || { printf '?'; return; }
+    openssl x509 -in "$1" -noout -enddate 2>/dev/null | cut -d= -f2
+}
+
+_cert_state_label() {
+    local cert="$1"
+    if [ ! -s "$cert" ]; then printf '文件缺失'; return; fi
+    if ! openssl x509 -in "$cert" -noout >/dev/null 2>&1; then printf '格式错误'; return; fi
+    if ! openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1; then
+        printf '已过期'
+    elif openssl x509 -in "$cert" -noout -checkend 2592000 >/dev/null 2>&1; then
+        printf '有效'
+    else
+        printf '30天内到期'
+    fi
+}
+
+_cert_normalize_domain() {
+    local d="$1"
+    d=$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]' | tr -d '\r' | \
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s#^https\?://##; s#/.*$##; s/\.$//')
+    [ -n "$d" ] || return 1
+    [ "${#d}" -le 253 ] || return 1
+    [[ "$d" == *.* ]] || return 1
+    [[ "$d" == *"*"* ]] && return 1
+    [[ "$d" == *..* ]] && return 1
+    [[ "$d" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || return 1
+    [[ "$d" =~ (^|\.)- ]] && return 1
+    [[ "$d" =~ -(\.|$) ]] && return 1
+    printf '%s' "$d"
+}
+
+_cert_valid_ip() {
+    local ip="$1" o
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        for o in ${ip//./ }; do
+            [ "$o" -le 255 ] 2>/dev/null || return 1
+        done
+        return 0
+    fi
+    [[ "$ip" == *:* ]] && [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]]
+}
+
+# Cloudflare API: 凭据只写进临时 curl 配置 (600), 不出现在进程参数里
+_CERT_CF_AUTH_TYPE=""
+_CERT_CF_TOKEN=""
+_CERT_CF_KEY=""
+_CERT_CF_EMAIL=""
+
+_cert_cf_api() {
+    local method="$1" endpoint="$2" data="${3:-}" cfg rc
+    cfg=$(mktemp) || return 1
+    chmod 600 "$cfg" 2>/dev/null || true
+    {
+        printf 'silent\nshow-error\nmax-time = 30\n'
+        if [ "$_CERT_CF_AUTH_TYPE" = "token" ]; then
+            printf 'header = "Authorization: Bearer %s"\n' "$_CERT_CF_TOKEN"
+        else
+            printf 'header = "X-Auth-Email: %s"\n' "$_CERT_CF_EMAIL"
+            printf 'header = "X-Auth-Key: %s"\n' "$_CERT_CF_KEY"
+        fi
+        printf 'header = "Content-Type: application/json"\n'
+    } > "$cfg" || { rm -f "$cfg"; return 1; }
+    if [ -n "$data" ]; then
+        printf '%s' "$data" | curl --config "$cfg" -X "$method" --data-binary @- "${CF_API_BASE}${endpoint}"
+    else
+        curl --config "$cfg" -X "$method" "${CF_API_BASE}${endpoint}"
+    fi
+    rc=$?
+    rm -f "$cfg"
+    return $rc
+}
+
+_cert_cf_error() {
+    printf '%s' "$1" | jq -r '.errors[]? | "  CF \(.code): \(.message)"' 2>/dev/null
+}
+
+_cert_cf_verify() {
+    local resp
+    if [ "$_CERT_CF_AUTH_TYPE" = "token" ]; then
+        resp=$(_cert_cf_api GET "/user/tokens/verify" 2>/dev/null) || return 1
+        if printf '%s' "$resp" | jq -e '.success == true and (.result.status // "") == "active"' >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    resp=$(_cert_cf_api GET "/zones?per_page=1" 2>/dev/null) || return 1
+    if printf '%s' "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
+        return 0
+    fi
+    _cert_cf_error "$resp"
+    return 1
+}
+
+_cert_cf_find_zone() {
+    local domain="$1" page=1 total=1 resp best_id="" best_name="" zid zname
+    while [ "$page" -le 20 ]; do
+        resp=$(_cert_cf_api GET "/zones?per_page=50&page=${page}") || return 1
+        if ! printf '%s' "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
+            _cert_cf_error "$resp" >&2
+            return 1
+        fi
+        while IFS=$'\t' read -r zid zname; do
+            [ -n "$zid" ] && [ -n "$zname" ] || continue
+            case "$domain" in
+                "$zname"|*".$zname")
+                    if [ "${#zname}" -gt "${#best_name}" ]; then
+                        best_id="$zid"
+                        best_name="$zname"
+                    fi
+                    ;;
+            esac
+        done < <(printf '%s' "$resp" | jq -r '.result[]? | [.id, .name] | @tsv')
+        total=$(printf '%s' "$resp" | jq -r '.result_info.total_pages // 1')
+        [[ "$total" =~ ^[0-9]+$ ]] || total=1
+        [ "$page" -ge "$total" ] && break
+        page=$((page + 1))
+    done
+    [ -n "$best_id" ] || return 1
+    printf '%s|%s' "$best_id" "$best_name"
+}
+
+_cert_cf_upsert_dns() {
+    local zone_id="$1" domain="$2" ip="$3" rtype="A" resp existing_id="" record_count="" types="" rid confirm
+    [[ "$ip" == *:* ]] && rtype="AAAA"
+    resp=$(_cert_cf_api GET "/zones/${zone_id}/dns_records?name=${domain}&per_page=100") || return 1
+    if ! printf '%s' "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
+        _cert_cf_error "$resp" >&2
+        return 1
+    fi
+    record_count=$(printf '%s' "$resp" | jq -r '.result | length')
+    if [ "${record_count:-0}" -gt 0 ]; then
+        existing_id=$(printf '%s' "$resp" | jq -r --arg t "$rtype" '[.result[]? | select(.type == $t)][0].id // empty')
+        if [ -z "$existing_id" ]; then
+            types=$(printf '%s' "$resp" | jq -r '[.result[].type] | unique | join("/")')
+            # 注意: 本函数用 stdout 返回 record_id, 提示/警告必须走 stderr
+            _warn "该域名已存在 ${types} 记录，与 ${rtype} 冲突。" >&2
+            read -r -p "  删除这些记录并改为 ${rtype}? (y/N): " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                _error "已取消，未修改 DNS。"
+                return 1
+            fi
+            while IFS= read -r rid; do
+                [ -n "$rid" ] || continue
+                _cert_cf_api DELETE "/zones/${zone_id}/dns_records/${rid}" >/dev/null || {
+                    _error "删除旧 DNS 记录失败: ${rid}"
+                    return 1
+                }
+            done < <(printf '%s' "$resp" | jq -r '.result[]?.id')
+        fi
+    fi
+    local payload
+    payload=$(jq -n --arg t "$rtype" --arg n "$domain" --arg c "$ip" \
+        '{type:$t, name:$n, content:$c, ttl:1, proxied:false, comment:"sx-cf-lite managed certificate"}')
+    if [ -n "$existing_id" ]; then
+        resp=$(_cert_cf_api PUT "/zones/${zone_id}/dns_records/${existing_id}" "$payload") || return 1
+    else
+        resp=$(_cert_cf_api POST "/zones/${zone_id}/dns_records" "$payload") || return 1
+    fi
+    if ! printf '%s' "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
+        _cert_cf_error "$resp" >&2
+        return 1
+    fi
+    printf '%s' "$resp" | jq -r '.result.id // empty'
+}
+
+_cert_acme_bin() {
+    printf '%s/acme.sh' "$ACME_HOME"
+}
+
+_cert_ensure_acme() {
+    local email="$1" acme log
+    acme="$(_cert_acme_bin)"
+    if [ ! -x "$acme" ]; then
+        command -v curl >/dev/null 2>&1 || { _error "缺少 curl，无法安装 acme.sh。"; return 1; }
+        _info "正在安装 acme.sh ..."
+        log=$(mktemp) || return 1
+        if ! curl -fsSL https://get.acme.sh | sh -s email="$email" >"$log" 2>&1; then
+            _error "acme.sh 安装失败:"
+            tail -n 20 "$log" >&2
+            rm -f "$log"
+            return 1
+        fi
+        rm -f "$log"
+    fi
+    [ -x "$acme" ] || { _error "未找到 acme.sh: ${acme}"; return 1; }
+    "$acme" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+    printf '%s' "$acme"
+}
+
+_cert_write_reload_script() {
+    mkdir -p "$SINGBOX_DIR" || return 1
+    cat > "$CERT_RELOAD_SCRIPT" <<'EOF'
+#!/bin/sh
+# 由 sx-cf-lite 生成: 证书续期后重载 sing-box
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl try-restart sing-box >/dev/null 2>&1 || true
+elif command -v rc-service >/dev/null 2>&1; then
+    if rc-service sing-box status 2>/dev/null | grep -q started; then
+        rc-service sing-box restart >/dev/null 2>&1 || true
+    fi
+fi
+exit 0
+EOF
+    chmod 700 "$CERT_RELOAD_SCRIPT" 2>/dev/null || true
+}
+
+_cert_ensure_acme_cron() {
+    local acme="$1" job
+    _ensure_cron_service "证书自动续期" || return 1
+    job="17 3 * * * \"${acme}\" --cron --home \"${ACME_HOME}\" >/dev/null 2>&1 # sx-cf-lite acme renew"
+    if crontab -l 2>/dev/null | grep -Fq 'sx-cf-lite acme renew'; then
+        return 0
+    fi
+    if { crontab -l 2>/dev/null; printf '%s\n' "$job"; } | crontab -; then
+        _success "已启用证书自动续期 (每天 03:17 检查)"
+        return 0
+    fi
+    _warn "自动续期 cron 写入失败，请手动执行: ${acme} --cron"
+    return 1
+}
+
+_cert_acme_issue() {
+    local acme="$1" domain="$2" email="$3" cert_path="$4" key_path="$5" rc
+    _cert_write_reload_script || return 1
+    export CF_Token="" CF_Key="" CF_Email="" CF_Account_ID=""
+    if [ "$_CERT_CF_AUTH_TYPE" = "token" ]; then
+        export CF_Token="$_CERT_CF_TOKEN"
+    else
+        export CF_Key="$_CERT_CF_KEY"
+        export CF_Email="$email"
+    fi
+    _info "正在申请 Let's Encrypt 证书 (DNS-01): ${domain}"
+    "$acme" --register-account -m "$email" --server letsencrypt >/dev/null 2>&1 || true
+    "$acme" --issue --dns dns_cf -d "$domain" --keylength 2048 --server letsencrypt
+    rc=$?
+    # acme.sh 已把凭据保存到 account.conf, 及时从当前进程环境清除
+    unset CF_Token CF_Key CF_Email CF_Account_ID
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+        _error "证书申请失败 (acme.sh 退出码 ${rc})"
+        return 1
+    fi
+    _info "正在把证书安装到 ${CERT_STORE_DIR} ..."
+    "$acme" --install-cert -d "$domain" \
+        --key-file "$key_path" \
+        --fullchain-file "$cert_path" \
+        --reloadcmd "sh ${CERT_RELOAD_SCRIPT}"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        _error "证书安装失败 (acme.sh 退出码 ${rc})"
+        return 1
+    fi
+    chmod 600 "$cert_path" "$key_path" 2>/dev/null || true
+    if ! openssl x509 -in "$cert_path" -noout >/dev/null 2>&1; then
+        _error "下载的证书无法解析: ${cert_path}"
+        return 1
+    fi
+    if ! openssl x509 -in "$cert_path" -noout -checkhost "$domain" >/dev/null 2>&1; then
+        # LibreSSL 等旧实现没有 -checkhost，退回 SAN 文本匹配
+        if ! openssl x509 -in "$cert_path" -noout -text 2>/dev/null | grep -Eq "DNS:${domain}([,[:space:]]|$)"; then
+            _error "证书不包含域名 ${domain}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+_cert_save_index() {
+    local domain="$1" cert="$2" key="$3" zone="$4" record="$5" email="$6" auth="$7" now
+    now=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)
+    _atomic_modify_json "$CERT_INDEX_FILE" '
+        . + {($d): {domain:$d, cert_path:$c, key_path:$k, zone_id:$z, record_id:$r, email:$e, auth_type:$a, issued_at:$n, source:"acme.sh", auto_renew:true}}
+    ' --arg d "$domain" --arg c "$cert" --arg k "$key" --arg z "$zone" --arg r "$record" --arg e "$email" --arg a "$auth" --arg n "$now"
+}
+
+_cert_apply() {
+    _cert_ensure_layout || { _error "无法创建证书目录: ${CERT_STORE_DIR}"; return 1; }
+    clear
+    echo -e "${CYAN}"
+    echo '  ╔═══════════════════════════════════════╗'
+    echo '  ║      一键申请证书 (Cloudflare)        ║'
+    echo '  ╚═══════════════════════════════════════╝'
+    echo -e "${NC}"
+    echo "  流程: 自动写入 A/AAAA 解析 → acme.sh DNS-01 申请 Let's Encrypt"
+    echo "        → 下载到 ${CERT_STORE_DIR} → 每天自动检查续期"
+    echo ""
+    echo -e "  ${YELLOW}Cloudflare API Token 权限: Zone:Zone:Read + Zone:DNS:Edit${NC}"
+    echo -e "  ${YELLOW}为避免源站证书被 CF 代理掩盖, 解析默认关闭小黄云 (DNS only)。${NC}"
+    echo ""
+
+    local email=""
+    while true; do
+        read -r -p "  邮箱 (Let's Encrypt 通知用): " email
+        if [[ "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+            break
+        fi
+        _error "邮箱格式无效。"
+    done
+
+    local auth_choice="1" secret=""
+    echo ""
+    echo "  Cloudflare 凭据类型:"
+    echo "    1) API Token (推荐)"
+    echo "    2) Global API Key + 邮箱"
+    read -r -p "  请选择 [1-2] (默认: 1): " auth_choice
+    auth_choice=${auth_choice:-1}
+    if [ "$auth_choice" = "2" ]; then
+        _CERT_CF_AUTH_TYPE="key"
+        read -r -s -p "  Global API Key: " secret; echo ""
+        _CERT_CF_KEY="$secret"
+        _CERT_CF_EMAIL="$email"
+    else
+        _CERT_CF_AUTH_TYPE="token"
+        read -r -s -p "  API Token: " secret; echo ""
+        _CERT_CF_TOKEN="$secret"
+        _CERT_CF_EMAIL="$email"
+    fi
+    if [ -z "$secret" ]; then
+        _error "凭据不能为空。"
+        return 1
+    fi
+    # 去掉复制时可能带入的空白/换行
+    secret=$(printf '%s' "$secret" | tr -d '[:space:]')
+    if [ "$_CERT_CF_AUTH_TYPE" = "token" ]; then
+        _CERT_CF_TOKEN="$secret"
+    else
+        _CERT_CF_KEY="$secret"
+    fi
+
+    local domain=""
+    while true; do
+        read -r -p "  子域名 (如 node.example.com): " domain
+        if domain=$(_cert_normalize_domain "$domain"); then
+            break
+        fi
+        _error "域名格式无效 (不要带 http:// 或路径, 不支持通配符)。"
+    done
+
+    local ip="" input_ip=""
+    ip=$(_get_public_ip 2>/dev/null)
+    read -r -p "  A/AAAA 记录 IP (默认: ${ip:-自动获取失败}): " input_ip
+    [ -n "$input_ip" ] && ip="$input_ip"
+    if ! _cert_valid_ip "$ip"; then
+        _error "IP 格式无效: ${ip:-空}"
+        return 1
+    fi
+
+    _info "正在验证 Cloudflare 凭据..."
+    if ! _cert_cf_verify; then
+        _error "Cloudflare 凭据无效或权限不足 (需要 Zone:Zone:Read + Zone:DNS:Edit)。"
+        return 1
+    fi
+    _info "正在匹配 Cloudflare Zone..."
+    local zinfo zone_id="" zone_name=""
+    if ! zinfo=$(_cert_cf_find_zone "$domain"); then
+        _error "未找到 ${domain} 对应的 Zone。请确认域名已托管在 Cloudflare，且 Token 有 Zone:Read 权限。"
+        return 1
+    fi
+    zone_id="${zinfo%%|*}"
+    zone_name="${zinfo#*|}"
+    _success "匹配 Zone: ${zone_name}"
+
+    echo ""
+    echo "  域名:     ${domain}"
+    echo "  解析:     ${domain} -> ${ip} (DNS only)"
+    echo "  证书:     Let's Encrypt (acme.sh DNS-01, RSA 2048)"
+    echo "  自动续期: 每天 03:17 检查"
+    echo ""
+    local confirm=""
+    read -r -p "  确认申请? (Y/n): " confirm
+    [[ "$confirm" =~ ^[Nn]$ ]] && { _info "已取消。"; return 0; }
+
+    local acme=""
+    if ! acme=$(_cert_ensure_acme "$email"); then
+        return 1
+    fi
+    _cert_ensure_acme_cron "$acme" || _warn "自动续期未启用，请稍后手动执行: ${acme} --cron"
+
+    local cert_path="${CERT_STORE_DIR}/${domain}.pem"
+    local key_path="${CERT_STORE_DIR}/${domain}.key"
+    local record_id=""
+    if ! record_id=$(_cert_cf_upsert_dns "$zone_id" "$domain" "$ip"); then
+        _error "DNS 解析写入失败。"
+        return 1
+    fi
+    _success "DNS 解析已写入: ${domain} -> ${ip} (record: ${record_id:-unknown})"
+
+    if ! _cert_acme_issue "$acme" "$domain" "$email" "$cert_path" "$key_path"; then
+        _error "证书申请未完成；DNS 解析已保留，修正后可重试。"
+        return 1
+    fi
+    if ! _cert_save_index "$domain" "$cert_path" "$key_path" "$zone_id" "$record_id" "$email" "$_CERT_CF_AUTH_TYPE"; then
+        _error "证书已下载，但索引写入失败 (不影响节点使用)。"
+        return 1
+    fi
+
+    echo ""
+    _success "证书申请成功: ${domain}"
+    echo "  证书: ${cert_path}"
+    echo "  私钥: ${key_path}"
+    echo "  到期: $(_cert_not_after "$cert_path")"
+    echo ""
+    _info "现在创建需要证书的节点时，选择「使用已申请证书」即可自动带出域名 ${domain}。"
+    _info "远程节点请放行对应端口；本证书是源站证书，Cloudflare 小黄云已关闭。"
+}
+
+_cert_managed_select() {
+    local domains=() certs=() keys=() domain cert key email state i=0 sel
+    while IFS=$'\t' read -r domain cert key email; do
+        [ -n "$domain" ] || continue
+        [ -s "$cert" ] && [ -s "$key" ] || continue
+        i=$((i + 1))
+        domains+=("$domain")
+        certs+=("$cert")
+        keys+=("$key")
+        state=$(_cert_state_label "$cert")
+        printf '    [%d] %-32s %-10s 到期: %s\n' "$i" "$domain" "$state" "$(_cert_not_after "$cert")"
+    done < <(_cert_list_index)
+    if [ "$i" -eq 0 ]; then
+        _warn "没有可用的已申请证书 (文件缺失或索引为空)。"
+        return 1
+    fi
+    read -r -p "  选择证书 [1-${i}] (0=取消): " sel
+    [[ "$sel" =~ ^[0-9]+$ ]] || return 1
+    [ "$sel" -eq 0 ] && return 1
+    if [ "$sel" -gt "$i" ]; then
+        _error "编号超出范围。"
+        return 1
+    fi
+    _CERT_SEL_DOMAIN="${domains[$((sel - 1))]}"
+    _CERT_SEL_CERT="${certs[$((sel - 1))]}"
+    _CERT_SEL_KEY="${keys[$((sel - 1))]}"
+    return 0
+}
+
+# 创建节点时选择证书来源; 成功后在 NODE_CERT_* 中返回
+_node_cert_choose() {
+    local tag="$1" default_domain="$2" cert_choice=""
+    NODE_CERT_PATH="${SINGBOX_DIR}/${tag}.pem"
+    NODE_CERT_KEY_PATH="${SINGBOX_DIR}/${tag}.key"
+    NODE_CERT_DOMAIN="$default_domain"
+    NODE_CERT_SKIP_VERIFY="true"
+    NODE_CERT_SOURCE="self-signed"
+
+    if [ "${BATCH_MODE:-false}" = "true" ]; then
+        _generate_self_signed_cert "$default_domain" "$NODE_CERT_PATH" "$NODE_CERT_KEY_PATH" || return 1
+        return 0
+    fi
+
+    if [ "$(_cert_index_count)" -gt 0 ] 2>/dev/null; then
+        echo ""
+        echo -e "  ${CYAN}【证书来源】${NC}"
+        echo -e "    ${GREEN}[1]${NC} 自动自签 (默认, 链接带证书指纹)"
+        echo -e "    ${GREEN}[2]${NC} 使用已申请证书 (Let's Encrypt, 自动续期)"
+        read -r -p "  请选择 [1-2] (默认: 1): " cert_choice
+        cert_choice=${cert_choice:-1}
+        if [ "$cert_choice" = "2" ]; then
+            if _cert_managed_select; then
+                NODE_CERT_PATH="$_CERT_SEL_CERT"
+                NODE_CERT_KEY_PATH="$_CERT_SEL_KEY"
+                NODE_CERT_DOMAIN="$_CERT_SEL_DOMAIN"
+                NODE_CERT_SKIP_VERIFY="false"
+                NODE_CERT_SOURCE="managed"
+                _success "使用已申请证书: ${NODE_CERT_DOMAIN} (到期: $(_cert_not_after "$NODE_CERT_PATH"))"
+                return 0
+            fi
+            _warn "未选择已申请证书，改用自动自签。"
+        fi
+    else
+        _info "未检测到已申请证书 (可先用 [6] 一键申请)，本次自动生成自签证书。"
+    fi
+
+    _generate_self_signed_cert "$default_domain" "$NODE_CERT_PATH" "$NODE_CERT_KEY_PATH" || return 1
+    _info "已自动生成自签证书 (直连用, 链接内含 pcs 指纹)。"
+    return 0
+}
+
+_cert_show_list() {
+    local domain cert key email state count
+    count=$(_cert_index_count)
+    if [ "${count:-0}" -eq 0 ]; then
+        echo "  暂无已申请证书。"
+        return 0
+    fi
+    echo -e "  ${CYAN}已申请证书:${NC}"
+    while IFS=$'\t' read -r domain cert key email; do
+        [ -n "$domain" ] || continue
+        state=$(_cert_state_label "$cert")
+        printf '    %-32s %-10s 到期: %s\n' "$domain" "$state" "$(_cert_not_after "$cert")"
+        printf '      证书: %s\n' "$cert"
+    done < <(_cert_list_index)
+}
+
+_cert_renew_all() {
+    local total=0 ok=0 fail=0 rc domain cert key email acme
+    total=$(_cert_index_count)
+    if [ "${total:-0}" -eq 0 ]; then
+        _warn "暂无已申请证书。"
+        return 0
+    fi
+    acme="$(_cert_acme_bin)"
+    if [ ! -x "$acme" ]; then
+        _error "未找到 acme.sh: ${acme}"
+        return 1
+    fi
+    while IFS=$'\t' read -r domain cert key email; do
+        [ -n "$domain" ] || continue
+        _info "检查/续期 ${domain} ..."
+        "$acme" --renew -d "$domain" --server letsencrypt
+        rc=$?
+        if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
+            if "$acme" --install-cert -d "$domain" \
+                --key-file "$key" \
+                --fullchain-file "$cert" \
+                --reloadcmd "sh ${CERT_RELOAD_SCRIPT}" >/dev/null 2>&1 && [ -s "$cert" ]; then
+                ok=$((ok + 1))
+                _success "${domain} 已就绪 (到期: $(_cert_not_after "$cert"))"
+            else
+                fail=$((fail + 1))
+                _error "${domain} 安装到本地失败"
+            fi
+        else
+            fail=$((fail + 1))
+            _error "${domain} 续期失败 (退出码 ${rc})"
+        fi
+    done < <(_cert_list_index)
+    echo ""
+    _info "续期检查完成: 成功 ${ok} / 失败 ${fail} / 共 ${total}"
+    [ "$fail" -eq 0 ]
+}
+
+_cert_delete() {
+    local domains=() certs=() keys=() domain cert key email i=0 sel acme confirm
+    while IFS=$'\t' read -r domain cert key email; do
+        [ -n "$domain" ] || continue
+        i=$((i + 1))
+        domains+=("$domain")
+        certs+=("$cert")
+        keys+=("$key")
+        printf '    [%d] %-32s %-10s 到期: %s\n' "$i" "$domain" "$(_cert_state_label "$cert")" "$(_cert_not_after "$cert")"
+    done < <(_cert_list_index)
+    if [ "$i" -eq 0 ]; then
+        _warn "暂无已申请证书。"
+        return 0
+    fi
+    read -r -p "  选择要删除的证书 [1-${i}] (0=取消): " sel
+    [[ "$sel" =~ ^[0-9]+$ ]] || return 1
+    [ "$sel" -eq 0 ] && return 1
+    if [ "$sel" -gt "$i" ]; then
+        _error "编号超出范围。"
+        return 1
+    fi
+    domain="${domains[$((sel - 1))]}"
+    cert="${certs[$((sel - 1))]}"
+    key="${keys[$((sel - 1))]}"
+    if grep -Fq "$cert" "$CONFIG_FILE" "$RELAY_CONFIG_FILE" 2>/dev/null; then
+        _error "证书 ${domain} 仍被节点引用；请先删除或修改使用它的节点。"
+        return 1
+    fi
+    echo ""
+    _warn "将删除本地证书、私钥和 acme.sh 续期记录: ${domain}"
+    _warn "Cloudflare 上的 DNS 解析不会自动删除。"
+    read -r -p "  确认删除? (y/N): " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { _info "已取消。"; return 0; }
+
+    acme="$(_cert_acme_bin)"
+    if [ -x "$acme" ]; then
+        "$acme" --remove -d "$domain" >/dev/null 2>&1 || true
+    fi
+    rm -rf "${ACME_HOME:?}/${domain}" "${ACME_HOME:?}/${domain}_ecc" 2>/dev/null || true
+    rm -f -- "$cert" "$key"
+    if ! _atomic_modify_json "$CERT_INDEX_FILE" 'del(.[$d])' --arg d "$domain"; then
+        _error "删除索引失败: ${CERT_INDEX_FILE}"
+        return 1
+    fi
+    _success "已删除本地证书: ${domain}"
+    _warn "如需删除解析，请到 Cloudflare 后台移除 ${domain} 的 A/AAAA 记录。"
+}
+
+_cert_cleanup_for_uninstall() {
+    local acme domain cert key email
+    [ -s "$CERT_INDEX_FILE" ] || return 0
+    acme="$(_cert_acme_bin)"
+    while IFS=$'\t' read -r domain cert key email; do
+        [ -n "$domain" ] || continue
+        if [ -x "$acme" ]; then
+            "$acme" --remove -d "$domain" >/dev/null 2>&1 || true
+        fi
+        rm -rf "${ACME_HOME:?}/${domain}" "${ACME_HOME:?}/${domain}_ecc" 2>/dev/null || true
+    done < <(_cert_list_index)
+    if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -vF '# sx-cf-lite acme renew' | crontab - 2>/dev/null || true
+    fi
+    _info "已清理受管证书的 acme.sh 续期任务 (Cloudflare DNS 记录保留)。"
+}
+
+_cert_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}"
+        echo '  ╔═══════════════════════════════════════╗'
+        echo '  ║              证书管理                 ║'
+        echo '  ╚═══════════════════════════════════════╝'
+        echo -e "${NC}"
+        echo ""
+        _cert_show_list
+        echo ""
+        echo -e "  ${CYAN}【操作】${NC}"
+        echo -e "    ${GREEN}[1]${NC} 申请新证书"
+        echo -e "    ${GREEN}[2]${NC} 立即检查/续期全部"
+        echo -e "    ${RED}[3]${NC} 删除本地证书"
+        echo ""
+        echo -e "  ───────────────────────────────────────"
+        echo -e "    ${YELLOW}[0]${NC} 返回"
+        echo ""
+        local choice=""
+        read -r -p "  请输入选项 [0-3]: " choice
+        case $choice in
+            1) _cert_apply; _pause_back ;;
+            2) _cert_renew_all; _pause_back ;;
+            3) _cert_delete; _pause_back ;;
+            0) return ;;
+            *) _error "无效输入，请重试。"; _pause_back ;;
+        esac
+    done
+}
+
 # 显示节点分享链接（在添加节点后调用）
 # 参数: $1=协议类型, $2=节点名称, $3=服务器IP(用于链接), $4=端口, $5=节点TAG, 其他参数根据协议不同
 _show_node_link() {
@@ -4103,20 +4770,25 @@ _show_node_link() {
             url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
         "hysteria2")
-            # 参数: password, sni, obfs_password(可选), port_hopping(可选)
-            local password="$1" sni="${2:-$DEFAULT_SNI}" obfs_password="$3" port_hopping="$4"
+            # 参数: password, sni, obfs_password(可选), port_hopping(可选), skip_verify(可选)
+            local password="$1" sni="${2:-$DEFAULT_SNI}" obfs_password="$3" port_hopping="$4" skip_verify="${5:-true}"
             local obfs_param=""; [[ -n "$obfs_password" ]] && obfs_param="&obfs=salamander&obfs-password=$(_url_encode "${obfs_password}")"
             local hop_param=""; [[ -n "$port_hopping" ]] && hop_param="&mport=${port_hopping}&ports=${port_hopping}"
             local cert_path="${SINGBOX_DIR}/${tag}.pem"
-            local pin_param=""
-            local cert_pcs=$(_cert_sha256_hex "$cert_path")
-            [ -n "$cert_pcs" ] && pin_param="&pinSHA256=${cert_pcs}"
-            url="hysteria2://${password}@${link_ip}:${port}?sni=${sni}&insecure=1${obfs_param}${hop_param}${pin_param}#$(_url_encode "$name")"
+            local insecure_param="" pin_param=""
+            if [ "$skip_verify" = "true" ]; then
+                insecure_param="&insecure=1"
+                local cert_pcs=$(_cert_sha256_hex "$cert_path")
+                [ -n "$cert_pcs" ] && pin_param="&pinSHA256=${cert_pcs}"
+            fi
+            url="hysteria2://${password}@${link_ip}:${port}?sni=${sni}${insecure_param}${obfs_param}${hop_param}${pin_param}#$(_url_encode "$name")"
             ;;
         "tuic")
-            # 参数: uuid, password, sni
-            local uuid="$1" password="$2" sni="${3:-$DEFAULT_SNI}"
-            url="tuic://${uuid}:${password}@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$name")"
+            # 参数: uuid, password, sni, skip_verify(可选)
+            local uuid="$1" password="$2" sni="${3:-$DEFAULT_SNI}" skip_verify="${4:-true}"
+            local insecure_param=""
+            [ "$skip_verify" = "true" ] && insecure_param="&allow_insecure=1"
+            url="tuic://${uuid}:${password}@${link_ip}:${port}?sni=${sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native${insecure_param}#$(_url_encode "$name")"
             ;;
         "anytls")
             # v2rayN 使用 sing-box 运行 AnyTLS；其 sing-box 出站不会应用链接中的 pcs。
@@ -4350,14 +5022,13 @@ _add_vless_ws_tls() {
     local key_path=""
     local skip_verify=false
 
-    # --- 步骤 5: 证书 (自动自签名, 不再询问) ---
-    # SX: 手动节点走直连, 证书固定自签名 + 链接内 pcs 指纹;
-    #     需要真证书 / 套 Cloudflare 请用 [2] 一键套CF (CF-A 全自动)。
-    cert_path="${SINGBOX_DIR}/${tag}.pem"
-    key_path="${SINGBOX_DIR}/${tag}.key"
-    skip_verify=true
-    _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-    _info "已自动生成自签名证书 (直连用, 链接内含 pcs 指纹)。"
+    # --- 步骤 5: 证书 (自签 / 已申请证书二选一) ---
+    # SX: 手动节点默认自签 + 链接内 pcs 指纹; 也可直接复用 [6] 申请的 Let's Encrypt 证书。
+    _node_cert_choose "$tag" "$camouflage_domain" || return 1
+    cert_path="$NODE_CERT_PATH"
+    key_path="$NODE_CERT_KEY_PATH"
+    camouflage_domain="$NODE_CERT_DOMAIN"
+    skip_verify="$NODE_CERT_SKIP_VERIFY"
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
@@ -4513,9 +5184,10 @@ _add_vless_grpc_tls() {
     else
         echo ""
         echo "请选择证书类型:"
-        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
-        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
-        read -p "请选择 [1-2] (默认: 1): " cert_choice
+        echo "  1) 自动生成自签名证书 (默认, 适合直连/跳过验证)"
+        echo "  2) 使用已申请证书 (Let's Encrypt, 自动续期)"
+        echo "  3) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
+        read -p "请选择 [1-3] (默认: 1): " cert_choice
         cert_choice=${cert_choice:-1}
     fi
 
@@ -4525,6 +5197,16 @@ _add_vless_grpc_tls() {
         _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
         skip_verify=true
         _info "已生成自签名证书，客户端将跳过证书验证。"
+    elif [ "$cert_choice" == "2" ]; then
+        if ! _cert_managed_select; then
+            _error "没有可用的已申请证书，请先在 [6] 一键申请证书。"
+            return 1
+        fi
+        cert_path="$_CERT_SEL_CERT"
+        key_path="$_CERT_SEL_KEY"
+        camouflage_domain="$_CERT_SEL_DOMAIN"
+        skip_verify=false
+        _success "使用已申请证书: ${camouflage_domain} (到期: $(_cert_not_after "$cert_path"))"
     else
         _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
         _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
@@ -4690,14 +5372,13 @@ _add_trojan_ws_tls() {
     local key_path=""
     local skip_verify=false
 
-    # --- 步骤 5: 证书 (自动自签名, 不再询问) ---
-    # SX: 手动节点走直连, 证书固定自签名 + 链接内 pcs 指纹;
-    #     需要真证书 / 套 Cloudflare 请用 [2] 一键套CF (CF-A 全自动)。
-    cert_path="${SINGBOX_DIR}/${tag}.pem"
-    key_path="${SINGBOX_DIR}/${tag}.key"
-    _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
-    skip_verify=true
-    _info "已自动生成自签名证书 (直连用, 链接内含 pcs 指纹)。"
+    # --- 步骤 5: 证书 (自签 / 已申请证书二选一) ---
+    # SX: 手动节点默认自签 + 链接内 pcs 指纹; 也可直接复用 [6] 申请的 Let's Encrypt 证书。
+    _node_cert_choose "$tag" "$camouflage_domain" || return 1
+    cert_path="$NODE_CERT_PATH"
+    key_path="$NODE_CERT_KEY_PATH"
+    camouflage_domain="$NODE_CERT_DOMAIN"
+    skip_verify="$NODE_CERT_SKIP_VERIFY"
     # [!] Trojan: 使用密码
     local password=""
     if [ "$BATCH_MODE" = "true" ]; then
@@ -4799,17 +5480,14 @@ _create_anytls_tls_node() {
     local password="$4"
     local name="$5"
 
-    # --- 步骤 4: 证书 (自动自签名, 不再询问) ---
-    # SX: 手动节点走直连, 证书固定自签名 + 链接内 pcs 指纹;
-    #     需要真证书 / 套 Cloudflare 请用 [2] 一键套CF (CF-A 全自动)。
-    local cert_path=""
-    local key_path=""
-    local skip_verify=true
+    # --- 步骤 4: 证书 (自签 / 已申请证书二选一) ---
+    # SX: 默认自签 + 链接内 pcs 指纹; 也可直接复用 [6] 申请的 Let's Encrypt 证书。
     local tag="anytls-in-${port}"
-    cert_path="${SINGBOX_DIR}/${tag}.pem"
-    key_path="${SINGBOX_DIR}/${tag}.key"
-    _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
-    _info "已自动生成自签名证书 (直连用, 链接内含 pcs 指纹)。"
+    _node_cert_choose "$tag" "$server_name" || return 1
+    local cert_path="$NODE_CERT_PATH"
+    local key_path="$NODE_CERT_KEY_PATH"
+    local skip_verify="$NODE_CERT_SKIP_VERIFY"
+    server_name="$NODE_CERT_DOMAIN"
     # IPv6 处理
     local yaml_ip="$node_ip"
     local link_ip="$node_ip"
@@ -5261,9 +5939,11 @@ _add_hysteria2() {
     fi
 
     local tag="hy2-in-${port}"
-    local cert_path="${SINGBOX_DIR}/${tag}.pem"
-    local key_path="${SINGBOX_DIR}/${tag}.key"
-    _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
+    _node_cert_choose "$tag" "$server_name" || return 1
+    local cert_path="$NODE_CERT_PATH"
+    local key_path="$NODE_CERT_KEY_PATH"
+    local skip_verify="$NODE_CERT_SKIP_VERIFY"
+    server_name="$NODE_CERT_DOMAIN"
 
     local password=""
     if [ "$BATCH_MODE" = "true" ]; then
@@ -5381,7 +6061,7 @@ _add_hysteria2() {
         clash_ports="$port_hopping"
     fi
     
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$client_port" --arg ports "$clash_ports" --arg pw "$password" --arg sn "$server_name" --arg up "$up" --arg down "$down" --arg op "$obfs_password" --arg hop "$port_hopping" \
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$client_port" --arg ports "$clash_ports" --arg pw "$password" --arg sn "$server_name" --arg up "$up" --arg down "$down" --arg op "$obfs_password" --arg hop "$port_hopping" --arg sv "$skip_verify" \
         '{
             "name": $n,
             "type": "hysteria2",
@@ -5389,7 +6069,7 @@ _add_hysteria2() {
             "port": ($p|tonumber),
             "password": $pw,
             "sni": $sn,
-            "skip-cert-verify": true,
+            "skip-cert-verify": ($sv == "true"),
             "alpn": ["h3"],
             "up": ($up|tonumber),
             "down": ($down|tonumber)
@@ -5403,7 +6083,7 @@ _add_hysteria2() {
         _info "端口跳跃范围: ${port_hopping}"
     fi
     
-    _show_node_link "hysteria2" "$name" "$link_ip" "$client_port" "$tag" "$password" "$server_name" "$obfs_password" "$port_hopping" || return 1
+    _show_node_link "hysteria2" "$name" "$link_ip" "$client_port" "$tag" "$password" "$server_name" "$obfs_password" "$port_hopping" "$skip_verify" || return 1
 }
 
 _add_tuic() {
@@ -5443,10 +6123,11 @@ _add_tuic() {
 
     local client_port="${link_port:-$port}"
     local tag="tuic-in-${port}"
-    local cert_path="${SINGBOX_DIR}/${tag}.pem"
-    local key_path="${SINGBOX_DIR}/${tag}.key"
-    
-    _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
+    _node_cert_choose "$tag" "$server_name" || return 1
+    local cert_path="$NODE_CERT_PATH"
+    local key_path="$NODE_CERT_KEY_PATH"
+    local skip_verify="$NODE_CERT_SKIP_VERIFY"
+    server_name="$NODE_CERT_DOMAIN"
 
     local uuid=$(${SINGBOX_BIN} generate uuid); local password=$(${SINGBOX_BIN} generate rand --hex 16)
     
@@ -5467,11 +6148,11 @@ _add_tuic() {
         '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
     
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$server_name" \
-        '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"udp-relay-mode":"native","congestion-controller":"bbr"}')
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$server_name" --arg sv "$skip_verify" \
+        '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":($sv == "true"),"alpn":["h3"],"udp-relay-mode":"native","congestion-controller":"bbr"}')
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
     _success "TUICv5 节点 [${name}] 添加成功!"
-    _show_node_link "tuic" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$password" "$server_name" || return 1
+    _show_node_link "tuic" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$password" "$server_name" "$skip_verify" || return 1
 }
 
 _generate_shadowsocks_password() {
@@ -6916,8 +7597,9 @@ _refresh_modified_node_artifacts() {
             down=$(jq -r --arg tag "$tag" '.[$tag].down // "100"' "$METADATA_FILE")
             cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
             key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
-            export NODE_PASSWORD="$password" NODE_SNI="$sni" NODE_OBFS="$obfs_password" NODE_HOP="$hop" NODE_UP="$up" NODE_DOWN="$down"
-            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.password = env(NODE_PASSWORD) | .sni = env(NODE_SNI) | .up = (env(NODE_UP) | tonumber) | .down = (env(NODE_DOWN) | tonumber))' || return 1
+            skip_verify=$(_get_proxy_field "$name" '.["skip-cert-verify"] // true')
+            export NODE_PASSWORD="$password" NODE_SNI="$sni" NODE_OBFS="$obfs_password" NODE_HOP="$hop" NODE_UP="$up" NODE_DOWN="$down" NODE_SKIP_VERIFY="$skip_verify"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.password = env(NODE_PASSWORD) | .sni = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true") | .up = (env(NODE_UP) | tonumber) | .down = (env(NODE_DOWN) | tonumber))' || return 1
             if [ -n "$obfs_password" ]; then
                 _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.obfs = "salamander" | ."obfs-password" = env(NODE_OBFS))' || return 1
             else
@@ -6928,7 +7610,7 @@ _refresh_modified_node_artifacts() {
             else
                 _atomic_modify_yaml "$CLASH_YAML_FILE" 'del(.proxies[] | select(.name == env(NEW_NAME)) | .ports)' || return 1
             fi
-            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$sni" "$obfs_password" "$hop" || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$password" "$sni" "$obfs_password" "$hop" "$skip_verify" || return 1
             ;;
         tuic)
             uuid=$(printf '%s' "$node" | jq -r '.users[0].uuid')
@@ -6937,9 +7619,10 @@ _refresh_modified_node_artifacts() {
             [ -n "$sni" ] || sni=$(_get_proxy_field "$name" '.sni // ""')
             cert_path=$(printf '%s' "$node" | jq -r '.tls.certificate_path // empty')
             key_path=$(printf '%s' "$node" | jq -r '.tls.key_path // empty')
-            export NODE_UUID="$uuid" NODE_PASSWORD="$password" NODE_SNI="$sni"
-            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .password = env(NODE_PASSWORD) | .sni = env(NODE_SNI))' || return 1
-            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$password" "$sni" || return 1
+            skip_verify=$(_get_proxy_field "$name" '.["skip-cert-verify"] // true')
+            export NODE_UUID="$uuid" NODE_PASSWORD="$password" NODE_SNI="$sni" NODE_SKIP_VERIFY="$skip_verify"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.uuid = env(NODE_UUID) | .password = env(NODE_PASSWORD) | .sni = env(NODE_SNI) | ."skip-cert-verify" = (env(NODE_SKIP_VERIFY) == "true"))' || return 1
+            _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$uuid" "$password" "$sni" "$skip_verify" || return 1
             ;;
         shadowsocks)
             method=$(printf '%s' "$node" | jq -r '.method')
@@ -6969,7 +7652,11 @@ _refresh_modified_node_artifacts() {
 
     if [ -n "${cert_path:-}" ] && [ -n "${key_path:-}" ]; then
         local cert_mode="custom" cert_sha
-        [[ "$cert_path" == "$SINGBOX_DIR/"* && "$key_path" == "$SINGBOX_DIR/"* ]] && cert_mode="self_signed"
+        if [[ "$cert_path" == "$CERT_STORE_DIR/"* && "$key_path" == "$CERT_STORE_DIR/"* ]]; then
+            cert_mode="managed"
+        elif [[ "$cert_path" == "$SINGBOX_DIR/"* && "$key_path" == "$SINGBOX_DIR/"* ]]; then
+            cert_mode="self_signed"
+        fi
         cert_sha=$(_cert_sha256_hex "$cert_path" 2>/dev/null || true)
         _atomic_modify_json "$METADATA_FILE" '.[$tag] += {serverName:$sni,certMode:$mode,certificatePath:$cert,keyPath:$key,certSha256:$sha,skipVerify:($skip == "true")}' \
             --arg tag "$tag" --arg sni "${sni:-}" --arg mode "$cert_mode" --arg cert "$cert_path" --arg key "$key_path" --arg sha "$cert_sha" --arg skip "${skip_verify:-false}" || return 1
@@ -7492,8 +8179,12 @@ _modify_port() (
                 _atomic_modify_json "$CONFIG_FILE" ".inbounds |= map(select(.tag | startswith(\"${new_tag}-hop-\") | not))" || return
             fi
             if [ -n "$final_hop_info" ]; then
-                local cert_path="${SINGBOX_DIR}/${final_tag}.pem"
-                local key_path="${SINGBOX_DIR}/${final_tag}.key"
+                # 证书路径必须沿用主节点 (可能是 [6] 申请的受管证书), 不能重新拼自签路径
+                local cert_path key_path
+                cert_path=$(jq -r --arg t "$final_tag" '.inbounds[] | select(.tag == $t) | .tls.certificate_path // empty' "$CONFIG_FILE")
+                key_path=$(jq -r --arg t "$final_tag" '.inbounds[] | select(.tag == $t) | .tls.key_path // empty' "$CONFIG_FILE")
+                [ -n "$cert_path" ] || cert_path="${SINGBOX_DIR}/${final_tag}.pem"
+                [ -n "$key_path" ] || key_path="${SINGBOX_DIR}/${final_tag}.key"
                 local hy2_password=$(jq -r --arg t "$final_tag" '.inbounds[] | select(.tag == $t) | .users[0].password // ""' "$CONFIG_FILE")
                 local hy2_obfs_password=$(jq -r --arg t "$final_tag" '.inbounds[] | select(.tag == $t) | .obfs.password // ""' "$CONFIG_FILE")
                 local batch_array="[]"
@@ -7928,11 +8619,19 @@ _modify_node() {
                     read -r -p "请输入新 SNI/证书域名 (当前: ${current}): " value
                     [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || { _error "域名/SNI 格式无效。"; return 1; }
                     echo "  1) 重新生成脚本管理的自签证书"
-                    echo "  2) 使用自定义证书和私钥"
-                    read -r -p "请选择证书方式 [1-2] (默认: 1): " cert_choice; cert_choice=${cert_choice:-1}
+                    echo "  2) 使用已申请证书 (Let's Encrypt, 自动续期)"
+                    echo "  3) 使用自定义证书和私钥"
+                    read -r -p "请选择证书方式 [1-3] (默认: 1): " cert_choice; cert_choice=${cert_choice:-1}
                     if [ "$cert_choice" = "1" ]; then
                         _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value" self_signed
                     elif [ "$cert_choice" = "2" ]; then
+                        if ! _cert_managed_select; then
+                            _error "没有可用的已申请证书，请先在 [6] 一键申请证书。"
+                            return 1
+                        fi
+                        value="$_CERT_SEL_DOMAIN"
+                        _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value" custom "$_CERT_SEL_CERT" "$_CERT_SEL_KEY" false
+                    elif [ "$cert_choice" = "3" ]; then
                         read -r -p "请输入证书完整路径: " cert_path
                         read -r -p "请输入私钥完整路径: " key_path
                         _validate_tls_key_pair "$cert_path" "$key_path" || return 1
@@ -9558,9 +10257,19 @@ _show_more_protocols_menu() {
         echo -e "  ${CYAN}【可选协议】${NC}"
         echo -e "    ${GREEN}[1]${NC} AnyTLS (Reality / TLS, 可同时建两个)"
         echo -e "    ${GREEN}[2]${NC} TUIC (需机器 UDP 可用)"
-        echo -e "    ${YELLOW}[3]${NC} VLESS + WS + TLS (自签证书)"
-        echo -e "    ${YELLOW}[4]${NC} Trojan + WS + TLS (自签证书)"
+        echo -e "    ${YELLOW}[3]${NC} VLESS + WS + TLS (自签 / 已申请证书)"
+        echo -e "    ${YELLOW}[4]${NC} Trojan + WS + TLS (自签 / 已申请证书)"
         echo -e "    ${YELLOW}[5]${NC} Shadowsocks-2022 (含 ShadowTLS v3)"
+        echo ""
+        echo -e "  ${CYAN}【证书】${NC}"
+        local cert_count="0"
+        cert_count=$(_cert_index_count 2>/dev/null || echo 0)
+        echo -e "    ${GREEN}[6]${NC} 一键申请证书 (Cloudflare 自动解析 + 自动续期)"
+        if [ "${cert_count:-0}" -gt 0 ] 2>/dev/null; then
+            echo -e "    ${GREEN}[7]${NC} 证书管理 (已申请 ${cert_count} 张, 创建节点时可选)"
+        else
+            echo -e "    ${GREEN}[7]${NC} 证书管理 (暂无已申请证书)"
+        fi
         echo ""
         echo -e "  ${YELLOW}提示: 直连首选还是 [1] VLESS + Reality (主菜单那个)。${NC}"
         echo -e "  ${YELLOW}     以上属于补充协议, 直连的隐蔽性都不如 Reality,${NC}"
@@ -9570,13 +10279,15 @@ _show_more_protocols_menu() {
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local c
-        read -p "  请输入选项 [0-5]: " c
+        read -p "  请输入选项 [0-7]: " c
         case $c in
             1) _run_main_create_transaction _add_anytls; _pause_back ;;
             2) _run_main_create_transaction _add_tuic; _pause_back ;;
             3) _run_main_create_transaction _add_vless_ws_tls; _pause_back ;;
             4) _run_main_create_transaction _add_trojan_ws_tls; _pause_back ;;
             5) _run_main_create_transaction _add_shadowsocks_menu; _pause_back ;;
+            6) _cert_apply; _pause_back ;;
+            7) _cert_menu ;;
             0) return ;;
             *) _error "无效输入，请重试。"; _pause_back ;;
         esac
