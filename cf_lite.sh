@@ -6,7 +6,8 @@
 # ┌─ 文件说明（配置地基）─────────────────────────────
 # │ cf_lite.sh = CF-A 子脚本：CF 云端资源 (DNS / Origin Rules / Origin 证书 / 凭据) + state + 链接快照
 # │ 地基：/etc/sing-box-cf-lite/{state.json, cf_account.json, origin.pem, origin.key, origin.csr}
-# │       cf_account.json 同时是 CF-A/CF-B 凭据互通的互读中枢
+# │ cf_account.json 同时是 CF-A/CF-B 凭据互通的互读中枢
+# │ 凭据生命周期: 删除节点只清节点 + 云端资源, cf_account.json 保留; 仅卸载脚本时删除
 # │ 节点本地落位 = gen_cfa_inbounds 产出 cfa-* 入站 → 主脚本 cfa-apply 并入主 config.json
 # │ （服务不再是独立 sing-box-cf；重启/状态 = 主 sing-box）
 # └───────────────────────────────────────────────
@@ -1142,8 +1143,10 @@ do_delete_node() {
     _delete_node_core "$state"
 
     remove_state
-    rm -f "$LAST_LINKS_PATH" "$CF_ACCOUNT_PATH" "$ORIGIN_CERT_PATH" "$ORIGIN_KEY_PATH" "$ORIGIN_CSR_PATH"
-    ok "已清理节点快照与 CF 凭据"
+    # SX: 不删 cf_account.json —— 删除节点只清节点与云端资源, CF 邮箱/API Key 留作复用;
+    #     只有 do_uninstall_script 才做全面清理
+    rm -f "$LAST_LINKS_PATH" "$ORIGIN_CERT_PATH" "$ORIGIN_KEY_PATH" "$ORIGIN_CSR_PATH"
+    ok "已清理节点快照 (CF 凭据已保留, 卸载脚本时才清理)"
     ok "节点已删除 (SSL 模式未改动)"
 }
 

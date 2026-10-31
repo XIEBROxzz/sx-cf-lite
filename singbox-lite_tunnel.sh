@@ -2743,7 +2743,9 @@ _uninstall_argo() {
 
     rm -f "$RUNTIME_DIR"/argo-*.pid /var/log/singbox_argo_*.log
     rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
-    rm -f "${CLOUDFLARED_BIN}" "${ARGO_METADATA_FILE}" "${CF_ACCOUNT_FILE}"
+    rm -f "${CLOUDFLARED_BIN}" "${ARGO_METADATA_FILE}"
+    # SX: cf_account.json 与 CF-A / [6] 证书流程共用, 不随 Argo 卸载删除;
+    #     删除节点只清节点与云端资源, 凭据仅在卸载脚本时全面清理
     rm -rf "/etc/cloudflared"
 
     _manage_service "restart"
