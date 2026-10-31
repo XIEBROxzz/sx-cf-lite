@@ -22,6 +22,11 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.67: 本机地址一览 + 节点地址探测偏好 —— 主菜单 / [14] DNS / [16] 头部显示
+#           本机 IPv4+IPv6 (读网卡全局地址, 瞬时, 内网地址标注 "(内网)");
+#           [16]→[B] 新增「入口: 节点地址探测」IPv4/IPv6 优先 (状态文件 node_ip_pref),
+#           解决「设了 v6 优先但创建节点默认 IP 仍是 v4」—— 节点地址来自 _get_public_ip
+#           的 curl 探测, 与 DNS 策略无关; 现在按该偏好先探测对应族, 失败回退另一族
 #     1.66: 中转 [R] 清空补一道保险 —— 删 <tag>.pem/.key 前先比对主配置 inbound tag,
 #           主/中转 tag 同构 (xxx-in-端口) 万一撞名也不会误删主节点证书
 #     1.65: 卸载补两处残留 —— acme.sh 安装时自带的续期 cron 行 (此前只删本脚本那条);
@@ -96,7 +101,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.66"
+export SCRIPT_VERSION="1.67"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -293,11 +298,71 @@ _ss_base64_encode() {
     printf '%s' "$1" | base64 | tr -d '\n\r ' | sed 's/=//g'
 }
 
-# 公网 IP 获取 (带全局缓存)
+# ── 本机地址 (读网卡全局地址, 瞬时完成, 绝不发网络请求) ──────────────
+# SX: 菜单每帧都会调用, 所以这里只用 `ip` 命令, 不走 curl
+_local_iface_addr() {
+    local fam="$1" addr=""
+    command -v ip >/dev/null 2>&1 || { printf ''; return; }
+    addr=$(ip -"$fam" -o addr show scope global 2>/dev/null \
+           | awk '{print $4}' | cut -d/ -f1 \
+           | grep -vE '^(fe80|fd[0-9a-fA-F]{2}:|fc[0-9a-fA-F]{2}:|::1$)' | head -n 1)
+    printf '%s' "$addr"
+}
+
+# SX: 内网地址标注 —— NAT 小鸡网卡上只有 10.x, 不标注会让人误以为公网 IP 变了
+_local_ip_is_private() {
+    case "$1" in
+        "") return 1 ;;
+        10.*|192.168.*|127.*) return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
+        fd*|fc*|fe80*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 输出一行: "IPv4 1.2.3.4   IPv6 2400:xxxx::1" —— 缺哪族显示「无」
+_local_ip_line() {
+    local v4 v6
+    v4=$(_local_iface_addr 4)
+    v6=$(_local_iface_addr 6)
+    if [ -n "$v4" ] && _local_ip_is_private "$v4"; then v4="${v4} (内网)"; fi
+    if [ -n "$v6" ] && _local_ip_is_private "$v6"; then v6="${v6} (内网)"; fi
+    printf 'IPv4 %s   IPv6 %s' "${v4:-无}" "${v6:-无}"
+}
+
+# ── 节点地址探测的地址族偏好 (入口地址) ────────────────────────
+# SX: 与 [16][B]「本机直连地址族」是两个方向 —— 那个管出站拨号用哪族,
+#     这个管「创建节点时默认填哪个地址」。状态文件由 advanced_relay.sh 的 [16][B] 写入
+_node_ip_pref_file() { printf '%s/node_ip_pref' "$SINGBOX_DIR"; }
+
+_node_ip_pref() {
+    local f v=""
+    f=$(_node_ip_pref_file)
+    [ -s "$f" ] && v=$(head -n 1 "$f" 2>/dev/null | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+    case "$v" in ipv6) printf 'ipv6' ;; *) printf 'ipv4' ;; esac
+}
+
+_probe_ip_family() {
+    local fam="$1" ip=""
+    ip=$(timeout 5 curl -fsS"$fam" --max-time 2 https://icanhazip.com 2>/dev/null)
+    [ -z "$ip" ] && ip=$(timeout 5 curl -fsS"$fam" --max-time 2 https://ipinfo.io/ip 2>/dev/null)
+    ip=$(printf '%s' "$ip" | tr -d '\r\n' | awk '{print $1}')
+    case "$fam" in
+        4) printf '%s' "$ip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' && printf '%s' "$ip" ;;
+        6) printf '%s' "$ip" | grep -qE '^[0-9a-fA-F:]+$'          && printf '%s' "$ip" ;;
+    esac
+    return 0
+}
+
+# 公网 IP 获取 (带全局缓存) —— 按节点地址偏好先试对应族, 拿不到再回退另一族
 _get_public_ip() {
     [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && { echo "$server_ip"; return; }
-    local ip=$(timeout 5 curl -fsS4 --max-time 2 https://icanhazip.com 2>/dev/null || timeout 5 curl -fsS4 --max-time 2 https://ipinfo.io/ip 2>/dev/null)
-    [ -z "$ip" ] && ip=$(timeout 5 curl -fsS6 --max-time 2 https://icanhazip.com 2>/dev/null || timeout 5 curl -fsS6 --max-time 2 https://ipinfo.io/ip 2>/dev/null)
+    local pref ip first second
+    pref=$(_node_ip_pref)
+    if [ "$pref" = "ipv6" ]; then first=6; second=4; else first=4; second=6; fi
+    ip=$(_probe_ip_family "$first")
+    [ -z "$ip" ] && ip=$(_probe_ip_family "$second")
     server_ip="$ip"
     echo "$ip"
 }
@@ -7553,6 +7618,8 @@ _dns_config_menu() {
         echo -e "${NC}"
         echo -e "  当前 DNS:  ${GREEN}${current_address}${NC}"
         echo -e "  当前策略:  ${GREEN}${current_strategy}${NC}"
+        echo -e "  本机 IP:   ${CYAN}$(_local_ip_line)${NC}"
+        echo -e "  ${YELLOW}↑ 全局兜底策略; 只让「直连」走某一族请用 [16] → [B] 本机直连地址族${NC}"
         echo ""
         echo -e "    ${GREEN}[1]${NC} 系统 DNS（local）"
         echo -e "    ${GREEN}[2]${NC} 阿里 DNS（DoH）"
@@ -7586,6 +7653,9 @@ _dns_config_menu() {
                 fi
                 ;;
             7)
+                echo ""
+                echo "    作用域: 全局 —— 影响所有域名解析, 含走落地/WARP 的流量"
+                echo "    只想让「直连」走某一族: 别在这里改, 用 [16] → [B] 本机直连地址族"
                 echo ""
                 echo "    1) prefer_ipv4（推荐，IPv4 优先）"
                 echo "    2) prefer_ipv6（IPv6 优先）"
@@ -9437,6 +9507,8 @@ _main_menu() {
         
         echo -e "  系统: ${CYAN}${os_info}${NC}  |  模式: ${CYAN}${INIT_SYSTEM}${NC}"
         echo -e "  Sing-box${CYAN}${sb_version}${NC}: ${service_status}  |  Argo: ${argo_status}${cfa_status}"
+        # SX: 本机地址一览 (读网卡, 瞬时; 双栈有则都显示)
+        echo -e "  本机 IP: ${CYAN}$(_local_ip_line)${NC}"
         echo ""
         
         # 节点管理

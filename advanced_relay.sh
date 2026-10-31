@@ -5113,6 +5113,61 @@ _direct_fam_state() {
         "$MAIN_CONFIG_FILE" 2>/dev/null
 }
 
+# ============================================================
+# SX: 节点地址探测偏好 (入口地址) —— 与上面的直连地址族是两个方向
+#     直连地址族 = 出站拨号用哪一族; 这个 = 创建节点时默认填哪个地址
+#     状态文件 /usr/local/etc/sing-box/node_ip_pref, 由 singbox.sh 的 _get_public_ip 读取
+#     默认 ipv4, 保持历史行为 (先 curl -4, 失败才 -6)
+# ============================================================
+_node_ip_pref_file() { printf '%s/node_ip_pref' "${SINGBOX_DIR}"; }
+
+_node_ip_pref_get() {
+    local f v=""
+    f=$(_node_ip_pref_file)
+    [ -s "$f" ] && v=$(head -n 1 "$f" 2>/dev/null | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+    case "$v" in ipv6) printf 'ipv6' ;; *) printf 'ipv4' ;; esac
+}
+
+_node_ip_pref_set() {
+    local v="$1" f
+    case "$v" in ipv4|ipv6) ;; *) return 1 ;; esac
+    f=$(_node_ip_pref_file)
+    mkdir -p "${SINGBOX_DIR}" 2>/dev/null
+    printf '%s\n' "$v" > "$f" 2>/dev/null || return 1
+    chmod 600 "$f" 2>/dev/null || true
+    return 0
+}
+
+# SX: 本机地址一览 (读网卡, 瞬时; 双栈有则都显示) —— 与 singbox.sh 同名函数保持一致
+_local_iface_addr() {
+    local fam="$1" addr=""
+    command -v ip >/dev/null 2>&1 || { printf ''; return; }
+    addr=$(ip -"$fam" -o addr show scope global 2>/dev/null \
+           | awk '{print $4}' | cut -d/ -f1 \
+           | grep -vE '^(fe80|fd[0-9a-fA-F]{2}:|fc[0-9a-fA-F]{2}:|::1$)' | head -n 1)
+    printf '%s' "$addr"
+}
+
+_local_ip_is_private() {
+    case "$1" in
+        "") return 1 ;;
+        10.*|192.168.*|127.*) return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
+        fd*|fc*|fe80*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_local_ip_line() {
+    local v4 v6
+    v4=$(_local_iface_addr 4)
+    v6=$(_local_iface_addr 6)
+    if [ -n "$v4" ] && _local_ip_is_private "$v4"; then v4="${v4} (内网)"; fi
+    if [ -n "$v6" ] && _local_ip_is_private "$v6"; then v6="${v6} (内网)"; fi
+    printf 'IPv4 %s   IPv6 %s' "${v4:-无}" "${v6:-无}"
+}
+
 _direct_fam_apply() {
     local ds="$1"
     [ -s "$MAIN_CONFIG_FILE" ] || { _error "主配置不存在: $MAIN_CONFIG_FILE"; _pause_anykey; return 1; }
@@ -5164,7 +5219,7 @@ _direct_fam_apply() {
 _direct_fam_menu() {
     while true; do
         clear
-        local st disp
+        local st disp npref ndisp
         st=$(_direct_fam_state)
         case "$st" in
             "")          disp="${GREEN}双栈默认${NC} (推荐)" ;;
@@ -5174,10 +5229,16 @@ _direct_fam_menu() {
             ipv6_only)   disp="${YELLOW}仅 IPv6${NC}" ;;
             *)           disp="${YELLOW}${st}${NC}" ;;
         esac
-        echo -e "\n  ${CYAN}==== 本机直连 地址族 (IPv4 / IPv6) ====${NC}"
-        echo -e "  当前: ${disp}"
-        echo -e "  ${YELLOW}作用: 只影响「直连」流量(未命中规则/规则指向 direct 的), 不影响落地与节点。${NC}"
-        echo -e "  ${YELLOW}用途: v4 段被 Google 判中国区(送中)、v6 段干净时, 让直连走 IPv6。${NC}"
+        npref=$(_node_ip_pref_get)
+        if [ "$npref" = "ipv6" ]; then ndisp="${GREEN}IPv6 优先${NC}"; else ndisp="${GREEN}IPv4 优先${NC} (默认)"; fi
+        echo -e "\n  ${CYAN}==== 本机地址族 (入口 / 出站) ====${NC}"
+        echo -e "  本机 IP: ${CYAN}$(_local_ip_line)${NC}"
+        echo -e "  ${CYAN}【出站】${NC} 直连拨号:     ${disp}"
+        echo -e "  ${CYAN}【入口】${NC} 节点地址探测: ${ndisp}"
+        echo -e "  ${YELLOW}两者独立: 入口决定客户端连哪个地址, 出站决定 sing-box 用哪族去连目标。${NC}"
+        echo ""
+        echo -e "  ${CYAN}── 出站: 直连拨号 ──${NC} ${YELLOW}(只影响「直连」流量, 不影响落地与节点)${NC}"
+        echo -e "  用途: v4 段被 Google 判中国区(送中)、v6 段干净时, 让直连走 IPv6。"
         echo -e "  ${RED}风险: 选「仅 IPv6」时, 只有 A 记录的站点会全部打不开。${NC}"
         echo ""
         echo -e "    ${GREEN}[1]${NC} 双栈默认 (清除设置, 推荐)"
@@ -5185,10 +5246,17 @@ _direct_fam_menu() {
         echo -e "    ${GREEN}[3]${NC} 优先 IPv6  (prefer_ipv6)"
         echo -e "    ${GREEN}[4]${NC} 仅 IPv4    (ipv4_only)"
         echo -e "    ${GREEN}[5]${NC} 仅 IPv6    (ipv6_only)"
+        echo ""
+        echo -e "  ${CYAN}── 入口: 创建节点时的「默认 IP」 ──${NC} ${YELLOW}(v4 被墙 / v6 干净时改这里)${NC}"
+        echo -e "  ${YELLOW}只改探测顺序, 不动 sing-box 配置; 拿不到首选族时自动回退另一族。${NC}"
+        echo ""
+        echo -e "    ${GREEN}[6]${NC} IPv4 优先 (默认, 与历史行为一致)"
+        echo -e "    ${GREEN}[7]${NC} IPv6 优先"
+        echo ""
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local c
-        read -p "  请选择 [0-5]: " c
+        read -p "  请选择 [0-7]: " c
         case "$c" in
             1) _direct_fam_apply "" ;;
             2) _direct_fam_apply prefer_ipv4 ;;
@@ -5197,6 +5265,20 @@ _direct_fam_menu() {
                [[ "$_y" =~ ^[Yy]$ ]] && _direct_fam_apply ipv4_only ;;
             5) local _y2; _warn "「仅 IPv6」会让只有 A 记录的站点全部打不开, 确认?"; read -p "  (y/N): " _y2
                [[ "$_y2" =~ ^[Yy]$ ]] && _direct_fam_apply ipv6_only ;;
+            6|7)
+               local _pfx="ipv4"
+               [ "$c" = "7" ] && _pfx="ipv6"
+               if _node_ip_pref_set "$_pfx"; then
+                   if [ "$_pfx" = "ipv6" ]; then
+                       _success "节点地址探测已设为「IPv6 优先」"
+                   else
+                       _success "节点地址探测已设为「IPv4 优先」"
+                   fi
+                   _info "只影响之后新创建的节点; 本次已缓存的地址需重开脚本生效。"
+               else
+                   _error "写入 ${SINGBOX_DIR}/node_ip_pref 失败"
+               fi
+               _pause_anykey ;;
             0|"") return 0 ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
@@ -5397,6 +5479,7 @@ _menu() {
 
         echo -e "  系统版本: ${CYAN}${os_info}${NC}"
         echo -e "  中转服务: ${service_status} (${service_name})"
+        echo -e "  本机 IP: ${CYAN}$(_local_ip_line)${NC}"
         echo ""
         echo -e "  ${CYAN}【基础配置】${NC}"
         echo -e "    ${GREEN}[1]${NC} 落地机：生成全协议 Token"
@@ -5425,6 +5508,11 @@ _menu() {
             *)           _df_disp="${YELLOW}${_df_st}${NC}" ;;
         esac
         echo -e "    ${GREEN}[B]${NC} 本机直连地址族: ${_df_disp}   ${YELLOW}(v4 送中时改走 v6)${NC}"
+        # SX: 入口地址探测偏好 —— 与 [B] 的直连地址族是两个方向, 这里只汇总一行
+        local _np_st _np_disp
+        _np_st=$(_node_ip_pref_get)
+        if [ "$_np_st" = "ipv6" ]; then _np_disp="${GREEN}节点地址=IPv6 优先${NC}"; else _np_disp="${GREEN}节点地址=IPv4 优先${NC}"; fi
+        echo -e "        入口地址探测: ${_np_disp}   ${YELLOW}(创建节点时默认填哪个 IP)${NC}"
         echo -e "    ${GREEN}[T]${NC} 中转排障 (UDP 转发 / 落地地址族)"
         # SX: 排障类开关 (U/V) 收进 [T], 这里只汇总一行状态 (与 [T] 的文字对齐)
         local _udp_st _udp_disp _ipf_st _ipf_disp _tsum
