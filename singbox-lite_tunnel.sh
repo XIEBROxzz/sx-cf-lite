@@ -1812,7 +1812,7 @@ _add_argo_node() {
             pref_domain="${pref_domain#.}"
             pref_domain="${pref_domain%.}"
             if [[ ! "$pref_domain" =~ ^[a-z0-9][a-z0-9.-]*\.[a-z]+$ ]] || [[ ! "$pref_domain" =~ ^([^.]+\.){2,}[^.]+$ ]]; then
-                _warning "域名格式无效: ${pref_domain} (如: sd.ys859696655.ccwu.cc)"
+                _warning "域名格式无效: ${pref_domain:-空} (需形如 abc.example.com)"
                 continue
             fi
             if [ -z "$pref_domain" ]; then

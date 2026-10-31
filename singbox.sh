@@ -5296,7 +5296,7 @@ _add_vless_ws_tls() {
         fi
 
         _info "伪装域名 (SNI): 直接回车用默认 ${DEFAULT_SNI}, 也可输入你自己的域名。"
-        _info " (例如: xxx.741865.xyz)"
+        _info " (例如: xxx.example.com)"
         read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
         camouflage_domain=${camouflage_domain:-$DEFAULT_SNI}
 
@@ -5458,7 +5458,7 @@ _add_vless_grpc_tls() {
         fi
 
         _info "伪装域名 (SNI): 直接回车用默认 ${DEFAULT_SNI}, 也可输入你自己的域名。"
-        _info " (例如: xxx.741865.xyz)"
+        _info " (例如: xxx.example.com)"
         read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
         camouflage_domain=${camouflage_domain:-$DEFAULT_SNI}
 
