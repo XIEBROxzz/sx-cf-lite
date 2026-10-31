@@ -22,6 +22,11 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.62: AnyTLS 协议选择文案去掉 "可用但特征弱" 的误导性评价, 改为 "自签证书 / 已申请证书"
+#           (该协议并不弱, 且本来就支持复用 [6] 申请的证书)
+#     1.61: 一键申请证书的邮箱提示改为 "Cloudflare 邮箱 (账号邮箱)" (本就是 CF 账号邮箱, 兼作
+#           Let's Encrypt 通知); 与 CF-A/CF-B 双向打通 —— 已存 cf_account.json 时默认复用邮箱 +
+#           Global API Key (选项 3); 手动输入的 Global API Key 验签通过后回写凭据文件 (仅同邮箱)
 #     1.60: 更多协议新增 [6] 一键申请证书 (Cloudflare 自动解析 + acme.sh DNS-01 + 自动续期)
 #           + [7] 证书管理; 创建需要证书的节点可选「使用已申请证书和域名」
 #     1.59: SNI 预设列表按实测总延迟升序编号 (失败排最后), 带延迟缓存与 [22] 重新实测
@@ -80,7 +85,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.60"
+export SCRIPT_VERSION="1.62"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4122,6 +4127,68 @@ _cert_normalize_domain() {
     printf '%s' "$d"
 }
 
+_cert_valid_email() {
+    [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]
+}
+
+# SX: 读取 CF-A (cf_lite) / CF-B (tunnel) 已保存的凭据 —— 输出 "邮箱<TAB>Global API Key"
+# 三处文件与两个 CF 子脚本的互读路径保持一致, 邮箱和 Key 必须取自同一个文件
+_cert_cf_saved_cred() {
+    local f email="" key=""
+    for f in "/etc/sing-box-cf-lite/cf_account.json" \
+             "${SINGBOX_DIR}/cf_account.json" \
+             "/etc/xray-cf-lite/cf_account.json"; do
+        [ -s "$f" ] || continue
+        email=$(jq -r '.email // ""' "$f" 2>/dev/null | head -n1)
+        key=$(jq -r '.api_key // ""' "$f" 2>/dev/null | head -n1)
+        if _cert_valid_email "$email" && [ -n "$key" ]; then
+            printf '%s\t%s' "$email" "$key"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# SX: 反向同步 —— 证书流程输入的 Global API Key 回写 CF-A/CF-B 的凭据文件, 三处一次输入互通
+# 安全约束: 只更新邮箱一致的已有文件 (刷新 Key), 邮箱不同则不动, 避免把别的账号的 Key 写进去
+_cert_cf_persist_key() {
+    local email="$1" key="$2" f fe tmp created=0 updated=0
+    for f in "/etc/sing-box-cf-lite/cf_account.json" "${SINGBOX_DIR}/cf_account.json"; do
+        [ -s "$f" ] || continue
+        fe=$(jq -r '.email // ""' "$f" 2>/dev/null | head -n1)
+        if [ "$fe" != "$email" ]; then
+            _warn "已存在 ${f} (账号 ${fe:-未知}), 与本次邮箱不同, 未覆盖。" >&2
+            continue
+        fi
+        tmp="${f}.tmp.$$"
+        if jq --arg k "$key" '.api_key = $k' "$f" > "$tmp" 2>/dev/null; then
+            chmod 600 "$tmp" 2>/dev/null || true
+            if mv -f "$tmp" "$f" 2>/dev/null; then
+                updated=$((updated + 1))
+            else
+                rm -f "$tmp" 2>/dev/null
+            fi
+        else
+            rm -f "$tmp" 2>/dev/null
+        fi
+    done
+    # 两处都还没有凭据文件时, 落到 CF-A 的规范路径 (CF-B 会自动跨脚本读取)
+    if [ "$updated" -eq 0 ] \
+        && [ ! -s "/etc/sing-box-cf-lite/cf_account.json" ] \
+        && [ ! -s "${SINGBOX_DIR}/cf_account.json" ]; then
+        mkdir -p "/etc/sing-box-cf-lite" 2>/dev/null && chmod 700 "/etc/sing-box-cf-lite" 2>/dev/null || true
+        tmp=$(mktemp) || return 1
+        if jq -n --arg e "$email" --arg k "$key" '{email:$e,api_key:$k}' > "$tmp" 2>/dev/null \
+            && chmod 600 "$tmp" 2>/dev/null \
+            && mv -f "$tmp" "/etc/sing-box-cf-lite/cf_account.json" 2>/dev/null; then
+            created=1
+        else
+            rm -f "$tmp" 2>/dev/null
+        fi
+    fi
+    [ $((updated + created)) -gt 0 ]
+}
+
 _cert_valid_ip() {
     local ip="$1" o
     if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -4377,45 +4444,80 @@ _cert_apply() {
     echo ""
     echo -e "  ${YELLOW}Cloudflare API Token 权限: Zone:Zone:Read + Zone:DNS:Edit${NC}"
     echo -e "  ${YELLOW}为避免源站证书被 CF 代理掩盖, 解析默认关闭小黄云 (DNS only)。${NC}"
+    echo -e "  ${YELLOW}邮箱填 Cloudflare 账号邮箱 (同一邮箱兼作 Let's Encrypt 通知)。${NC}"
     echo ""
 
-    local email=""
+    # SX: 邮箱/凭据与 CF-A (cf_lite) / CF-B (tunnel) 互通 —— 存过就直接复用, 不再重复输入
+    local email="" saved_email="" saved_key="" cred="" auth_choice="" secret="" max_choice=2 default_choice=1
+    _CERT_CF_EMAIL=""
+    cred=$(_cert_cf_saved_cred 2>/dev/null) || cred=""
+    if [ -n "$cred" ]; then
+        saved_email="${cred%%$'\t'*}"
+        saved_key="${cred#*$'\t'}"
+    fi
+
     while true; do
-        read -r -p "  邮箱 (Let's Encrypt 通知用): " email
-        if [[ "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
-            break
+        if [ -n "$saved_email" ]; then
+            read -r -p "  Cloudflare 邮箱 (账号邮箱, 默认: ${saved_email}): " email
+            email="${email:-$saved_email}"
+        else
+            read -r -p "  Cloudflare 邮箱 (账号邮箱): " email
         fi
+        _cert_valid_email "$email" && break
         _error "邮箱格式无效。"
     done
+    _CERT_CF_EMAIL="$email"
 
-    local auth_choice="1" secret=""
     echo ""
     echo "  Cloudflare 凭据类型:"
     echo "    1) API Token (推荐)"
-    echo "    2) Global API Key + 邮箱"
-    read -r -p "  请选择 [1-2] (默认: 1): " auth_choice
-    auth_choice=${auth_choice:-1}
-    if [ "$auth_choice" = "2" ]; then
+    echo "    2) Global API Key"
+    if [ -n "$saved_key" ]; then
+        max_choice=3
+        default_choice=3
+        echo "    3) 复用已保存的凭据 (${saved_email}, 来自 CF-A/CF-B)"
+    fi
+    read -r -p "  请选择 [1-${max_choice}] (默认: ${default_choice}): " auth_choice
+    auth_choice=${auth_choice:-$default_choice}
+    case "$auth_choice" in
+        1|2) ;;
+        3) [ -n "$saved_key" ] || auth_choice=1 ;;
+        *) auth_choice="$default_choice" ;;
+    esac
+
+    if [ "$auth_choice" = "3" ]; then
         _CERT_CF_AUTH_TYPE="key"
-        read -r -s -p "  Global API Key: " secret; echo ""
-        _CERT_CF_KEY="$secret"
+        _CERT_CF_KEY="$saved_key"
         _CERT_CF_EMAIL="$email"
-    else
-        _CERT_CF_AUTH_TYPE="token"
-        read -r -s -p "  API Token: " secret; echo ""
-        _CERT_CF_TOKEN="$secret"
-        _CERT_CF_EMAIL="$email"
+        _info "正在校验已保存的 Cloudflare 凭据..."
+        if _cert_cf_verify; then
+            _success "已复用已保存的 Cloudflare 凭据 (${email})"
+        else
+            _warn "已保存的凭据校验失败 (Key 可能已更换或权限不足), 请手动输入。"
+            auth_choice="1"
+        fi
     fi
-    if [ -z "$secret" ]; then
-        _error "凭据不能为空。"
-        return 1
-    fi
-    # 去掉复制时可能带入的空白/换行
-    secret=$(printf '%s' "$secret" | tr -d '[:space:]')
-    if [ "$_CERT_CF_AUTH_TYPE" = "token" ]; then
-        _CERT_CF_TOKEN="$secret"
-    else
-        _CERT_CF_KEY="$secret"
+
+    if [ "$auth_choice" != "3" ]; then
+        if [ "$auth_choice" = "2" ]; then
+            _CERT_CF_AUTH_TYPE="key"
+            read -r -s -p "  Global API Key: " secret; echo ""
+        else
+            _CERT_CF_AUTH_TYPE="token"
+            read -r -s -p "  API Token: " secret; echo ""
+        fi
+
+        if [ -z "$secret" ]; then
+            _error "凭据不能为空。"
+            return 1
+        fi
+        # 去掉复制时可能带入的空白/换行
+        secret=$(printf '%s' "$secret" | tr -d '[:space:]')
+        if [ "$_CERT_CF_AUTH_TYPE" = "token" ]; then
+            _CERT_CF_TOKEN="$secret"
+        else
+            _CERT_CF_KEY="$secret"
+        fi
     fi
 
     local domain=""
@@ -4441,6 +4543,12 @@ _cert_apply() {
         _error "Cloudflare 凭据无效或权限不足 (需要 Zone:Zone:Read + Zone:DNS:Edit)。"
         return 1
     fi
+
+    # SX: Global API Key 模式 —— 回写 CF-A/CF-B 凭据文件, 套 CF / Argo 隧道无需再输入
+    if [ "$_CERT_CF_AUTH_TYPE" = "key" ] && _cert_cf_persist_key "$email" "$_CERT_CF_KEY"; then
+        _info "该凭据已同步到 CF-A/CF-B (cf_account.json), 后续套 CF / Argo 隧道可直接复用"
+    fi
+
     _info "正在匹配 Cloudflare Zone..."
     local zinfo zone_id="" zone_name=""
     if ! zinfo=$(_cert_cf_find_zone "$domain"); then
@@ -4454,6 +4562,7 @@ _cert_apply() {
     echo ""
     echo "  域名:     ${domain}"
     echo "  解析:     ${domain} -> ${ip} (DNS only)"
+    echo "  邮箱:     ${email} (Cloudflare 账号)"
     echo "  证书:     Let's Encrypt (acme.sh DNS-01, RSA 2048)"
     echo "  自动续期: 每天 03:17 检查"
     echo ""
@@ -5641,7 +5750,7 @@ _add_anytls() {
         _info "--- 添加 AnyTLS / Any-Reality 节点 ---"
         echo "请选择节点协议:"
         echo "  1) Any-Reality   ← 默认, 推荐 (抗 TLS-in-TLS 指纹)"
-        echo "  2) AnyTLS (自签证书, 可用但特征弱)"
+        echo "  2) AnyTLS (自签证书 / 已申请证书)"
         echo "  3) 同时创建 AnyTLS + Any-Reality"
         read -p "请选择 [1-3] (默认: 1=Any-Reality): " _mode_sel
         _mode_sel=${_mode_sel:-1}

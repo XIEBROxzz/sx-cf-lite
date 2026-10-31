@@ -1,6 +1,6 @@
 # SX-CF-lite
 
-sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.60**
+sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.62**
 
 > 基于 [0xdabiaoge/singbox-lite](https://github.com/0xdabiaoge/singbox-lite) 地基 + Joey [xray-cf-lite](https://github.com/byJoey/xray-cf-lite) 的 CF 套皮整合魔改。
 
@@ -22,20 +22,30 @@ bash <(curl -fsSL https://raw.githubusercontent.com/XIEBROxzz/sx-cf-lite/main/in
 
 需要域名已经托管在 Cloudflare。脚本用 `acme.sh` + Cloudflare DNS-01 申请 Let's Encrypt 证书，自动加解析、下载到本地并每天自动续期。
 
-**准备 Cloudflare 凭据（二选一）**
+**准备 Cloudflare 凭据（三选一）**
 
+- **复用已保存凭据**：CF-A（`[3]` 套 CF）或 CF-B（`[4]` Argo 隧道）输入过 Global API Key 后，这里直接选 `[3]`，邮箱和 Key 都不用再敲
 - **API Token（推荐）**：权限 `Zone:Zone:Read` + `Zone:DNS:Edit`
-- **Global API Key**：填 Key 即可（邮箱沿用申请时输入的邮箱）
+- **Global API Key**：填 Key 即可（邮箱沿用上面输入的邮箱）
 
 **操作流程**
 
 1. 主菜单 → `[4] 更多协议` → `[6] 一键申请证书`
-2. 输入邮箱、Cloudflare 凭据、子域名（如 `node.example.com`）
+2. 输入 Cloudflare 邮箱、凭据与子域名（如 `node.example.com`）
 3. 脚本自动写入 A/AAAA 解析（强制 **DNS only**，关闭小黄云，避免源站证书被 CF 代理掩盖）
 4. 通过 DNS-01 申请证书并下载到本地：
    - `/usr/local/etc/sing-box/certs/<域名>.pem`
    - `/usr/local/etc/sing-box/certs/<域名>.key`
 5. 自动启用续期：每天 03:17 执行 `acme.sh --cron`，续期后由 `cert-reload.sh` 重启 sing-box
+
+> **这个邮箱就是 Cloudflare 账号邮箱**（同一邮箱兼作 Let's Encrypt 通知），提示里已明确标注，不再写成容易误解的「Let's Encrypt 通知用」。
+
+> **三处凭据双向互通**：CF-A 存 `/etc/sing-box-cf-lite/cf_account.json`，CF-B 存 `/usr/local/etc/sing-box/cf_account.json`（旧版 `/etc/xray-cf-lite/`），字段一致（`email` + `api_key`）。CF-A 与 CF-B 本来就双向互读；证书流程也接入了同一批文件：
+>
+> - **读**：任一处存过 Global API Key，证书里选 `[3]` 直接复用，邮箱也会带出默认值；
+> - **写**：证书里手动输入的 Global API Key 验签通过后回写两处 `cf_account.json`（保留 `account_id` 等字段），之后套 CF / Argo 隧道不用再输入。
+>
+> 回写有账号隔离：目标文件的 `email` 与本次输入不一致时**不覆盖**，只提示跳过，避免把另一个 CF 账号的 Key 写进去。API Token 不回写（`cf_account.json` 只存 Global API Key）。
 
 **创建节点时使用已申请证书**
 
