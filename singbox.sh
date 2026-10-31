@@ -22,6 +22,9 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.65: 卸载补两处残留 —— acme.sh 安装时自带的续期 cron 行 (此前只删本脚本那条);
+#           ~/.acme.sh/account.conf 里明文保存的 SAVED_CF_Token/Key/Email 一并抹除;
+#           无证书索引时也照样清 cron 与凭据残留
 #     1.64: 删节点不再清理 CF 凭据 —— CF-A (cf_lite.sh do_delete_node) 删节点时保留
 #           cf_account.json; CF-B (Argo 卸载) 也不再删共用的凭据文件。邮箱/API Key 只在
 #           卸载脚本时清理, 删节点只清节点本身 + 云端资源
@@ -91,7 +94,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.64"
+export SCRIPT_VERSION="1.65"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4845,20 +4848,37 @@ _cert_cloud_cleanup_for_uninstall() {
 }
 
 _cert_cleanup_for_uninstall() {
-    local acme domain cert key email
-    [ -s "$CERT_INDEX_FILE" ] || return 0
+    local acme domain cert key email acc_conf
     # 先删云端解析 (需要索引里的 zone_id/record_id), 再清本地文件与 acme.sh 记录
-    _cert_cloud_cleanup_for_uninstall 2>/dev/null || true
-    acme="$(_cert_acme_bin)"
-    while IFS=$'\t' read -r domain cert key email; do
-        [ -n "$domain" ] || continue
-        if [ -x "$acme" ]; then
-            "$acme" --remove -d "$domain" >/dev/null 2>&1 || true
-        fi
-        rm -rf "${ACME_HOME:?}/${domain}" "${ACME_HOME:?}/${domain}_ecc" 2>/dev/null || true
-    done < <(_cert_list_index)
+    if [ -s "$CERT_INDEX_FILE" ]; then
+        _cert_cloud_cleanup_for_uninstall 2>/dev/null || true
+        acme="$(_cert_acme_bin)"
+        while IFS=$'\t' read -r domain cert key email; do
+            [ -n "$domain" ] || continue
+            if [ -x "$acme" ]; then
+                "$acme" --remove -d "$domain" >/dev/null 2>&1 || true
+            fi
+            rm -rf "${ACME_HOME:?}/${domain}" "${ACME_HOME:?}/${domain}_ecc" 2>/dev/null || true
+        done < <(_cert_list_index)
+    fi
+    # 续期 cron: 本脚本添加的那条 + acme.sh 安装时自带的 --cron 行, 一并清掉
     if command -v crontab >/dev/null 2>&1; then
-        crontab -l 2>/dev/null | grep -vF '# sx-cf-lite acme renew' | crontab - 2>/dev/null || true
+        crontab -l 2>/dev/null \
+            | grep -vF '# sx-cf-lite acme renew' \
+            | grep -vE 'acme\.sh.*--cron' \
+            | crontab - 2>/dev/null || true
+    fi
+    # acme.sh 会把 CF 凭据明文写进 account.conf (SAVED_CF_Token/Key/Email), 卸载时抹掉
+    acc_conf="${ACME_HOME}/account.conf"
+    if [ -f "$acc_conf" ] && grep -qE '^SAVED_CF_' "$acc_conf" 2>/dev/null; then
+        if grep -vE '^SAVED_CF_' "$acc_conf" > "${acc_conf}.sxclean" 2>/dev/null; then
+            chmod 600 "${acc_conf}.sxclean" 2>/dev/null || true
+            if mv -f "${acc_conf}.sxclean" "$acc_conf" 2>/dev/null; then
+                _info "已抹除 acme.sh account.conf 中保存的 Cloudflare 凭据。"
+            else
+                rm -f "${acc_conf}.sxclean" 2>/dev/null
+            fi
+        fi
     fi
     _info "已清理受管证书的 acme.sh 续期任务与本地证书文件。"
 }
