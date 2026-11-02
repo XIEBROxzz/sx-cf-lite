@@ -22,6 +22,10 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.70: 协议菜单去重与措辞校正 —— [4] 更多协议的【证书】栏与 [1] 重复, 删掉只留一行指路
+#           (编号回到 [0-5]); 各协议标注「免证书 / 需证书」, 并修正「都不如 Reality」与
+#           Any-Reality 自相矛盾的提示; 选「已申请证书」时会明确告知 SNI 被证书域名替换
+#           (此前伪装域名白填一句解释都没有); 过时的「[6] 一键申请」路径统一改为 [1]→[7]
 #     1.69: 添加节点菜单 (sx→[1]) 直接给出证书入口 —— 新增 [7] 一键申请证书 / [8] 证书管理
 #           (原来只在 [4] 更多协议里, 建 HY2/TUIC 时看不到「暂无证书」, 容易以为只能用自签);
 #           [2] Hysteria2 标注「需 UDP 可用」(HY2 是 QUIC over UDP, 与 TUIC 同理);
@@ -110,7 +114,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.69"
+export SCRIPT_VERSION="1.70"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4800,7 +4804,7 @@ _batch_cert_choose() {
             _warn "未选择已申请证书, 本次改用自签。"
         fi
     else
-        _info "未检测到已申请证书 (可先在 [4]→[6] 申请), 本次批量使用自签证书。"
+        _info "未检测到已申请证书 (可先到 [1]→[7] 申请), 本次批量使用自签证书。"
     fi
     return 0
 }
@@ -4845,12 +4849,16 @@ _node_cert_choose() {
                 NODE_CERT_SKIP_VERIFY="false"
                 NODE_CERT_SOURCE="managed"
                 _success "使用已申请证书: ${NODE_CERT_DOMAIN} (到期: $(_cert_not_after "$NODE_CERT_PATH"))"
+                # SX: 前面填的伪装域名会被证书域名顶掉, 明说一句, 免得以为白填了
+                if [ -n "$default_domain" ] && [ "$default_domain" != "$NODE_CERT_DOMAIN" ]; then
+                    _info "SNI 已改为证书域名 ${NODE_CERT_DOMAIN} (刚才填的 ${default_domain} 不再使用)"
+                fi
                 return 0
             fi
             _warn "未选择已申请证书，改用自动自签。"
         fi
     else
-        _info "未检测到已申请证书 (可先用 [6] 一键申请)，本次自动生成自签证书。"
+        _info "未检测到已申请证书 (可先到 [1]→[7] 申请)，本次自动生成自签证书。"
     fi
 
     _generate_self_signed_cert "$default_domain" "$NODE_CERT_PATH" "$NODE_CERT_KEY_PATH" || return 1
@@ -5348,7 +5356,7 @@ _add_vless_ws_tls() {
 
         _info "伪装域名 (SNI): 直接回车用默认 ${DEFAULT_SNI}, 也可输入你自己的域名。"
         _info " (例如: xxx.example.com)"
-        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
+        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}; 下一步选「已申请证书」会改用证书域名): " camouflage_domain
         camouflage_domain=${camouflage_domain:-$DEFAULT_SNI}
 
         while true; do
@@ -5572,7 +5580,7 @@ _add_vless_grpc_tls() {
         _info "已生成自签名证书，客户端将跳过证书验证。"
     elif [ "$cert_choice" == "2" ]; then
         if ! _cert_managed_select; then
-            _error "没有可用的已申请证书，请先在 [6] 一键申请证书。"
+            _error "没有可用的已申请证书，请先到 [1]→[7] 申请证书。"
             return 1
         fi
         cert_path="$_CERT_SEL_CERT"
@@ -5698,7 +5706,7 @@ _add_trojan_ws_tls() {
         fi
 
         _info "伪装域名 (SNI): 直接回车用默认 ${DEFAULT_SNI}, 也可输入你自己的域名。"
-        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
+        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}; 下一步选「已申请证书」会改用证书域名): " camouflage_domain
         camouflage_domain=${camouflage_domain:-$DEFAULT_SNI}
 
         while true; do
@@ -6307,7 +6315,7 @@ _add_hysteria2() {
             _check_port_conflict "$port" "tcp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
+        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}; 下一步选「已申请证书」会改用证书域名): " camouflage_domain
         server_name=${camouflage_domain:-"$DEFAULT_SNI"}
     fi
 
@@ -6490,7 +6498,7 @@ _add_tuic() {
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}): " camouflage_domain
+        read -p "请输入伪装域名 (默认: ${DEFAULT_SNI}; 下一步选「已申请证书」会改用证书域名): " camouflage_domain
         server_name=${camouflage_domain:-"$DEFAULT_SNI"}
     fi
 
@@ -9018,7 +9026,7 @@ _modify_node() {
                         _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" identity "$value" self_signed
                     elif [ "$cert_choice" = "2" ]; then
                         if ! _cert_managed_select; then
-                            _error "没有可用的已申请证书，请先在 [6] 一键申请证书。"
+                            _error "没有可用的已申请证书，请先到 [1]→[7] 申请证书。"
                             return 1
                         fi
                         value="$_CERT_SEL_DOMAIN"
@@ -10649,39 +10657,31 @@ _show_more_protocols_menu() {
         echo -e "  ╚═══════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${CYAN}【可选协议】${NC}"
-        echo -e "    ${GREEN}[1]${NC} AnyTLS (自签 / 已申请证书, Reality / TLS)"
+        echo -e "    ${GREEN}[1]${NC} AnyTLS / Any-Reality (Any-Reality 免证书, AnyTLS 需证书)"
         echo -e "    ${GREEN}[2]${NC} TUIC (自签 / 已申请证书, 需 UDP 可用)"
-        echo -e "    ${YELLOW}[3]${NC} VLESS + WS + TLS (自签 / 已申请证书)"
-        echo -e "    ${YELLOW}[4]${NC} Trojan + WS + TLS (自签 / 已申请证书)"
-        echo -e "    ${YELLOW}[5]${NC} Shadowsocks-2022 (含 ShadowTLS v3)"
+        echo -e "    ${YELLOW}[3]${NC} VLESS + WS + TLS (自签 / 已申请证书, 可套 CDN)"
+        echo -e "    ${YELLOW}[4]${NC} Trojan + WS + TLS (自签 / 已申请证书, 可套 CDN)"
+        echo -e "    ${YELLOW}[5]${NC} Shadowsocks-2022 (含 ShadowTLS v3, 免证书)"
         echo ""
-        echo -e "  ${CYAN}【证书】${NC}"
-        local cert_count="0"
-        cert_count=$(_cert_index_count 2>/dev/null || echo 0)
-        echo -e "    ${GREEN}[6]${NC} 一键申请证书 (Cloudflare 自动解析 + 自动续期)"
-        if [ "${cert_count:-0}" -gt 0 ] 2>/dev/null; then
-            echo -e "    ${GREEN}[7]${NC} 证书管理 (已申请 ${cert_count} 张, 创建节点时可选)"
-        else
-            echo -e "    ${GREEN}[7]${NC} 证书管理 (暂无已申请证书)"
-        fi
+        # SX: 证书入口已上移到 [1] 添加节点菜单, 这里只留一行指路, 不重复列菜单
+        echo -e "  ${YELLOW}证书: 申请/管理请返回上级 → [7] 一键申请 / [8] 证书管理${NC}"
         echo ""
-        echo -e "  ${YELLOW}提示: 直连首选还是 [1] VLESS + Reality (主菜单那个)。${NC}"
-        echo -e "  ${YELLOW}     以上属于补充协议, 直连的隐蔽性都不如 Reality,${NC}"
-        echo -e "  ${YELLOW}     更适合当中转落地 (TUIC 需机器 UDP 可用), 直连请谨慎选用。${NC}"
+        echo -e "  ${YELLOW}提示: 直连首选仍是主菜单 [1] VLESS + Reality;${NC}"
+        echo -e "  ${YELLOW}      本页 [1] 的 Any-Reality 同属 Reality 系, 也可直连。${NC}"
+        echo -e "  ${YELLOW}      [2] TUIC 走 UDP (需放行 UDP); [3]/[4] WS+TLS 适合套 CDN;${NC}"
+        echo -e "  ${YELLOW}      [5] SS-2022 靠 ShadowTLS 伪装, 不依赖证书。${NC}"
         echo ""
         echo -e "  ───────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local c
-        read -p "  请输入选项 [0-7]: " c
+        read -p "  请输入选项 [0-5]: " c
         case $c in
             1) _run_main_create_transaction _add_anytls; _pause_back ;;
             2) _run_main_create_transaction _add_tuic; _pause_back ;;
             3) _run_main_create_transaction _add_vless_ws_tls; _pause_back ;;
             4) _run_main_create_transaction _add_trojan_ws_tls; _pause_back ;;
             5) _run_main_create_transaction _add_shadowsocks_menu; _pause_back ;;
-            6) _cert_apply; _pause_back ;;
-            7) _cert_menu ;;
             0) return ;;
             *) _error "无效输入，请重试。"; _pause_back ;;
         esac
@@ -10970,7 +10970,7 @@ _show_add_node_menu() {
     echo ""
     
     echo -e "  ${CYAN}【协议选择】${NC}"
-    echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision"
+    echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision (免证书, 推荐)"
     echo -e "    ${GREEN}[2]${NC} Hysteria2 (自签 / 已申请证书, 需 UDP 可用)"
     echo -e "    ${GREEN}[3]${NC} 一键临时argo (全自动)"
     echo -e "    ${GREEN}[4]${NC} 更多协议 (AnyTLS / TUIC / WS+TLS / Trojan / SS-2022)"
