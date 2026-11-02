@@ -4854,7 +4854,9 @@ _node_cert_choose() {
     fi
 
     _generate_self_signed_cert "$default_domain" "$NODE_CERT_PATH" "$NODE_CERT_KEY_PATH" || return 1
-    _info "已自动生成自签证书 (直连用, 链接内含 pcs 指纹)。"
+    # SX: 不再笼统说「链接内含 pcs 指纹」—— 各协议参数不同: WS/gRPC/Trojan 用 pcs,
+    #     HY2 用 pinSHA256, TUIC 用 allow_insecure, AnyTLS 只能 insecure(客户端不认 pcs)
+    _info "已自动生成自签证书 (直连用; 客户端需跳过证书验证, 或按链接里的指纹固定)"
     return 0
 }
 
