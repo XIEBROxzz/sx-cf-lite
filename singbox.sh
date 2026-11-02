@@ -22,6 +22,16 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.77: 修「卸载时申请证书的子域名解析没清理」, 三处原因:
+#           ① 顺序错 —— 先 rm -rf /etc/sing-box-cf-lite 再清解析, 只申请过证书
+#              (没建过 CF-A/CF-B) 时凭据只存在那个目录, 删完就认证不了;
+#              现在证书清理提到删目录之前
+#           ② API Token 模式从不落盘 —— 卸载时找不到凭据, 解析整批留下;
+#              现在 token 单独存 certs/cf_token (600), 仅用于卸载清理
+#           ③ _cert_cloud_cleanup_for_uninstall 被 2>/dev/null 包住, 而 _info/_warn
+#              全走 stderr → 整段静默, 删了哪条/跳过哪条用户完全看不到
+#           另: 按记录类型 (A/AAAA) 分别与本机 v4/v6 比对, 不再拿单一地址硬比,
+#           避免 v6 环境下 v4 解析被误判成"指向他机"而保留
 #     1.76: 修「[16]→[B] 选了 IPv6 优先, 创建节点仍填 IPv4」——
 #           _get_public_ip 开头直接返回会话缓存 $server_ip, 只要之前取过一次地址,
 #           后面改偏好永远拿到旧族; 现在 _get_public_ip 每次按当前偏好重新解析,
@@ -135,7 +145,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.76"
+export SCRIPT_VERSION="1.77"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -3888,6 +3898,11 @@ _uninstall() {
         systemctl reset-failed xray.service >/dev/null 2>&1 || true
     fi
 
+    # SX: 证书子域名解析清理必须放在删除 /etc/sing-box-cf-lite 之前 ——
+    #     只申请过证书、没建过 CF-A/CF-B 时, CF 凭据只存在那个目录里,
+    #     目录先删掉就再也认证不了, 解析会整批留下
+    _cert_cleanup_for_uninstall || true
+
     # SX: CF-A (Cloudflare-OriginRules) 云端资源清扫 — 无头调用 cf_lite.sh delete
     # 不再依赖 state.json —— v34 创建失败时 state 不存在但 CF 资源已写入,
     # cf_lite delete 现在会在 state 缺失时按本地痕迹 (origin 证书 CN/订阅快照) 清理
@@ -3919,8 +3934,8 @@ _uninstall() {
         fi
     fi
 
-    # SX: 不再吞掉 stderr —— 云端清理会逐条提示进度, 解析指向他机时还要询问
-    _cert_cleanup_for_uninstall || true
+    # SX: 证书云端解析已在删除 /etc/sing-box-cf-lite 之前清理过 (见上方),
+    #     这里不能再调一次 —— 凭据文件此时已不存在
 
     rm -rf "${SINGBOX_DIR}"
     rm -f "${LOG_FILE}"
@@ -4734,6 +4749,17 @@ _cert_apply() {
     if [ "$_CERT_CF_AUTH_TYPE" = "key" ] && _cert_cf_persist_key "$email" "$_CERT_CF_KEY"; then
         _info "该凭据已同步到 CF-A/CF-B (cf_account.json), 后续套 CF / Argo 隧道可直接复用"
     fi
+    # SX: API Token 模式不写 cf_account.json (那是 Global Key 的地盘, 混写会串账号),
+    #     单独存一份 600 的 token —— 卸载时靠它删除本脚本写入的 A/AAAA 解析,
+    #     否则 token 用户卸载后子域名解析会全部留在 CF 上
+    if [ "$_CERT_CF_AUTH_TYPE" = "token" ]; then
+        if printf '%s' "$_CERT_CF_TOKEN" > "${CERT_STORE_DIR}/cf_token" 2>/dev/null; then
+            chmod 600 "${CERT_STORE_DIR}/cf_token" 2>/dev/null || true
+        else
+            rm -f "${CERT_STORE_DIR}/cf_token" 2>/dev/null
+            _warn "API Token 未能保存, 卸载时可能无法自动删除解析 (可到 CF 后台手动删)。"
+        fi
+    fi
 
     _info "正在匹配 Cloudflare Zone..."
     local zinfo zone_id="" zone_name=""
@@ -5013,20 +5039,36 @@ _cert_delete() {
 # SX: 卸载时清理云端 —— 删除 [6] 申请证书时写入的 A/AAAA 解析
 # 只删「仍指向本机」的记录; 已改指其他机器时逐条询问, 避免拆掉别处的解析
 _cert_cloud_cleanup_for_uninstall() {
-    local cred cemail ckey myip domain cert kp iemail zid rid resp content ans
+    local cred cemail ckey token myip myip4 myip6 domain cert kp iemail zid rid resp content ans rtype
     local removed=0 kept=0
     [ -s "$CERT_INDEX_FILE" ] || return 0
     cred=$(_cert_cf_saved_cred 2>/dev/null) || cred=""
-    if [ -z "$cred" ]; then
-        _warn "未找到 Cloudflare 凭据, 云端解析未清理 (需到 CF 后台手动删除)。"
+    # SX: API Token 模式不写 cf_account.json (那是 Global Key 的地盘), 单独存一份
+    #     600 权限的 token, 就为了这里能认证; 没有它则 token 用户永远清不掉解析
+    token=""
+    if [ -s "${CERT_STORE_DIR}/cf_token" ]; then
+        token=$(tr -d '[:space:]' < "${CERT_STORE_DIR}/cf_token" 2>/dev/null)
+    fi
+    if [ -n "$cred" ]; then
+        cemail="${cred%%$'\t'*}"
+        ckey="${cred#*$'\t'}"
+        _CERT_CF_AUTH_TYPE="key"
+        _CERT_CF_EMAIL="$cemail"
+        _CERT_CF_KEY="$ckey"
+    elif [ -n "$token" ]; then
+        _CERT_CF_AUTH_TYPE="token"
+        _CERT_CF_TOKEN="$token"
+    else
+        _warn "未找到 Cloudflare 凭据 (Global API Key / API Token), 云端解析未清理。"
+        _warn "  请到 CF 后台手动删除这些子域名的 A/AAAA 记录:"
+        while IFS=$'\t' read -r domain _ _ _ _ _; do
+            [ -n "$domain" ] && _warn "    - ${domain}"
+        done < <(_cert_list_index)
         return 0
     fi
-    cemail="${cred%%$'\t'*}"
-    ckey="${cred#*$'\t'}"
-    _CERT_CF_AUTH_TYPE="key"
-    _CERT_CF_EMAIL="$cemail"
-    _CERT_CF_KEY="$ckey"
-    myip=$(_get_public_ip 2>/dev/null) || myip=""
+    # 记录内容可能是 A 也可能是 AAAA, 分别和本机对应族比对 (拿不到再实时探)
+    myip4=$(_public_ip_cached 4)
+    myip6=$(_public_ip_cached 6)
     _info "正在清理 Cloudflare 云端解析..."
     while IFS=$'\t' read -r domain cert kp iemail zid rid; do
         [ -n "$domain" ] || continue
@@ -5041,7 +5083,15 @@ _cert_cloud_cleanup_for_uninstall() {
             kept=$((kept + 1))
             continue
         fi
+        rtype=$(printf '%s' "$resp" | jq -r '.result.type // "A"')
         content=$(printf '%s' "$resp" | jq -r '.result.content // ""')
+        if [ "$rtype" = "AAAA" ]; then
+            myip="$myip6"
+            [ -z "$myip" ] && myip=$(_probe_ip_family 6)
+        else
+            myip="$myip4"
+            [ -z "$myip" ] && myip=$(_probe_ip_family 4)
+        fi
         if [ -n "$myip" ] && [ "$content" != "$myip" ]; then
             _warn "  ${domain}: 解析当前指向 ${content}, 与本机 ${myip} 不一致。"
             # 从 /dev/tty 读, 否则会吃掉循环正在读的索引行; 无终端时按「不删」处理
@@ -5067,6 +5117,7 @@ _cert_cloud_cleanup_for_uninstall() {
     done < <(_cert_list_index)
     _CERT_CF_KEY=""
     _CERT_CF_EMAIL=""
+    _CERT_CF_TOKEN=""
     _info "云端解析清理完成: 已删除 ${removed} 条, 保留/跳过 ${kept} 条。"
 }
 
@@ -5074,7 +5125,9 @@ _cert_cleanup_for_uninstall() {
     local acme domain cert key email acc_conf
     # 先删云端解析 (需要索引里的 zone_id/record_id), 再清本地文件与 acme.sh 记录
     if [ -s "$CERT_INDEX_FILE" ]; then
-        _cert_cloud_cleanup_for_uninstall 2>/dev/null || true
+        # SX: 不能 2>/dev/null —— _info/_warn/_success 全走 stderr, 一重定向就整段静默,
+        #     用户看不到"删了哪条/跳过了哪条", 以为脚本没清理解析
+        _cert_cloud_cleanup_for_uninstall || true
         acme="$(_cert_acme_bin)"
         while IFS=$'\t' read -r domain cert key email; do
             [ -n "$domain" ] || continue
