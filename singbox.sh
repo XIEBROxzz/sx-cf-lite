@@ -22,6 +22,9 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.74: 节点名后缀改用对外(暴露)口 —— 填 443:33000 时名字显示 AnyTLS-33000,
+#           与客户端实际连接端口一致; 之前显示内部监听口 443, 看名字配客户端容易填错。
+#           单填端口时两者相同, 行为不变; VLESS-TCP / Socks 不支持内外分离, 保持原样
 #     1.73: 补上 v1.72 漏改的一处 —— Any-Reality 输出分享链接时仍传内部口, 导致
 #           填 443:31000 时屏幕上的链接是 443 (配置与 metadata 里的链接是对的)。
 #           现在与 AnyTLS 一致: 监听内部口, 链接用暴露口
@@ -123,7 +126,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.73"
+export SCRIPT_VERSION="1.74"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -5422,9 +5425,9 @@ _add_vless_ws_tls() {
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_unique_node_name "VLESS-WS-${port}")
+        name=$(_unique_node_name "VLESS-WS-${link_port:-$port}")
     else
-        local default_name="VLESS-WS-${port}"
+        local default_name="VLESS-WS-${link_port:-$port}"
         custom_name=""  # SX: 节点名自动取默认, 不再询问
         name=$(_unique_node_name "${custom_name:-$default_name}")
     fi
@@ -5616,9 +5619,9 @@ _add_vless_grpc_tls() {
 
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_unique_node_name "VLESS-gRPC-${port}")
+        name=$(_unique_node_name "VLESS-gRPC-${link_port:-$port}")
     else
-        local default_name="VLESS-gRPC-${port}"
+        local default_name="VLESS-gRPC-${link_port:-$port}"
         custom_name=""  # SX: 节点名自动取默认, 不再询问
         name=$(_unique_node_name "${custom_name:-$default_name}")
     fi
@@ -5787,9 +5790,9 @@ _add_trojan_ws_tls() {
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_unique_node_name "Trojan-WS-${port}")
+        name=$(_unique_node_name "Trojan-WS-${link_port:-$port}")
     else
-        local default_name="Trojan-WS-${port}"
+        local default_name="Trojan-WS-${link_port:-$port}"
         custom_name=""  # SX: 节点名自动取默认, 不再询问
         name=$(_unique_node_name "${custom_name:-$default_name}")
     fi
@@ -6085,9 +6088,9 @@ _add_anytls() {
         1)
             local name
             if [ "$BATCH_MODE" = "true" ]; then
-                name=$(_unique_node_name "AnyTLS-${port}")
+                name=$(_unique_node_name "AnyTLS-${link_port:-$port}")
             else
-                local default_name="AnyTLS-${port}"
+                local default_name="AnyTLS-${link_port:-$port}"
                 custom_name=""  # SX: 节点名自动取默认, 不再询问
                 name=$(_unique_node_name "${custom_name:-$default_name}")
             fi
@@ -6097,9 +6100,9 @@ _add_anytls() {
         2)
             local name
             if [ "$BATCH_MODE" = "true" ]; then
-                name=$(_unique_node_name "Any-Reality-${port}")
+                name=$(_unique_node_name "Any-Reality-${link_port:-$port}")
             else
-                local default_name="Any-Reality-${port}"
+                local default_name="Any-Reality-${link_port:-$port}"
                 custom_name=""  # SX: 节点名自动取默认, 不再询问
                 name=$(_unique_node_name "${custom_name:-$default_name}")
             fi
@@ -6125,7 +6128,7 @@ _add_vless_reality() {
         # 批量模式变量预加载，增加多层保底，防止变量泄露
         server_name=$(echo "${BATCH_SNI}" | xargs)
         [[ -z "$server_name" ]] && server_name="$DEFAULT_SNI"
-        name=$(_unique_node_name "VLESS-TCP-REALITY-VISION-${port}")
+        name=$(_unique_node_name "VLESS-TCP-REALITY-VISION-${link_port:-$port}")
         # 批量模式下如果不显式指定，可能丢失 IP，此处进行双重保险
         [ -z "$node_ip" ] && node_ip="$server_ip"
     else
@@ -6150,7 +6153,7 @@ _add_vless_reality() {
             _check_port_conflict "$port" "tcp" && continue
             break
         done
-        local default_name="VLESS-TCP-REALITY-VISION-${port}"
+        local default_name="VLESS-TCP-REALITY-VISION-${link_port:-$port}"
         custom_name=""  # SX: 节点名自动取默认, 不再询问
         name=$(_unique_node_name "${custom_name:-$default_name}")
     fi
@@ -6352,9 +6355,9 @@ _add_hysteria2() {
     # [!] 自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_unique_node_name "Hysteria2-${port}")
+        name=$(_unique_node_name "Hysteria2-${link_port:-$port}")
     else
-        local default_name="Hysteria2-${port}"
+        local default_name="Hysteria2-${link_port:-$port}"
         custom_name=""  # SX: 节点名自动取默认, 不再询问
         name=$(_unique_node_name "${custom_name:-$default_name}")
     fi
@@ -6495,9 +6498,9 @@ _add_tuic() {
     # [!] 自主生成与名称分配
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_unique_node_name "TUICv5-${port}")
+        name=$(_unique_node_name "TUICv5-${link_port:-$port}")
     else
-        local default_name="TUICv5-${port}"
+        local default_name="TUICv5-${link_port:-$port}"
         custom_name=""  # SX: 节点名自动取默认, 不再询问
         name=$(_unique_node_name "${custom_name:-$default_name}")
     fi
@@ -6635,9 +6638,9 @@ _add_shadowsocks_menu() {
     # [!] 新增：自定义名称
     local name=""
     if [ "$BATCH_MODE" = "true" ]; then
-        name=$(_unique_node_name "${name_prefix}-${port}")
+        name=$(_unique_node_name "${name_prefix}-${link_port:-$port}")
     else
-        local default_name="${name_prefix}-${port}"
+        local default_name="${name_prefix}-${link_port:-$port}"
         custom_name=""  # SX: 节点名自动取默认, 不再询问
         name=$(_unique_node_name "${custom_name:-$default_name}")
     fi
