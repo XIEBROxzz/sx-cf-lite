@@ -22,6 +22,9 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.73: 补上 v1.72 漏改的一处 —— Any-Reality 输出分享链接时仍传内部口, 导致
+#           填 443:31000 时屏幕上的链接是 443 (配置与 metadata 里的链接是对的)。
+#           现在与 AnyTLS 一致: 监听内部口, 链接用暴露口
 #     1.72: AnyTLS 菜单去掉「同时创建」—— 它固定占用 port+1, NAT 场景第二个节点常连不通,
 #           且两节点共用同一 SNI/密码, 收益有限; 现在只有 [1] Any-Reality / [2] AnyTLS,
 #           想两个都要就建两次(端口各自指定)。顺带修 AnyTLS/Any-Reality 忽略「内部:暴露」的问题:
@@ -120,7 +123,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.72"
+export SCRIPT_VERSION="1.73"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -6012,7 +6015,7 @@ _create_anyreality_node() {
 
     _success "Any-Reality 节点 [${name}] 添加成功!"
     _warning "Any-Reality 为 AnyTLS + Reality，Mihomo/Clash 不支持，已跳过写入 clash.yaml。"
-    _show_node_link "any-reality" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$public_key" "$short_id" || return 1
+    _show_node_link "any-reality" "$name" "$link_ip" "$link_port" "$tag" "$password" "$server_name" "$public_key" "$short_id" || return 1
 }
 
 _add_anytls() {
