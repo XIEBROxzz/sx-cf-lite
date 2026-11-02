@@ -5331,7 +5331,7 @@ _direct_fam_menu() {
                    else
                        _success "节点地址探测已设为「IPv4 优先」"
                    fi
-                   _info "只影响之后新创建的节点; 本次已缓存的地址需重开脚本生效。"
+                   _info "只影响之后新创建的节点; 回主菜单再进 [1] 即按新偏好解析, 无需重开脚本。"
                else
                    _error "写入 ${SINGBOX_DIR}/node_ip_pref 失败"
                fi

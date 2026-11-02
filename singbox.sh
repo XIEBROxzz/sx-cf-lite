@@ -22,6 +22,12 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.76: 修「[16]→[B] 选了 IPv6 优先, 创建节点仍填 IPv4」——
+#           _get_public_ip 开头直接返回会话缓存 $server_ip, 只要之前取过一次地址,
+#           后面改偏好永远拿到旧族; 现在 _get_public_ip 每次按当前偏好重新解析,
+#           并用 _server_ip_family 记录「这次解析用的哪族」, 偏好一变 _resolve_server_ip
+#           立即重解析 (无需重开脚本)。另: 缓存里首选族为空时补一次实时探测,
+#           避免开机时 v6 未就绪导致缓存 v6=空、之后一直回退 v4
 #     1.75: 清理过时的 xray 字样 —— CF-A 早已并入主 sing-box (单核), 菜单却还写
 #           「CF Origin Rules 版 (xray + ...)」; 另修 [19] 优选订阅里 "xray-vless" 这种
 #           把 xray 当前缀拼在协议名前的残留标签; 删除节点相关提示同步去掉 Xray
@@ -129,7 +135,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.75"
+export SCRIPT_VERSION="1.76"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -434,23 +440,40 @@ _probe_ip_family() {
     return 0
 }
 
-# 公网 IP 获取 (带全局缓存) —— 按节点地址偏好先试对应族, 拿不到再回退另一族
+# 公网 IP 获取 —— 严格按节点地址偏好解析, 不复用 server_ip 旧值
+# SX: 之前这里第一行直接返回 $server_ip, 导致 [16]→[B] 改成「IPv6 优先」后,
+#     本次会话里只要早先取过一次地址 (server_ip 已被填成 v4), 后面创建节点永远拿到 v4,
+#     脚本还得提示"需重开脚本生效"。现在每次调用都按当前偏好重新解析。
 _get_public_ip() {
-    [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && { echo "$server_ip"; return; }
     local pref ip first second
     pref=$(_node_ip_pref)
     if [ "$pref" = "ipv6" ]; then first=6; second=4; else first=4; second=6; fi
     # 优先用菜单启动时探好的缓存, 避免创建节点时再等一轮 curl
     ip=$(_public_ip_cached "$first")
+    # SX: 缓存里首选族为空 ≠ 没有该族 —— 开机时 v6 可能还没起来, 现探一次再回退
+    [ -z "$ip" ] && ip=$(_probe_ip_family "$first")
     [ -z "$ip" ] && ip=$(_public_ip_cached "$second")
-    if [ -z "$ip" ]; then
-        ip=$(_probe_ip_family "$first")
-        [ -z "$ip" ] && ip=$(_probe_ip_family "$second")
-    fi
-    server_ip="$ip"
-    echo "$ip"
+    [ -z "$ip" ] && ip=$(_probe_ip_family "$second")
+    # 兜底: 两族都探不到时才沿用会话里已有的值 (可能已是 127.0.0.1)
+    [ -z "$ip" ] && [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && ip="$server_ip"
+    printf '%s' "$ip"
 }
 _get_ip() { _get_public_ip; } # 别名兼容
+
+# SX: 把 server_ip 与「解析时用的偏好」绑在一起 —— 偏好变了就重解析,
+#     偏好没变才复用, 这样改完 [16]→[B] 立刻生效, 不必重开脚本
+_server_ip_family=""
+_resolve_server_ip() {
+    local pref
+    pref=$(_node_ip_pref)
+    if [ -n "$server_ip" ] && [ "$server_ip" != "null" ] \
+       && [ "$_server_ip_family" = "$pref" ]; then
+        return 0
+    fi
+    server_ip=$(_get_public_ip)
+    _server_ip_family="$pref"
+    return 0
+}
 
 # 系统环境检测
 _detect_init_system() {
@@ -809,10 +832,11 @@ _remove_nftables_rules() {
 # 公网 IP 初始化
 _init_server_ip() {
     _info "正在获取服务器公网 IP..."
-    server_ip=$(_get_public_ip)
+    _resolve_server_ip
     if [ -z "$server_ip" ] || [ "$server_ip" == "null" ]; then
         _warn "自动获取 IP 失败，将回退到 127.0.0.1"
         server_ip="127.0.0.1"
+        _server_ip_family=$(_node_ip_pref)
     else
         _success "当前服务器公网 IP: ${server_ip}"
     fi
@@ -1809,11 +1833,12 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
+export -f _info _success _warn _warning _error _flock_wait _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _node_ip_pref _node_ip_pref_file _public_ip_cached _public_ip_cache_file _probe_ip_family _resolve_server_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_json_locked _atomic_modify_yaml _atomic_modify_yaml_locked _with_state_lock _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _add_node_to_yaml_locked _remove_node_from_yaml _remove_node_from_yaml_locked _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
 
 export -f _time_is_container _time_probe_ntp _time_has_ss2022 _time_prepare_ntp_config _time_prepare_ntp_config_locked _time_diagnostics _time_menu
 
 server_ip=""
+_server_ip_family=""
 BATCH_MODE=false
 VIEW_LINKS_TMP=""
 _cleanup_main_temp_files() {
@@ -6118,7 +6143,7 @@ _add_anytls() {
 }
 
 _add_vless_reality() {
-    [ -z "$server_ip" ] && server_ip=$(_get_ip)
+    _resolve_server_ip   # SX: 偏好可能在本次会话被改过, 每次比对后按新偏好重解析
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local server_name="$DEFAULT_SNI"
@@ -6234,7 +6259,7 @@ _add_vless_tcp() {
 }
 
 _add_hysteria2() {
-    [ -z "$server_ip" ] && server_ip=$(_get_ip)
+    _resolve_server_ip   # SX: 偏好可能在本次会话被改过, 每次比对后按新偏好重解析
     local node_ip="${server_ip}"
     [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
@@ -10236,7 +10261,7 @@ _run_main_create_transaction() {
 # [3] 临时Argo 全自动 (内部口随机 + ws 路径随机 + 域名临时分配), 零输入。
 # 端口输入: "内部" 或 "内部:暴露" (如 8443:36000); 回车 = 随机统一内外 30000-50000。
 _add_trio_quick() {
-    [ -z "$server_ip" ] && server_ip=$(_get_ip)
+    _resolve_server_ip   # SX: 偏好可能在本次会话被改过, 每次比对后按新偏好重解析
 
     echo ""
     _info "三合一 = Reality + Hysteria2 + 临时Argo, 全自动部署"
@@ -10393,7 +10418,7 @@ _batch_create_nodes() {
     _info "--- 批量部署引导向导 ---"
     
     # [修复] 强制初始化服务器 IP，防止各协议函数因变量未定义生成空配置
-    [ -z "$server_ip" ] && server_ip=$(_get_ip)
+    _resolve_server_ip   # SX: 偏好可能在本次会话被改过, 每次比对后按新偏好重解析
     local batch_ip="${server_ip}"
     read -p "请输入批量节点绑定的IP地址 (回车默认: ${server_ip}): " custom_batch_ip
     batch_ip=${custom_batch_ip:-$server_ip}
@@ -10947,6 +10972,7 @@ _set_default_sni() {
 
 _show_add_node_menu() {
     [ -z "$server_ip" ] && _init_server_ip
+    _resolve_server_ip   # SX: 改过 [16]→[B] 的偏好时, 进菜单即按新族重解析
     clear
     echo -e "${CYAN}"
     echo '  ╔═══════════════════════════════════════╗'
