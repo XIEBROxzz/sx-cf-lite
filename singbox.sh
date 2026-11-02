@@ -22,6 +22,10 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.68: 批量 / 三合一 也支持复用已申请证书 —— 原来批量模式一律静默自签,
+#           已申请证书在「三合一」和「批量创建」里完全用不上; 现在向导里问一次
+#           (BATCH_CERT_MODE), 统一套用到本次创建的所有节点; 单节点文案同步标注
+#           Hysteria2 / AnyTLS / TUIC 都支持「自签 / 已申请证书」
 #     1.67: 本机公网 IP 一览 + 节点地址探测偏好 —— 主菜单 / [14] DNS / [16] 头部显示
 #           显示「公网」IPv4+IPv6 (curl 探测, 缓存 public_ip.cache 10 分钟; 探测失败才退回
 #           网卡地址并标注 "(网卡)") —— NAT 小鸡网卡上只有 10.x, 不能拿它当本机 IP;
@@ -102,7 +106,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.67"
+export SCRIPT_VERSION="1.68"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -4767,6 +4771,36 @@ _cert_managed_select() {
     return 0
 }
 
+# SX: 批量/三合一 统一证书来源 —— 批量模式原本一律自签, 已申请证书完全用不上。
+#     在向导里问一次, 结果经 BATCH_CERT_* 传给 _node_cert_choose。
+_batch_cert_choose() {
+    export BATCH_CERT_MODE="self"
+    unset BATCH_CERT_PATH BATCH_CERT_KEY_PATH BATCH_CERT_DOMAIN 2>/dev/null || true
+    if [ "$(_cert_index_count 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null; then
+        echo ""
+        echo -e "  ${CYAN}【证书来源】本次创建的节点统一使用${NC}"
+        echo -e "    ${GREEN}[1]${NC} 自动自签 (默认, 链接带证书指纹)"
+        echo -e "    ${GREEN}[2]${NC} 使用已申请证书 (Let's Encrypt, 自动续期)"
+        local c=""
+        read -r -p "  请选择 [1-2] (默认: 1): " c
+        c=${c:-1}
+        if [ "$c" = "2" ]; then
+            if _cert_managed_select; then
+                export BATCH_CERT_MODE="managed"
+                export BATCH_CERT_PATH="$_CERT_SEL_CERT"
+                export BATCH_CERT_KEY_PATH="$_CERT_SEL_KEY"
+                export BATCH_CERT_DOMAIN="$_CERT_SEL_DOMAIN"
+                _success "本次节点统一使用已申请证书: ${BATCH_CERT_DOMAIN}"
+                return 0
+            fi
+            _warn "未选择已申请证书, 本次改用自签。"
+        fi
+    else
+        _info "未检测到已申请证书 (可先在 [4]→[6] 申请), 本次批量使用自签证书。"
+    fi
+    return 0
+}
+
 # 创建节点时选择证书来源; 成功后在 NODE_CERT_* 中返回
 _node_cert_choose() {
     local tag="$1" default_domain="$2" cert_choice=""
@@ -4777,6 +4811,17 @@ _node_cert_choose() {
     NODE_CERT_SOURCE="self-signed"
 
     if [ "${BATCH_MODE:-false}" = "true" ]; then
+        # SX: 向导里统一选过「已申请证书」就直接沿用, 否则照旧自签
+        if [ "${BATCH_CERT_MODE:-self}" = "managed" ] \
+           && [ -n "${BATCH_CERT_PATH:-}" ] && [ -s "${BATCH_CERT_PATH:-/dev/null}" ] \
+           && [ -n "${BATCH_CERT_KEY_PATH:-}" ] && [ -s "${BATCH_CERT_KEY_PATH:-/dev/null}" ]; then
+            NODE_CERT_PATH="$BATCH_CERT_PATH"
+            NODE_CERT_KEY_PATH="$BATCH_CERT_KEY_PATH"
+            NODE_CERT_DOMAIN="${BATCH_CERT_DOMAIN:-$default_domain}"
+            NODE_CERT_SKIP_VERIFY="false"
+            NODE_CERT_SOURCE="managed"
+            return 0
+        fi
         _generate_self_signed_cert "$default_domain" "$NODE_CERT_PATH" "$NODE_CERT_KEY_PATH" || return 1
         return 0
     fi
@@ -10268,6 +10313,9 @@ _add_trio_quick() {
     _info "开始部署: [Reality+Hy2 内口 ${in_port} / 暴露 ${out_port}] + [临时Argo 全自动] ..."
     echo ""
 
+    # SX: Reality 不用证书, 三合一里只有 HY2 用 —— 已申请证书时问一次
+    _batch_cert_choose
+
     export BATCH_MODE="true"
     export BATCH_IP="$server_ip"
     export BATCH_SNI="${DEFAULT_SNI:-www.amd.com}"
@@ -10277,14 +10325,14 @@ _add_trio_quick() {
     export BATCH_LINK_PORT="$out_port"
 
     if ! _add_vless_reality; then
-        unset BATCH_MODE BATCH_IP BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_PORT BATCH_LINK_PORT 2>/dev/null || true
+        unset BATCH_MODE BATCH_IP BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_PORT BATCH_LINK_PORT BATCH_CERT_MODE BATCH_CERT_PATH BATCH_CERT_KEY_PATH BATCH_CERT_DOMAIN 2>/dev/null || true
         _error "三合一 Reality 环节失败，整单回滚。"
         _pause_back
         return 1
     fi
     echo ""
     if ! _add_hysteria2; then
-        unset BATCH_MODE BATCH_IP BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_PORT BATCH_LINK_PORT 2>/dev/null || true
+        unset BATCH_MODE BATCH_IP BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_PORT BATCH_LINK_PORT BATCH_CERT_MODE BATCH_CERT_PATH BATCH_CERT_KEY_PATH BATCH_CERT_DOMAIN 2>/dev/null || true
         _error "三合一 Hysteria2 环节失败，整单回滚。"
         _pause_back
         return 1
@@ -10299,7 +10347,7 @@ if _add_argo_node vless auto; then
         _warning "临时Argo 创建失败 (Reality/Hysteria2 已就绪不受影响); 可单独重跑 [3] 一键临时argo 补齐。"
     fi
 
-    unset BATCH_MODE BATCH_IP BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_PORT BATCH_LINK_PORT 2>/dev/null || true
+    unset BATCH_MODE BATCH_IP BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_PORT BATCH_LINK_PORT BATCH_CERT_MODE BATCH_CERT_PATH BATCH_CERT_KEY_PATH BATCH_CERT_DOMAIN 2>/dev/null || true
     _pause_back   # SX: 三合一输出不大, 但同样防上层 menu clear 瞬擦结果
     return 0
 }
@@ -10482,6 +10530,11 @@ _batch_create_nodes() {
         fi
     done
 
+    # SX: 批量白名单里只有 HY2 需要证书 (Reality 不用 / SOCKS5 不用)
+    if [ "$has_hy2" = true ]; then
+        _batch_cert_choose
+    fi
+
     # 4. 执行安装循环
     local bulk_idx=0
     local proto_array=()
@@ -10530,7 +10583,7 @@ _batch_create_nodes() {
         fi
     done
 
-    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME
+    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME BATCH_CERT_MODE BATCH_CERT_PATH BATCH_CERT_KEY_PATH BATCH_CERT_DOMAIN
 
     if [ "$batch_failed" != false ]; then
         _error "批量创建在第 $((bulk_idx + 1)) 个节点失败，整批操作将回滚。"
@@ -10598,8 +10651,8 @@ _show_more_protocols_menu() {
         echo -e "  ╚═══════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${CYAN}【可选协议】${NC}"
-        echo -e "    ${GREEN}[1]${NC} AnyTLS (Reality / TLS, 可同时建两个)"
-        echo -e "    ${GREEN}[2]${NC} TUIC (需机器 UDP 可用)"
+        echo -e "    ${GREEN}[1]${NC} AnyTLS (自签 / 已申请证书, Reality / TLS)"
+        echo -e "    ${GREEN}[2]${NC} TUIC (自签 / 已申请证书, 需 UDP 可用)"
         echo -e "    ${YELLOW}[3]${NC} VLESS + WS + TLS (自签 / 已申请证书)"
         echo -e "    ${YELLOW}[4]${NC} Trojan + WS + TLS (自签 / 已申请证书)"
         echo -e "    ${YELLOW}[5]${NC} Shadowsocks-2022 (含 ShadowTLS v3)"
@@ -10920,7 +10973,7 @@ _show_add_node_menu() {
     
     echo -e "  ${CYAN}【协议选择】${NC}"
     echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision"
-    echo -e "    ${GREEN}[2]${NC} Hysteria2"
+    echo -e "    ${GREEN}[2]${NC} Hysteria2 (自签 / 已申请证书)"
     echo -e "    ${GREEN}[3]${NC} 一键临时argo (全自动)"
     echo -e "    ${GREEN}[4]${NC} 更多协议 (AnyTLS / TUIC / WS+TLS / Trojan / SS-2022)"
     echo ""
