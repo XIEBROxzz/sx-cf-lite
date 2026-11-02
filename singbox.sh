@@ -22,16 +22,18 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
-#     1.77: 修「卸载时申请证书的子域名解析没清理」, 三处原因:
-#           ① 顺序错 —— 先 rm -rf /etc/sing-box-cf-lite 再清解析, 只申请过证书
-#              (没建过 CF-A/CF-B) 时凭据只存在那个目录, 删完就认证不了;
-#              现在证书清理提到删目录之前
-#           ② API Token 模式从不落盘 —— 卸载时找不到凭据, 解析整批留下;
-#              现在 token 单独存 certs/cf_token (600), 仅用于卸载清理
-#           ③ _cert_cloud_cleanup_for_uninstall 被 2>/dev/null 包住, 而 _info/_warn
-#              全走 stderr → 整段静默, 删了哪条/跳过哪条用户完全看不到
-#           另: 按记录类型 (A/AAAA) 分别与本机 v4/v6 比对, 不再拿单一地址硬比,
-#           避免 v6 环境下 v4 解析被误判成"指向他机"而保留
+#     1.78: 卸载清理解析改为全自动 —— 原来指向他机时逐条弹 y/N, 都卸载了还挨个问;
+#           现在能删的直接删 (只删仍指向本机的), 指向他机/记录不存在/删除失败的
+#           收进清单, 卸载末尾一次性列出, 提示去 CF 后台处理; 全清干净则无提示。
+#           云端清理挪到删除 /etc/sing-box-cf-lite 之前 (凭据只在该目录时也能认证)。
+#           清理能力同时保留在 证书管理 [4], 不卸载也能主动清
+#     1.77: 证书子域名解析相关三处修正:
+#           ① API Token 模式从不落盘 → 现在 token 单独存 certs/cf_token (600),
+#              证书管理 [4] 清理解析时用它认证
+#           ② 云端清理被 2>/dev/null 包住, 而 _info/_warn 全走 stderr → 整段静默,
+#              删了哪条/跳过哪条完全看不到
+#           ③ 按记录类型 (A/AAAA) 分别与本机 v4/v6 比对, 不再拿单一地址硬比,
+#              避免 v6 环境下 v4 解析被误判成"指向他机"而保留
 #     1.76: 修「[16]→[B] 选了 IPv6 优先, 创建节点仍填 IPv4」——
 #           _get_public_ip 开头直接返回会话缓存 $server_ip, 只要之前取过一次地址,
 #           后面改偏好永远拿到旧族; 现在 _get_public_ip 每次按当前偏好重新解析,
@@ -145,7 +147,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.77"
+export SCRIPT_VERSION="1.78"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -3898,9 +3900,10 @@ _uninstall() {
         systemctl reset-failed xray.service >/dev/null 2>&1 || true
     fi
 
-    # SX: 证书子域名解析清理必须放在删除 /etc/sing-box-cf-lite 之前 ——
-    #     只申请过证书、没建过 CF-A/CF-B 时, CF 凭据只存在那个目录里,
-    #     目录先删掉就再也认证不了, 解析会整批留下
+    # SX: 先清 CF 云端解析, 再清本地 —— 必须在删 /etc/sing-box-cf-lite 之前,
+    #     只申请过证书 (没建过 CF-A/CF-B) 时凭据只存在那个目录里。
+    #     全程不询问: 能删的直接删, 删不掉的记进 _CERT_CLEANUP_SKIPPED, 最后统一提示
+    _cert_cloud_cleanup || true
     _cert_cleanup_for_uninstall || true
 
     # SX: CF-A (Cloudflare-OriginRules) 云端资源清扫 — 无头调用 cf_lite.sh delete
@@ -3934,8 +3937,8 @@ _uninstall() {
         fi
     fi
 
-    # SX: 证书云端解析已在删除 /etc/sing-box-cf-lite 之前清理过 (见上方),
-    #     这里不能再调一次 —— 凭据文件此时已不存在
+    # SX: 证书子域名解析不在这里删 —— 清单已在上面抄到 _cert_left_domains,
+    #     最后统一提示, 卸载流程不碰任何 CF 云端资源
 
     rm -rf "${SINGBOX_DIR}"
     rm -f "${LOG_FILE}"
@@ -3961,6 +3964,16 @@ _uninstall() {
     fi
 
     rmdir "$RUNTIME_DIR" >/dev/null 2>&1 || true
+
+    # SX: 最后统一提示 —— 只列没能自动清掉的那几条, 全部清干净就什么都不打
+    if [ -n "${_CERT_CLEANUP_SKIPPED:-}" ]; then
+        echo ""
+        _warn "以下子域名的 Cloudflare 解析未能自动清理:"
+        printf '%s' "$_CERT_CLEANUP_SKIPPED" | while IFS= read -r _d; do
+            [ -n "$_d" ] && _warn "    - ${_d}"
+        done
+        _info "如需清理, 请到 Cloudflare 后台手动删除对应 A/AAAA 记录。"
+    fi
 
     _success "清理完成。脚本已自毁。再见！"
     [ -f "${SELF_SCRIPT_PATH}" ] && rm -f "${SELF_SCRIPT_PATH}"
@@ -4750,14 +4763,14 @@ _cert_apply() {
         _info "该凭据已同步到 CF-A/CF-B (cf_account.json), 后续套 CF / Argo 隧道可直接复用"
     fi
     # SX: API Token 模式不写 cf_account.json (那是 Global Key 的地盘, 混写会串账号),
-    #     单独存一份 600 的 token —— 卸载时靠它删除本脚本写入的 A/AAAA 解析,
-    #     否则 token 用户卸载后子域名解析会全部留在 CF 上
+    #     单独存一份 600 的 token —— 证书管理 [4] 清理云端解析时靠它认证,
+    #     否则 token 用户永远删不掉本脚本写入的 A/AAAA 记录
     if [ "$_CERT_CF_AUTH_TYPE" = "token" ]; then
         if printf '%s' "$_CERT_CF_TOKEN" > "${CERT_STORE_DIR}/cf_token" 2>/dev/null; then
             chmod 600 "${CERT_STORE_DIR}/cf_token" 2>/dev/null || true
         else
             rm -f "${CERT_STORE_DIR}/cf_token" 2>/dev/null
-            _warn "API Token 未能保存, 卸载时可能无法自动删除解析 (可到 CF 后台手动删)。"
+            _warn "API Token 未能保存, 之后用 [4] 清理云端解析会缺少凭据 (可到 CF 后台手动删)。"
         fi
     fi
 
@@ -5036,11 +5049,14 @@ _cert_delete() {
     _warn "如需删除解析，请到 Cloudflare 后台移除 ${domain} 的 A/AAAA 记录。"
 }
 
-# SX: 卸载时清理云端 —— 删除 [6] 申请证书时写入的 A/AAAA 解析
-# 只删「仍指向本机」的记录; 已改指其他机器时逐条询问, 避免拆掉别处的解析
-_cert_cloud_cleanup_for_uninstall() {
-    local cred cemail ckey token myip myip4 myip6 domain cert kp iemail zid rid resp content ans rtype
+# SX: 清理云端解析 —— 删除本脚本申请证书时写入的 A/AAAA 记录
+# 全自动, 不询问: 只删「仍指向本机」的记录; 指向他机 / 记录不存在 / 删除失败的
+# 记进 _CERT_CLEANUP_SKIPPED, 由调用方在最后统一提示, 避免误删别处的解析
+_CERT_CLEANUP_SKIPPED=""
+_cert_cloud_cleanup() {
+    local cred cemail ckey token myip myip4 myip6 domain cert kp iemail zid rid resp content rtype
     local removed=0 kept=0
+    _CERT_CLEANUP_SKIPPED=""
     [ -s "$CERT_INDEX_FILE" ] || return 0
     cred=$(_cert_cf_saved_cred 2>/dev/null) || cred=""
     # SX: API Token 模式不写 cf_account.json (那是 Global Key 的地盘), 单独存一份
@@ -5059,10 +5075,9 @@ _cert_cloud_cleanup_for_uninstall() {
         _CERT_CF_AUTH_TYPE="token"
         _CERT_CF_TOKEN="$token"
     else
-        _warn "未找到 Cloudflare 凭据 (Global API Key / API Token), 云端解析未清理。"
-        _warn "  请到 CF 后台手动删除这些子域名的 A/AAAA 记录:"
+        _warn "未找到 Cloudflare 凭据 (Global API Key / API Token), 云端解析无法清理。"
         while IFS=$'\t' read -r domain _ _ _ _ _; do
-            [ -n "$domain" ] && _warn "    - ${domain}"
+            [ -n "$domain" ] && _CERT_CLEANUP_SKIPPED+="${domain} (无凭据)"$'\n'
         done < <(_cert_list_index)
         return 0
     fi
@@ -5073,13 +5088,15 @@ _cert_cloud_cleanup_for_uninstall() {
     while IFS=$'\t' read -r domain cert kp iemail zid rid; do
         [ -n "$domain" ] || continue
         if [ -z "$zid" ] || [ -z "$rid" ]; then
-            _warn "  ${domain}: 索引缺少 Zone/Record 信息, 跳过 (需手动删除解析)。"
+            _warn "  ${domain}: 索引缺少 Zone/Record 信息, 跳过。"
+            _CERT_CLEANUP_SKIPPED+="${domain} (索引缺 Zone/Record)"$'\n'
             kept=$((kept + 1))
             continue
         fi
         resp=$(_cert_cf_api GET "/zones/${zid}/dns_records/${rid}" 2>/dev/null) || resp=""
         if ! printf '%s' "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
             _warn "  ${domain}: 解析记录已不存在或无权访问, 跳过。"
+            _CERT_CLEANUP_SKIPPED+="${domain} (记录不存在或无权访问)"$'\n'
             kept=$((kept + 1))
             continue
         fi
@@ -5093,25 +5110,18 @@ _cert_cloud_cleanup_for_uninstall() {
             [ -z "$myip" ] && myip=$(_probe_ip_family 4)
         fi
         if [ -n "$myip" ] && [ "$content" != "$myip" ]; then
-            _warn "  ${domain}: 解析当前指向 ${content}, 与本机 ${myip} 不一致。"
-            # 从 /dev/tty 读, 否则会吃掉循环正在读的索引行; 无终端时按「不删」处理
-            ans=""
-            if (exec 3</dev/tty) 2>/dev/null; then
-                printf '    仍要删除这条解析? (y/N): '
-                read -r ans <&3 || ans=""
-                exec 3<&-
-            fi
-            if [[ ! "$ans" =~ ^[Yy]$ ]]; then
-                kept=$((kept + 1))
-                continue
-            fi
+            _warn "  ${domain}: 解析当前指向 ${content}, 与本机 ${myip} 不一致, 未删除。"
+            _CERT_CLEANUP_SKIPPED+="${domain} (指向 ${content}, 非本机)"$'\n'
+            kept=$((kept + 1))
+            continue
         fi
         resp=$(_cert_cf_api DELETE "/zones/${zid}/dns_records/${rid}" 2>/dev/null) || resp=""
         if printf '%s' "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
             _success "  ${domain}: 云端解析已删除 (${content:-记录})"
             removed=$((removed + 1))
         else
-            _warn "  ${domain}: 云端解析删除失败, 请到 CF 后台手动删除。"
+            _warn "  ${domain}: 云端解析删除失败。"
+            _CERT_CLEANUP_SKIPPED+="${domain} (删除失败)"$'\n'
             kept=$((kept + 1))
         fi
     done < <(_cert_list_index)
@@ -5123,11 +5133,10 @@ _cert_cloud_cleanup_for_uninstall() {
 
 _cert_cleanup_for_uninstall() {
     local acme domain cert key email acc_conf
-    # 先删云端解析 (需要索引里的 zone_id/record_id), 再清本地文件与 acme.sh 记录
+    # SX: 卸载只清本地 (acme.sh 记录 / 续期 cron / account.conf 里的明文凭据),
+    #     不碰 CF 云端解析 —— 都卸载了还逐条删/逐条问, 既慢又容易误删别处的记录;
+    #     子域名清单由 _uninstall 在最后一次性提示, 用户自己决定要不要去后台删
     if [ -s "$CERT_INDEX_FILE" ]; then
-        # SX: 不能 2>/dev/null —— _info/_warn/_success 全走 stderr, 一重定向就整段静默,
-        #     用户看不到"删了哪条/跳过了哪条", 以为脚本没清理解析
-        _cert_cloud_cleanup_for_uninstall || true
         acme="$(_cert_acme_bin)"
         while IFS=$'\t' read -r domain cert key email; do
             [ -n "$domain" ] || continue
@@ -5174,16 +5183,18 @@ _cert_menu() {
         echo -e "    ${GREEN}[1]${NC} 申请新证书"
         echo -e "    ${GREEN}[2]${NC} 立即检查/续期全部"
         echo -e "    ${RED}[3]${NC} 删除本地证书"
+        echo -e "    ${GREEN}[4]${NC} 清理 CF 云端解析 (本脚本写入的 A/AAAA)"
         echo ""
         echo -e "  ───────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local choice=""
-        read -r -p "  请输入选项 [0-3]: " choice
+        read -r -p "  请输入选项 [0-4]: " choice
         case $choice in
             1) _cert_apply; _pause_back ;;
             2) _cert_renew_all; _pause_back ;;
             3) _cert_delete; _pause_back ;;
+            4) _cert_cloud_cleanup; _pause_back ;;
             0) return ;;
             *) _error "无效输入，请重试。"; _pause_back ;;
         esac
