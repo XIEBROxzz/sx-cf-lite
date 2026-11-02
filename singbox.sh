@@ -22,6 +22,9 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.75: 清理过时的 xray 字样 —— CF-A 早已并入主 sing-box (单核), 菜单却还写
+#           「CF Origin Rules 版 (xray + ...)」; 另修 [19] 优选订阅里 "xray-vless" 这种
+#           把 xray 当前缀拼在协议名前的残留标签; 删除节点相关提示同步去掉 Xray
 #     1.74: 节点名后缀改用对外(暴露)口 —— 填 443:33000 时名字显示 AnyTLS-33000,
 #           与客户端实际连接端口一致; 之前显示内部监听口 443, 看名字配客户端容易填错。
 #           单填端口时两者相同, 行为不变; VLESS-TCP / Socks 不支持内外分离, 保持原样
@@ -126,7 +129,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.74"
+export SCRIPT_VERSION="1.75"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -7340,7 +7343,7 @@ _delete_all_main_nodes_locked() (
     delete_all_committed=1
     trap - EXIT INT TERM
     rm -rf -- "$backup_dir" || _warn "批量删除事务快照目录清理失败: $backup_dir"
-    _success "主 sing-box 节点已全部删除；Argo、Xray、中转配置均已保留。"
+    _success "主 sing-box 节点已全部删除；Argo、中转配置均已保留。"
 )
 
     # SX: 删除节点统一入口 —— 普通 / CF-A(Cloudflare-OriginRules) / CF-B(Argo) 自动识别, 选中后分派各家现成删除
@@ -7603,7 +7606,7 @@ _delete_node() {
     done <<< "$primary_nodes"
 
     echo ""
-    echo -e "  ${RED}99)${NC} 删除所有主 sing-box 节点（保留 Argo/Xray/中转）"
+    echo -e "  ${RED}99)${NC} 删除所有主 sing-box 节点（保留 Argo/中转）"
     local num
     read -p "请输入要删除的节点编号 (输入 0 返回): " num
     [[ "$num" =~ ^[0-9]+$ ]] || return
@@ -9739,7 +9742,7 @@ _cf_preferred_sub() {
         while IFS=$'\t' read -r row_proto row_link; do
             [[ -n "$row_link" && "$row_link" != "null" ]] || continue
             idx=$((idx+1))
-            label_arr+=("CF-A 橙云  xray-$row_proto")
+            label_arr+=("CF-A 橙云  $row_proto")
             link_arr+=("$row_link")
         done < <(jq -r '.links // {} | to_entries[] | [.key, .value] | @tsv' "$state_path" 2>/dev/null)
     fi
@@ -10593,7 +10596,7 @@ _batch_create_nodes() {
 _cf_wrap_menu() {
     clear
     echo -e "  ${CYAN}【一键套 CF】${NC}"
-    echo -e "    ${GREEN}[1]${NC} CF Origin Rules 版 (xray + DNS/证书/规则重建, 需公网IP)"
+    echo -e "    ${GREEN}[1]${NC} CF Origin Rules 版 (sing-box + DNS/证书/规则重建, 需公网IP)"
     echo -e "    ${GREEN}[2]${NC} CF Argo 隧道版 (cloudflared 全出站, 免端口放行)"
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
