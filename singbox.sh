@@ -22,6 +22,10 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.69: 添加节点菜单 (sx→[1]) 直接给出证书入口 —— 新增 [7] 一键申请证书 / [8] 证书管理
+#           (原来只在 [4] 更多协议里, 建 HY2/TUIC 时看不到「暂无证书」, 容易以为只能用自签);
+#           [2] Hysteria2 标注「需 UDP 可用」(HY2 是 QUIC over UDP, 与 TUIC 同理);
+#           清理批量创建里永远不可达的分支 (2/3/4/5/7/9, 白名单只放行 1/6/10) 与重复校验
 #     1.68: 批量 / 三合一 也支持复用已申请证书 —— 原来批量模式一律静默自签,
 #           已申请证书在「三合一」和「批量创建」里完全用不上; 现在向导里问一次
 #           (BATCH_CERT_MODE), 统一套用到本次创建的所有节点; 单节点文案同步标注
@@ -106,7 +110,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.68"
+export SCRIPT_VERSION="1.69"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -10377,10 +10381,6 @@ _batch_create_nodes() {
             _error "协议 ID $pid 不在虫虫版白名单内 (仅支持 1=Reality / 6=Hysteria2 / 10=SOCKS5)。"
             return 1
         fi
-        if [[ "$pid" =~ ^(2|3|4)$ ]]; then
-            _error "协议 ID $pid (WebSocket/gRPC+TLS) 不支持批量创建，请使用单节点模式单独创建以开启高级 CDN 优化。"
-            return 1
-        fi
         ((proto_count++))
         if [[ "$pid" == "8" ]]; then
             has_ss=true
@@ -10569,14 +10569,10 @@ _batch_create_nodes() {
 
             case $pid in
                 1) _add_vless_reality || batch_failed=true ;;
-                2) _add_vless_ws_tls || batch_failed=true ;;
-                3) _add_trojan_ws_tls || batch_failed=true ;;
-                4) _add_vless_grpc_tls || batch_failed=true ;;
-                5) _add_anytls || batch_failed=true ;;
                 6) _add_hysteria2 || batch_failed=true ;;
-                7) _add_tuic || batch_failed=true ;;
-                9) _add_vless_tcp || batch_failed=true ;;
                 10) _add_socks || batch_failed=true ;;
+                # SX: 白名单只放行 1/6/10 —— 原 2/3/4/5/7/9 分支永远不可达
+                #     (7 是 _add_tuic, 看着像支持批量建 TUIC, 实际被白名单拒), 已删除
             esac
             [ "$batch_failed" = false ] || break
             ((bulk_idx++))
@@ -10973,7 +10969,7 @@ _show_add_node_menu() {
     
     echo -e "  ${CYAN}【协议选择】${NC}"
     echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision"
-    echo -e "    ${GREEN}[2]${NC} Hysteria2 (自签 / 已申请证书)"
+    echo -e "    ${GREEN}[2]${NC} Hysteria2 (自签 / 已申请证书, 需 UDP 可用)"
     echo -e "    ${GREEN}[3]${NC} 一键临时argo (全自动)"
     echo -e "    ${GREEN}[4]${NC} 更多协议 (AnyTLS / TUIC / WS+TLS / Trojan / SS-2022)"
     echo ""
@@ -10985,6 +10981,19 @@ _show_add_node_menu() {
     echo -e "  ${CYAN}【其他】${NC}"
     echo -e "    ${GREEN}[6]${NC} 伪装域名 (SNI) 优选: ${CYAN}${DEFAULT_SNI}${NC}"
     echo ""
+
+    # SX: 证书入口放这里 —— 以前只在 [4] 更多协议里, 建 HY2/TUIC 时看不到「暂无证书」,
+    #     容易以为节点只能用自签, 还得退出去找
+    echo -e "  ${CYAN}【证书】${NC}"
+    local cert_count="0"
+    cert_count=$(_cert_index_count 2>/dev/null || echo 0)
+    echo -e "    ${GREEN}[7]${NC} 一键申请证书 (Cloudflare 自动解析 + 自动续期)"
+    if [ "${cert_count:-0}" -gt 0 ] 2>/dev/null; then
+        echo -e "    ${GREEN}[8]${NC} 证书管理 (已申请 ${cert_count} 张, 创建节点时可选)"
+    else
+        echo -e "    ${GREEN}[8]${NC} 证书管理 (暂无已申请证书)"
+    fi
+    echo ""
     echo -e "  ${YELLOW}端口统一写法: 单填=内外一致 / 内部:暴露 / 回车=随机 30000-50000${NC}"
     echo ""
     
@@ -10992,7 +11001,7 @@ _show_add_node_menu() {
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
     
-    read -p "  请输入选项 [0-6]: " choice
+    read -p "  请输入选项 [0-8]: " choice
 
     case $choice in
         # SX: 建完节点会打印链接, 主菜单下一轮 clear 会瞬间擦掉 → 每个分支后停留
@@ -11003,6 +11012,8 @@ _show_add_node_menu() {
         # 三合一函数尾部自带 _pause_back, 这里不重复
         5) _run_main_create_transaction _add_trio_quick ;;
         6) _set_default_sni ;;
+        7) _cert_apply; _pause_back ;;
+        8) _cert_menu ;;
         0) return ;;
         *) _error "无效输入，请重试。"; _pause_back; return 1 ;;
     esac
