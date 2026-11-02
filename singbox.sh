@@ -22,6 +22,10 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.72: AnyTLS 菜单去掉「同时创建」—— 它固定占用 port+1, NAT 场景第二个节点常连不通,
+#           且两节点共用同一 SNI/密码, 收益有限; 现在只有 [1] Any-Reality / [2] AnyTLS,
+#           想两个都要就建两次(端口各自指定)。顺带修 AnyTLS/Any-Reality 忽略「内部:暴露」的问题:
+#           之前把对外端口当成监听端口, 现在监听内部口、链接用暴露口(与 WS+TLS 一致)
 #     1.71: 更多协议菜单去掉 [3]/[4] 的「可套 CDN」标注 (容易误解为脚本会自动套),
 #           改为底部一行指路: 套 CF/CDN 用主菜单 [2], 并注明 CF-A/CF-B 均只建 VLESS
 #     1.70: 协议菜单去重与措辞校正 —— [4] 更多协议的【证书】栏与 [1] 重复, 删掉只留一行指路
@@ -116,7 +120,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.71"
+export SCRIPT_VERSION="1.72"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -5862,6 +5866,8 @@ _create_anytls_tls_node() {
     local server_name="$3"
     local password="$4"
     local name="$5"
+    # SX: 第 6 参 = 对外(链接)端口; 内部:暴露 写法时监听内部口, 链接用暴露口
+    local link_port="${6:-$2}"
 
     # --- 步骤 4: 证书 (自签 / 已申请证书二选一) ---
     # SX: 默认自签 + 链接内 pcs 指纹; 也可直接复用 [6] 申请的 Let's Encrypt 证书。
@@ -5911,7 +5917,7 @@ _create_anytls_tls_node() {
     local proxy_json=$(jq -n \
         --arg n "$name" \
         --arg s "$yaml_ip" \
-        --arg p "$port" \
+        --arg p "$link_port" \
         --arg pw "$password" \
         --arg sn "$server_name" \
         --arg skip_verify_bool "$skip_verify" \
@@ -5940,7 +5946,7 @@ _create_anytls_tls_node() {
     
     # _show_node_link 负责输出并保存最终分享链接。
     _success "AnyTLS 节点 [${name}] 添加成功!"
-    _show_node_link "anytls" "$name" "$link_ip" "$port" "$tag" "$password" "$server_name" "$skip_verify" "$cert_path" || return 1
+    _show_node_link "anytls" "$name" "$link_ip" "$link_port" "$tag" "$password" "$server_name" "$skip_verify" "$cert_path" || return 1
 }
 
 _create_anyreality_node() {
@@ -5949,6 +5955,7 @@ _create_anyreality_node() {
     local server_name="$3"
     local password="$4"
     local name="$5"
+    local link_port="${6:-$2}"
     local tag="any-reality-in-${port}"
 
     local keypair private_key public_key short_id
@@ -5991,7 +5998,7 @@ _create_anyreality_node() {
     local link_ip="$node_ip"
     [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
 
-    local share_link="anytls://${password}@${link_ip}:${port}?security=reality&sni=${server_name}&fp=chrome&pbk=$(_url_encode "$public_key")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
+    local share_link="anytls://${password}@${link_ip}:${link_port}?security=reality&sni=${server_name}&fp=chrome&pbk=$(_url_encode "$public_key")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
     local meta_json
     meta_json=$(jq -n \
         --arg type "any-reality" \
@@ -6023,20 +6030,16 @@ _add_anytls() {
     else
         _info "--- 添加 AnyTLS / Any-Reality 节点 ---"
         echo "请选择节点协议:"
-        echo "  1) Any-Reality   ← 默认, 推荐 (抗 TLS-in-TLS 指纹)"
+        echo "  1) Any-Reality   ← 默认, 推荐 (抗 TLS-in-TLS 指纹, 免证书)"
         echo "  2) AnyTLS (自签证书 / 已申请证书)"
-        echo "  3) 同时创建 AnyTLS + Any-Reality"
-        read -p "请选择 [1-3] (默认: 1=Any-Reality): " _mode_sel
+        echo "     两个都要就建两次, 端口可各自指定"
+        read -p "请选择 [1-2] (默认: 1=Any-Reality): " _mode_sel
         _mode_sel=${_mode_sel:-1}
+        # SX: 去掉「同时创建」—— 它固定占用 port+1, NAT 场景第二个节点常连不通,
+        #     且两个节点共用同一 SNI/密码, 收益有限; 分两次建端口还能各自选
         case "$_mode_sel" in
             1) mode_choice=2 ;;      # Any-Reality
             2) mode_choice=1 ;;      # AnyTLS
-            3) mode_choice="1,2" ;;  # 两个都建
-            *) mode_choice="$_mode_sel" ;;  # 兼容直接输入 1,2 / 2,1
-        esac
-        mode_choice=$(echo "$mode_choice" | tr '，' ',' | xargs)
-        case "$mode_choice" in
-            1|2|1,2|2,1|"1 2"|"2 1") ;;
             *) _error "无效选择"; return 1 ;;
         esac
 
@@ -6058,14 +6061,6 @@ _add_anytls() {
             fi
             [[ -z "$port" ]] && _error "端口不能为空" && continue
             _check_port_conflict "$port" "tcp" && continue
-            if [[ "$mode_choice" == "1,2" || "$mode_choice" == "2,1" || "$mode_choice" == "1 2" || "$mode_choice" == "2 1" ]]; then
-                local reality_port=$((port + 1))
-                if [ "$reality_port" -gt 65535 ]; then
-                    _error "同时创建两个节点时，起始端口不能为 65535。"
-                    continue
-                fi
-                _check_port_conflict "$reality_port" "tcp" && continue
-            fi
             break
         done
         read -p "请输入伪装域名/SNI (默认: ${DEFAULT_SNI}): " camouflage_domain
@@ -6093,7 +6088,7 @@ _add_anytls() {
                 custom_name=""  # SX: 节点名自动取默认, 不再询问
                 name=$(_unique_node_name "${custom_name:-$default_name}")
             fi
-            _create_anytls_tls_node "$node_ip" "$client_port" "$server_name" "$password" "$name" || return 1
+            _create_anytls_tls_node "$node_ip" "$port" "$server_name" "$password" "$name" "$client_port" || return 1
             created=true
             ;;
         2)
@@ -6105,27 +6100,7 @@ _add_anytls() {
                 custom_name=""  # SX: 节点名自动取默认, 不再询问
                 name=$(_unique_node_name "${custom_name:-$default_name}")
             fi
-            _create_anyreality_node "$node_ip" "$client_port" "$server_name" "$password" "$name" || return 1
-            created=true
-            ;;
-        1,2|2,1|"1 2"|"2 1")
-            local tls_port="$port"
-            local reality_port=$((port + 1))
-            local tls_name reality_name
-            if [ "$BATCH_MODE" = "true" ]; then
-                tls_name=$(_unique_node_name "AnyTLS-${tls_port}")
-                reality_name=$(_unique_node_name "Any-Reality-${reality_port}")
-            else
-                local default_tls_name="AnyTLS-${tls_port}"
-                local default_reality_name="Any-Reality-${reality_port}"
-                _info "同时创建时，Any-Reality 将使用端口 ${reality_port}。"
-                custom_tls_name=""  # SX: 节点名自动取默认, 不再询问
-                tls_name=$(_unique_node_name "${custom_tls_name:-$default_tls_name}")
-                custom_reality_name=""  # SX: 节点名自动取默认, 不再询问
-                reality_name=$(_unique_node_name "${custom_reality_name:-$default_reality_name}")
-            fi
-            _create_anytls_tls_node "$node_ip" "$client_port" "$server_name" "$password" "$tls_name" || return 1
-            _create_anyreality_node "$node_ip" "$(( client_port + 1 ))" "$server_name" "$password" "$reality_name" || return 1
+            _create_anyreality_node "$node_ip" "$port" "$server_name" "$password" "$name" "$client_port" || return 1
             created=true
             ;;
     esac
