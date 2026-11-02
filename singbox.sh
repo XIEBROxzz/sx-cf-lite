@@ -22,6 +22,8 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.71: 更多协议菜单去掉 [3]/[4] 的「可套 CDN」标注 (容易误解为脚本会自动套),
+#           改为底部一行指路: 套 CF/CDN 用主菜单 [2], 并注明 CF-A/CF-B 均只建 VLESS
 #     1.70: 协议菜单去重与措辞校正 —— [4] 更多协议的【证书】栏与 [1] 重复, 删掉只留一行指路
 #           (编号回到 [0-5]); 各协议标注「免证书 / 需证书」, 并修正「都不如 Reality」与
 #           Any-Reality 自相矛盾的提示; 选「已申请证书」时会明确告知 SNI 被证书域名替换
@@ -114,7 +116,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.70"
+export SCRIPT_VERSION="1.71"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -10659,8 +10661,8 @@ _show_more_protocols_menu() {
         echo -e "  ${CYAN}【可选协议】${NC}"
         echo -e "    ${GREEN}[1]${NC} AnyTLS / Any-Reality (Any-Reality 免证书, AnyTLS 需证书)"
         echo -e "    ${GREEN}[2]${NC} TUIC (自签 / 已申请证书, 需 UDP 可用)"
-        echo -e "    ${YELLOW}[3]${NC} VLESS + WS + TLS (自签 / 已申请证书, 可套 CDN)"
-        echo -e "    ${YELLOW}[4]${NC} Trojan + WS + TLS (自签 / 已申请证书, 可套 CDN)"
+        echo -e "    ${YELLOW}[3]${NC} VLESS + WS + TLS (自签 / 已申请证书)"
+        echo -e "    ${YELLOW}[4]${NC} Trojan + WS + TLS (自签 / 已申请证书)"
         echo -e "    ${YELLOW}[5]${NC} Shadowsocks-2022 (含 ShadowTLS v3, 免证书)"
         echo ""
         # SX: 证书入口已上移到 [1] 添加节点菜单, 这里只留一行指路, 不重复列菜单
@@ -10668,8 +10670,8 @@ _show_more_protocols_menu() {
         echo ""
         echo -e "  ${YELLOW}提示: 直连首选仍是主菜单 [1] VLESS + Reality;${NC}"
         echo -e "  ${YELLOW}      本页 [1] 的 Any-Reality 同属 Reality 系, 也可直连。${NC}"
-        echo -e "  ${YELLOW}      [2] TUIC 走 UDP (需放行 UDP); [3]/[4] WS+TLS 适合套 CDN;${NC}"
-        echo -e "  ${YELLOW}      [5] SS-2022 靠 ShadowTLS 伪装, 不依赖证书。${NC}"
+        echo -e "  ${YELLOW}      [2] TUIC 走 UDP (需放行 UDP); [5] SS-2022 靠 ShadowTLS 伪装, 不依赖证书。${NC}"
+        echo -e "  ${YELLOW}      套 CF / CDN 请用主菜单 [2] 一键套 CF —— CF-A 橙云 / CF-B Argo 均只建 VLESS。${NC}"
         echo ""
         echo -e "  ───────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回"
