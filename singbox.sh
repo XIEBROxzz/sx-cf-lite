@@ -22,16 +22,6 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
-#     1.79: [16] 进阶转发新增「前置」层 —— 原来只有 入口→落地 两层, 想加一跳前置只能手改
-#           relay.json。现在: [1] 前置机/落地机通用 Token (同一份 Token 两种角色都能用);
-#           [2] 添加前置 / [3] 添加落地, 各自两个来源 (Token / 第三方节点);
-#           [8]→[3] 给落地挂前置 (写 outbound.detour); [4] 链路显示 入口 → [前置] → 落地;
-#           [5] 删除拆成「前置 / 落地」两项。
-#           前置台账单独存 relay_pre.json (不混进 relay_links.json —— 后者被当落地台账遍历,
-#           混进去会被 _clear_all_relays 当落地去删 clash.yaml 节点)。
-#           删除前置前先查 detour 引用, 被引用则拒绝 —— 悬空 detour 会让 sing-box 启动直接
-#           FATAL, 整机节点一起挂; 落地是 HY2/TUIC (UDP 传输) 时拒绝 http/anytls 前置;
-#           前置只允许单层, 不做嵌套。
 #     1.78: 卸载清理解析改为全自动 —— 原来指向他机时逐条弹 y/N, 都卸载了还挨个问;
 #           现在能删的直接删 (只删仍指向本机的), 指向他机/记录不存在/删除失败的
 #           收进清单, 卸载末尾一次性列出, 提示去 CF 后台处理; 全清干净则无提示。
@@ -157,7 +147,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79"
+export SCRIPT_VERSION="1.78"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -257,7 +247,6 @@ _secure_state_permissions() {
     for path in \
         "$CONFIG_FILE" "$CLASH_YAML_FILE" "$METADATA_FILE" "$ARGO_METADATA_FILE" \
         "${SINGBOX_DIR}/relay.json" "${SINGBOX_DIR}/relay_links.json" \
-        "${SINGBOX_DIR}/relay_pre.json" \
         "${SINGBOX_DIR}/relay_pf.json" "$SINGBOX_CORE_LOCK_FILE" "/usr/local/etc/xray/config.json" \
         "/usr/local/etc/xray/metadata.json"; do
         [ -f "$path" ] && chmod 600 "$path" 2>/dev/null || true

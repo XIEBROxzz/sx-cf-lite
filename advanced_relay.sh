@@ -8,14 +8,10 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 umask 077
 
 # ┌─ 文件说明（配置地基）─────────────────────────────
-# │ advanced_relay.sh = [16] 落地分流 / 中转 / 前置 / 第三方节点导入 / WARP 出站管理
-# │ 地基：/usr/local/etc/sing-box/{relay.json, relay_links.json, relay_pre.json,
-# │       relay_pf.json, warp.json}
+# │ advanced_relay.sh = [18] 落地分流 / 中转 / 第三方节点导入 / WARP 出站管理
+# │ 地基：/usr/local/etc/sing-box/{relay.json, relay_links.json, relay_pf.json, warp.json}
 # │       relay.json 随主服务双重加载 (run -c config.json -c relay.json)，其为全局规则——
 # │       对主配置内全部入站 (含 CF-A 的 cfa-*) 天然生效
-# │ 三层链路: 客户端 → 入口(inbound) → [前置 relay-pre-*] → 落地(relay-out-*) → 目标
-# │       前置靠落地出站的 detour 挂载, 只允许单层; 台账分文件存放 ——
-# │       relay_links.json 是"落地台账"(被 _clear_all_relays 逐条遍历), 前置混进去会被误当落地
 # │ v1.0: WARP 的 route.rule_set 定义与规则同文件 (relay.json, sing-box 多配置 route 域不跨
 # │       文件解析); 清空中转全量释放 relay.json 入站 (覆盖所有标签形态); 导入界面 auto 直通;
 # │       清空/删除中转跳过复用入口 (reused) —— 不触碰主配置节点的证书/私钥, 防重启读证书失败
@@ -89,9 +85,6 @@ MAIN_METADATA_FILE="${SINGBOX_DIR}/metadata.json"
 RELAY_AUX_DIR="${SINGBOX_DIR}"
 RELAY_CLASH_YAML="${RELAY_AUX_DIR}/clash.yaml"
 RELAY_CONFIG_FILE="${RELAY_AUX_DIR}/relay.json"
-# SX: 前置节点台账 —— 必须与 relay_links.json 分开。后者被当"落地台账"遍历
-# (_clear_all_relays 拿它的每个 key 去删 clash.yaml 节点), 前置混进去会被当落地处理。
-RELAY_PRE_FILE="${RELAY_AUX_DIR}/relay_pre.json"
 STATE_LOCK_FILE="${SINGBOX_DIR}/.singboxlite.lock"
 RUN_DIR="/run/singboxlite"
 SINGBOX_PID_FILE="${RUN_DIR}/sing-box.pid"
@@ -736,7 +729,6 @@ _txn_cleanup() {
                 "$dir/relay" "$dir/relay.absent" \
                 "$dir/links" "$dir/links.absent" \
                 "$dir/clash" "$dir/clash.absent" \
-                "$dir/pre" "$dir/pre.absent" \
                 "$dir/pf" "$dir/pf.absent" 2>/dev/null || true
             rmdir -- "$dir" 2>/dev/null || true
             ;;
@@ -963,11 +955,6 @@ _init_relay_dirs() {
         echo '{}' > "$LINKS_FILE"
         _info "已初始化链接存储文件: $LINKS_FILE"
     fi
-
-    # 确保 relay_pre.json 存在 (前置台账, 与落地台账分离)
-    if [ ! -f "$RELAY_PRE_FILE" ]; then
-        echo '{}' > "$RELAY_PRE_FILE"
-    fi
     
     # 确保 clash.yaml 存在
     if [ ! -f "$RELAY_CLASH_YAML" ]; then
@@ -1034,7 +1021,6 @@ EOF
     fi
     _ensure_relay_yaml_groups || { [ "$acquired" = "true" ] && _state_lock_release; return 1; }
     _secure_state_file "$LINKS_FILE"
-    _secure_state_file "$RELAY_PRE_FILE"
     _secure_state_file "$RELAY_CLASH_YAML"
     _secure_state_file "$RELAY_CONFIG_FILE"
     [ -e "${RELAY_AUX_DIR}/relay_pf.json" ] && _secure_state_file "${RELAY_AUX_DIR}/relay_pf.json"
@@ -1347,16 +1333,9 @@ _manual_socks_outbound() {
 
 # --- 2.1 导入第三方节点 ---
 _import_link_config() {
-    # SX: 角色由菜单决定 (pre / landing); 解析与校验逻辑两种角色完全一致
-    local role="${1:-landing}" role_label="落地"
-    [ "$role" = "pre" ] && role_label="前置"
     echo -e "${CYAN}"
     echo '  ╔═══════════════════════════════════════╗'
-    if [ "$role" = "pre" ]; then
-        echo '  ║     添加前置：导入第三方节点          ║'
-    else
-        echo '  ║     添加落地：导入第三方节点          ║'
-    fi
+    echo '  ║     中转机：导入第三方落地节点        ║'
     echo '  ╚═══════════════════════════════════════╝'
     echo -e "${NC}"
     echo -e "    ${GREEN}[1]${NC} ${YELLOW}自动导入 (推荐 - 粘贴任意链接, 自动识别协议)${NC}"
@@ -1467,7 +1446,7 @@ _import_link_config() {
         _pause_relay
         return 1
     fi
-    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json" "$frag_name" "$role" || { _pause_relay; return 1; }
+    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json" "$frag_name" || { _pause_relay; return 1; }
 }
 
 # 检查依赖 (主脚本已预装绝大部分，此处仅做快速校验)
@@ -1493,9 +1472,8 @@ _check_root() {
 
 # --- 1. 落地机配置 (生成 Token) ---
 _landing_config() {
-    echo -e "\n  ${CYAN}【前置机/落地机：生成全协议 Token】${NC}"
-    echo -e "  ${YELLOW}Token 就是本机某个节点的出站参数, 同一份既能当落地也能当前置${NC}"
-    _info "正在加载本地节点..."
+    echo -e "\n  ${CYAN}【落地机：生成全协议 Token】${NC}"
+    _info "正在加载本地落地节点..."
     
     if [ ! -f "$MAIN_CONFIG_FILE" ]; then
         _error "配置文件不存在: $MAIN_CONFIG_FILE"
@@ -1526,8 +1504,8 @@ _landing_config() {
     fi
 
     if [ -z "$nodes" ]; then
-        _error "未找到任何节点。"
-        _warn "请先去主菜单 [1] 添加节点 创建节点。"
+        _error "未找到任何落地节点。"
+        _warn "请先去主菜单 [1) 添加节点] 创建节点。"
         read -n 1 -s -r -p "$(echo -e ${YELLOW}"按任意键返回..."${NC})"   # SX: 特例 —— 落地配置报错需按键确认, 防止没看清
         return
     fi
@@ -1591,7 +1569,7 @@ _landing_config() {
         echo -e "${YELLOW}[注意] 已自动隐藏 Shadowsocks-2022 节点 (因需要同步时间，屏蔽SS2022加密)${NC}"
     fi
     
-    read -p "  请选择要导出的节点编号: " choice
+    read -p "  请选择落地节点编号: " choice
     if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || [ "$choice" -ge "$i" ]; then
         _warn "无效选择。"; read -n 1 -s -r -p "按任意键返回..."
         return
@@ -1821,7 +1799,7 @@ _landing_config() {
             read -n 1 -s -r -p "$(echo -e ${YELLOW}"按任意键返回..."${NC})"   # SX: 特例 —— 落地配置报错需按键确认, 防止没看清
             return
         fi
-        _info "使用说明: 在中转机上用 [2] 添加前置 或 [3] 添加落地 导入此 Token。"
+        _info "使用说明: 请在中转机上使用 [2] 导入此 Token。"
     else
         _error "Token 生成失败。"
     fi
@@ -1907,16 +1885,9 @@ _finalize_relay_setup() {
     local dest_port="$3"
     local outbound_json="$4"
     local default_name="$5"
-    # SX: 角色 —— landing (落地) | pre (前置)。两条导入路径 ([2] Token / [3] 分享链接)
-    #     都汇到这里, 所以角色只在这一处分支, 导入侧不用各写一遍。
-    local role="${6:-landing}"
-    local is_pre="false"
-    [ "$role" = "pre" ] && is_pre="true"
-    local role_label="落地"
-    [ "$is_pre" = "true" ] && role_label="前置"
 
     if ! _valid_port "$dest_port" || ! _valid_server_address "$dest_addr"; then
-        _error "${role_label}节点服务器地址或端口无效"
+        _error "落地节点服务器地址或端口无效"
         sleep 2   # SX: 报错停留, 免被菜单 clear 瞬间擦掉
         return 1
     fi
@@ -1926,26 +1897,20 @@ _finalize_relay_setup() {
         and (.server | type == "string" and length > 0)
         and (.server_port | type == "number" and floor == . and . >= 1 and . <= 65535)
     ' >/dev/null 2>&1; then
-        _error "${role_label} outbound JSON 不完整或端口越界"
+        _error "落地 outbound JSON 不完整或端口越界"
         sleep 2
         return 1
     fi
 
-    _success "已解析${role_label}节点: ${dest_type} -> ${dest_addr}:${dest_port}"
+    _success "已解析落地节点: ${dest_type} -> ${dest_addr}:${dest_port}"
     if [ "$dest_type" == "http" ]; then
-        _warn "【提示】HTTP/HTTPS 代理节点通常仅支持 TCP (HTTP CONNECT)，不能承载 UDP。"
-        [ "$is_pre" = "true" ] && _warn "作为前置时，若落地是 Hysteria2/TUIC (UDP 传输)，这条链路会连不上。"
-    fi
-    if [ "$dest_type" == "anytls" ] && [ "$is_pre" = "true" ]; then
-        _warn "【提示】AnyTLS 出站不支持 UDP：作前置时不能配给 Hysteria2/TUIC 落地。"
+        _warn "【提示】HTTP/HTTPS 代理落地节点通常仅支持 TCP (HTTP CONNECT)，不支持 UDP 转发。"
     fi
 
-    # SX: 落地 relay-out-<4位> / 前置 relay-pre-<4位>, 各自避免与已有出站撞名
-    local tag_prefix="relay-out-"
-    [ "$is_pre" = "true" ] && tag_prefix="relay-pre-"
+    # SX: 落地编号 relay-out-<唯一4位> (避免与已有出站撞名)
     local out_tag
     while :; do
-        out_tag="${tag_prefix}$(( (RANDOM % 9000) + 1000 ))"
+        out_tag="relay-out-$(( (RANDOM % 9000) + 1000 ))"
         if ! jq -e --arg t "$out_tag" '.outbounds[]? | select(.tag == $t)' "$RELAY_CONFIG_FILE" >/dev/null 2>&1; then
             break
         fi
@@ -1963,69 +1928,53 @@ _finalize_relay_setup() {
     # SX: 粘贴分享链接时剪贴板常带多余换行, 残留会被下一个 read 立刻吃掉 →
     #     表现为"名称提示一闪而过, 没法改名"。这里先清掉残留再问。
     _flush_pending_stdin
-    read -p "  请输入${role_label}节点名称 (直接回车 = ${node_name}): " _input_name
+    read -p "  请输入落地节点名称 (直接回车 = ${node_name}): " _input_name
     # 去首尾空白; 只敲了空格视同直接回车
     _input_name="${_input_name#"${_input_name%%[![:space:]]*}"}"
     _input_name="${_input_name%"${_input_name##*[![:space:]]}"}"
     [ -n "$_input_name" ] && node_name="$_input_name"
 
-    _info "正在写入${role_label}节点 ${node_name} (${out_tag})..."
+    _info "正在写入落地节点 ${node_name} (${out_tag})..."
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    # 前置记 relay_pre.json, 落地记 relay_links.json —— 两者消费方完全不同
-    local META_FILE="$LINKS_FILE"
-    [ "$is_pre" = "true" ] && META_FILE="$RELAY_PRE_FILE"
     local txn_dir failed="false"
     _state_lock_acquire || return 1
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
     if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" pre "$RELAY_PRE_FILE"; then
+        || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE"; then
         _txn_cleanup "$txn_dir"; _state_lock_release
         _error "无法创建配置快照，已取消"
         sleep 2; return 1
     fi
     if ! _atomic_modify_json "$CONFIG_FILE" '.outbounds = ((.outbounds // []) + ['"$outbound_json"'])'; then failed="true"; fi
     local metadata
-    if [ "$is_pre" = "true" ]; then
-        metadata=$(jq -nc --arg t "$out_tag" --arg n "$node_name" --arg lt "$dest_type" --arg la "${dest_addr}:${dest_port}" \
-            --arg c "$(date '+%Y-%m-%d %H:%M:%S')" '{node_name:$n,pre_type:$lt,pre_addr:$la,created_at:$c}')
-    else
-        metadata=$(jq -nc --arg t "$out_tag" --arg n "$node_name" --arg lt "$dest_type" --arg la "${dest_addr}:${dest_port}" \
-            --arg c "$(date '+%Y-%m-%d %H:%M:%S')" '{node_name:$n,landing_type:$lt,landing_addr:$la,created_at:$c,relay_mode:"all"}')
-    fi
+    metadata=$(jq -nc --arg t "$out_tag" --arg n "$node_name" --arg lt "$dest_type" --arg la "${dest_addr}:${dest_port}" \
+        --arg c "$(date '+%Y-%m-%d %H:%M:%S')" '{node_name:$n,landing_type:$lt,landing_addr:$la,created_at:$c,relay_mode:"all"}')
     if [ "$failed" != "true" ]; then
-        _atomic_modify_json "$META_FILE" '.["'"$out_tag"'"] = '"$metadata"'' || true
+        _atomic_modify_json "$LINKS_FILE" '.["'"$out_tag"'"] = '"$metadata"'' || true
     fi
     if [ "$failed" = "true" ] || ! _restart_checked; then
         _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
         _txn_restore_file "$txn_dir" links "$LINKS_FILE"
-        _txn_restore_file "$txn_dir" pre "$RELAY_PRE_FILE"
         _manage_service restart >/dev/null 2>&1 || true
         _txn_cleanup "$txn_dir"
         _state_lock_release
-        _error "${role_label}导入失败，已恢复原配置"
+        _error "落地导入失败，已恢复原配置"
         sleep 2
         return 1
     fi
     _secure_state_file "$CONFIG_FILE"
     _secure_state_file "$LINKS_FILE"
-    [ "$is_pre" = "true" ] && _secure_state_file "$RELAY_PRE_FILE"
     _txn_cleanup "$txn_dir"
     _state_lock_release
-    _log_operation "IMPORT_$( [ "$is_pre" = "true" ] && printf 'PRE' || printf 'LANDING')" \
-        "Tag: $out_tag, ${role_label}: ${dest_type}@${dest_addr}:${dest_port}, Name: $node_name"
+    _log_operation "IMPORT_LANDING" "Tag: $out_tag, Landing: ${dest_type}@${dest_addr}:${dest_port}, Name: $node_name"
 
     echo -e "${YELLOW}═══════════════════ 配置成功 ═══════════════════${NC}"
-    _success "${role_label}节点已导入！"
-    echo -e "  ${role_label}名称: ${GREEN}$node_name${NC}"
-    echo -e "  ${role_label}编号: ${CYAN}$out_tag${NC}"
-    echo -e "  ${role_label}地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
-    if [ "$is_pre" = "true" ]; then
-        echo -e "  挂载状态: ${YELLOW}未挂载 —— 前置要挂到落地才生效: [8] 中转分流管理 → [3] 给落地挂前置${NC}"
-    else
-        echo -e "  对接状态: ${YELLOW}未对接 —— 入口对接请在 [8] 中转分流管理 → [1] 设置中转节点 (扫描入口, 多选落地)${NC}"
-    fi
+    _success "落地节点已导入！"
+    echo -e "  落地名称: ${GREEN}$node_name${NC}"
+    echo -e "  落地编号: ${CYAN}$out_tag${NC}"
+    echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
+    echo -e "  对接状态: ${YELLOW}未对接 —— 入口对接请在 [8] 中转分流管理 → [1] 设置中转节点 (扫描入口, 多选落地)${NC}"
     echo ""
     # SX: 单次添加 —— 加完按任意键回菜单, 想继续加再进 [2]/[3] 走一遍新的添加流程
     _pause_anykey
@@ -2035,11 +1984,8 @@ _finalize_relay_setup() {
 
 # --- 2. 中转机配置 (导入 Token) ---
 _relay_config() {
-    # SX: 角色由菜单决定 (pre / landing) —— Token 本身不带角色, 同一 Token 两种用途通用
-    local role="${1:-landing}" role_label="落地" token_from="落地机"
-    if [ "$role" = "pre" ]; then role_label="前置"; token_from="前置机"; fi
-    echo -e "\n  ${CYAN}【添加${role_label} (导入 Token)】${NC}"
-    echo -e "  请输入来自 [${token_from}] 的 Token 字符串:"
+    echo -e "\n  ${CYAN}【配置为 [中转机] (导入 Token)】${NC}"
+    echo -e "  请输入来自 [落地机] 的 Token 字符串:"
     echo ""
     read -r token_input
     
@@ -2112,11 +2058,11 @@ _relay_config() {
     if [ -z "$outbound_json" ]; then _error "Token 解析失败"; read -r -p "  按回车键返回..."; return; fi
     local tok_name=$(echo "$decoded_json" | jq -r '.name // empty' 2>/dev/null)
     # 提供重命名选项，与 _import_link_config 保持一致
-    _info "已解析节点: ${dest_type} -> ${dest_addr}:${dest_port}"
+    _info "已解析落地节点: ${dest_type} -> ${dest_addr}:${dest_port}"
     if [ "$dest_type" == "http" ]; then
-        _warn "【提示】HTTP/HTTPS 代理节点通常仅支持 TCP (HTTP CONNECT)，不能承载 UDP。"
+        _warn "【提示】HTTP/HTTPS 代理落地节点通常仅支持 TCP (HTTP CONNECT)，不支持 UDP 转发。"
     fi
-    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json" "$tok_name" "$role" || { read -r -p "  按回车键返回..."; return 1; }
+    _finalize_relay_setup "$dest_type" "$dest_addr" "$dest_port" "$outbound_json" "$tok_name" || { read -r -p "  按回车键返回..."; return 1; }
 }
 
 # --- 3. 查看落地与对接关系 ---
@@ -2131,32 +2077,16 @@ _view_relays() {
     [ -f "$RELAY_CONFIG_FILE" ] || { _error "配置文件不存在。"; return; }
 
     echo -e "  ${CYAN}【落地节点】${NC}"
-    local i=1 ot nn land mdisp has="0" _pt _pn
+    local i=1 ot nn land mdisp has="0"
     while IFS='|' read -r ot nn land mdisp; do
         [ -z "$ot" ] && continue
         has="1"
-        _pt=$(_pre_of_landing "$ot"); _pn=""
-        [ -n "$_pt" ] && _pn=" ${CYAN}←经 $(_pre_name "$_pt")${NC}"
-        echo -e "  ${GREEN}[$i]${NC} ${YELLOW}${nn}${NC} → ${land}   [${mdisp}]${_pn}"
+        echo -e "  ${GREEN}[$i]${NC} ${YELLOW}${nn}${NC} → ${land}   [${mdisp}]"
         i=$((i+1))
     done < <(_relay_list_landing_rows)
     if [ "$has" == "0" ]; then
-        echo -e "    ${YELLOW}暂无落地节点, 请先在 [3] 添加落地${NC}"
+        echo -e "    ${YELLOW}暂无落地节点, 请先在 [2]/[3] 添加${NC}"
     fi
-
-    echo ""
-    echo -e "  ${CYAN}【前置节点】${NC}"
-    local _has_pre="0" pt pn pa patt
-    while IFS='|' read -r pt pn pa patt; do
-        [ -z "$pt" ] && continue
-        _has_pre="1"
-        if [ -n "$patt" ]; then
-            echo -e "    ${YELLOW}${pn}${NC} (${pa})  ${GREEN}已挂: ${patt}${NC}"
-        else
-            echo -e "    ${YELLOW}${pn}${NC} (${pa})  ${YELLOW}未挂载${NC}"
-        fi
-    done < <(_pre_list_rows)
-    [ "$_has_pre" == "0" ] && echo -e "    ${YELLOW}暂无前置节点 (可选, 不加就是 入口 → 落地 直连)${NC}"
 
     echo ""
     echo -e "  ${CYAN}【入口对接关系】${NC}"
@@ -2236,274 +2166,22 @@ _relay_list_landing_rows() {
     done
 }
 
-# ============================================================
-# SX: 前置节点 (relay-pre-*) —— 挂在落地出站的 detour 上
-#   链路: 客户端 → 入口 → [前置] → 落地 → 目标
-#   数据: relay.json outbounds[] 的 relay-pre-* + 落地出站的 .detour
-#         台账 relay_pre.json (前置自己的名字/地址, 与落地台账分离)
-#         挂载关系记在 relay_links.json .[落地tag].pre
-#   约束: 只允许单层 (前置不能再挂前置); 一个前置可被多个落地共用
-# ============================================================
-_pre_list_rows() {
-    # 输出: pre_tag|名称|地址|已挂载的落地名(逗号分隔, 未挂载为空)
-    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    [ -s "$RELAY_PRE_FILE" ] || return 0
-    jq -r 'to_entries[] | [.key, (.value.node_name // .key), (.value.pre_addr // "未知地址")] | @tsv' "$RELAY_PRE_FILE" 2>/dev/null \
-    | while IFS=$'\t' read -r pt pn pa; do
-        [ -n "$pt" ] || continue
-        # 出站被手工删掉 → 台账残留, 跳过 (避免列出点不中的项)
-        jq -e --arg t "$pt" '.outbounds[]? | select(.tag == $t)' "$RELAY_CONFIG_FILE" >/dev/null 2>&1 || continue
-        local att=""
-        if [ -s "$LINKS_FILE" ]; then
-            att=$(jq -r --arg t "$pt" '[to_entries[] | select((.value.pre? // "") == $t) | (.value.node_name // .key)] | join(", ")' "$LINKS_FILE" 2>/dev/null)
-        fi
-        printf '%s|%s|%s|%s\n' "$pt" "$pn" "$pa" "$att"
-    done
-}
-
-_pre_name() {
-    # pre_tag → 显示名 (台账无记录时回退 tag)
-    local pt="$1" nm=""
-    [ -s "$RELAY_PRE_FILE" ] && nm=$(jq -r --arg t "$pt" '.[$t].node_name // empty' "$RELAY_PRE_FILE" 2>/dev/null)
-    [ -n "$nm" ] || nm="$pt"
-    printf '%s' "$nm"
-}
-
-_pre_of_landing() {
-    # 落地 tag → 挂在它上面的前置 tag (无则空)
-    jq -r --arg t "$1" 'first(.outbounds[]? | select(.tag == $t) | .detour) // empty' "$RELAY_CONFIG_FILE" 2>/dev/null
-}
-
-_pre_refs() {
-    # 前置 tag → 引用它的落地 tag (空格分隔)
-    jq -r --arg t "$1" '[.outbounds[]? | select((.detour? // "") == $t) | .tag] | join(" ")' "$RELAY_CONFIG_FILE" 2>/dev/null
-}
-
-_pre_udp_capable() {
-    # 该出站能否承载 UDP —— 用于拦掉"前置 TCP-only + 落地 UDP 协议"的必挂组合。
-    # http/https 只有 CONNECT; anytls 出站没有 UDP 通路 (无 network 字段)。
-    case "$1" in
-        ""|http|https|anytls) return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
-_attach_pre_menu() {
-    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    [ -f "$RELAY_CONFIG_FILE" ] || { _error "配置文件不存在。"; return; }
-    clear
-    echo -e "\n  ${CYAN}【给落地挂前置】挂上后链路: 入口 → 前置 → 落地${NC}"
-    local i=0 ltags=() lot lnn lland lmdisp _pt _pn
-    while IFS='|' read -r lot lnn lland lmdisp; do
-        [ -z "$lot" ] && continue
-        i=$((i+1)); ltags+=("$lot")
-        _pt=$(_pre_of_landing "$lot"); _pn=""
-        [ -n "$_pt" ] && _pn=$(_pre_name "$_pt")
-        echo -e "    ${GREEN}[$i]${NC} ${YELLOW}${lnn}${NC} (${lland})${_pn:+  ${CYAN}前置: ${_pn}${NC}}"
-    done < <(_relay_list_landing_rows)
-    if [ "$i" -eq 0 ]; then
-        _warn "暂无落地节点, 请先在 [3] 添加落地"
-        _pause_relay; return
-    fi
-    echo ""
-    read -p "  选择落地 [1-$i] (0=返回): " lpick
-    if [[ "$lpick" == "0" || -z "$lpick" ]]; then return; fi
-    if ! [[ "$lpick" =~ ^[1-9][0-9]*$ ]] || [ "$lpick" -gt "$i" ]; then _error "无效序号"; sleep 2; return; fi
-    local sel_lt="${ltags[$((lpick-1))]}"
-
-    echo ""
-    echo -e "  ${CYAN}可选前置 (同一前置可被多个落地共用):${NC}"
-    local j=0 ptags=() pt pn pa patt
-    while IFS='|' read -r pt pn pa patt; do
-        [ -z "$pt" ] && continue
-        j=$((j+1)); ptags+=("$pt")
-        echo -e "    ${GREEN}[$j]${NC} ${YELLOW}${pn}${NC} (${pa})${patt:+  ${YELLOW}已挂: ${patt}${NC}}"
-    done < <(_pre_list_rows)
-    if [ "$j" -eq 0 ]; then
-        _warn "暂无前置节点, 请先在 [2] 添加前置"
-        _pause_relay; return
-    fi
-    echo -e "    ${YELLOW}[0]${NC} 解绑 (该落地恢复直连落地)"
-    echo ""
-    read -p "  选择前置 [1-$j] (0=解绑): " ppick
-    [ -z "$ppick" ] && return
-    if ! [[ "$ppick" =~ ^[0-9]+$ ]] || [ "$ppick" -gt "$j" ]; then _error "无效序号"; sleep 2; return; fi
-    local sel_pt=""
-    [ "$ppick" -ne 0 ] && sel_pt="${ptags[$((ppick-1))]}"
-
-    # 兼容校验: 落地是 UDP 传输协议 (HY2/TUIC) 时, 前置必须能承载 UDP,
-    # 否则连接落地这一跳就走不出去 (只会在日志里刷 UDP 相关报错)
-    if [ -n "$sel_pt" ]; then
-        local ltype ptype
-        ltype=$(jq -r --arg t "$sel_lt" 'first(.outbounds[]? | select(.tag == $t) | .type) // ""' "$RELAY_CONFIG_FILE" 2>/dev/null)
-        ptype=$(jq -r --arg t "$sel_pt" 'first(.outbounds[]? | select(.tag == $t) | .type) // ""' "$RELAY_CONFIG_FILE" 2>/dev/null)
-        case "$ltype" in
-            hysteria2|tuic)
-                if ! _pre_udp_capable "$ptype"; then
-                    _error "落地类型是 ${ltype} (UDP 传输), 但前置类型 ${ptype} 不能承载 UDP, 这条链路必然连不上。"
-                    _warn "请换一个前置: VLESS / Trojan / VMess / Shadowsocks / SOCKS5 / Hysteria2 / TUIC。"
-                    _pause_relay; return 1
-                fi ;;
-        esac
-    fi
-
-    local txn_dir failed="false"
-    _state_lock_acquire || return 1
-    txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
-    if ! _txn_snapshot_file "$txn_dir" relay "$RELAY_CONFIG_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE"; then
-        _txn_cleanup "$txn_dir"; _state_lock_release
-        _error "无法创建配置快照，已取消"
-        _pause_relay; return 1
-    fi
-    if ! _atomic_modify_json "$RELAY_CONFIG_FILE" '
-        .outbounds = ((.outbounds // []) | map(
-            if ((.tag? // "") == $lt)
-            then (if $pt == "" then del(.detour) else . + {detour: $pt} end)
-            else . end))
-    ' --arg lt "$sel_lt" --arg pt "$sel_pt"; then failed="true"; fi
-    if [ "$failed" != "true" ]; then
-        _atomic_modify_json "$LINKS_FILE" '.[$lt] = ((.[$lt] // {}) | if $pt == "" then del(.pre) else . + {pre: $pt} end)' \
-            --arg lt "$sel_lt" --arg pt "$sel_pt" || failed="true"
-    fi
-    if [ "$failed" = "true" ] || ! _restart_checked; then
-        _txn_restore_file "$txn_dir" relay "$RELAY_CONFIG_FILE"
-        _txn_restore_file "$txn_dir" links "$LINKS_FILE"
-        _manage_service restart >/dev/null 2>&1 || true
-        _txn_cleanup "$txn_dir"
-        _state_lock_release
-        _error "挂载失败，已恢复原配置"
-        _pause_relay; return 1
-    fi
-    _txn_cleanup "$txn_dir"
-    _state_lock_release
-    local lnm
-    lnm=$(jq -r --arg t "$sel_lt" '.[$t].node_name // empty' "$LINKS_FILE" 2>/dev/null)
-    if [ -n "$sel_pt" ]; then
-        _log_operation "ATTACH_PRE" "Landing: $sel_lt, Pre: $sel_pt"
-        _success "已挂载: ${lnm:-$sel_lt} 改为经 $(_pre_name "$sel_pt") 转发"
-        _info '只影响"连接落地"这一跳; 入口对接与分流规则不变'
-    else
-        _log_operation "DETACH_PRE" "Landing: $sel_lt"
-        _success "已解绑: ${lnm:-$sel_lt} 恢复直连落地"
-    fi
-    _pause_relay
-}
-
-_delete_pre() {
-    [ -f "$RELAY_CONFIG_FILE" ] || { _error "配置文件不存在。"; return; }
-    echo -e "\n  ${RED}【删除前置节点】${NC}"
-    local i=0 rows=() pt pn pa patt
-    while IFS='|' read -r pt pn pa patt; do
-        [ -z "$pt" ] && continue
-        i=$((i+1)); rows+=("$pt|$pn|$pa")
-        echo -e "    ${GREEN}[$i]${NC} ${YELLOW}${pn}${NC} — ${pa}${patt:+  ${YELLOW}已挂: ${patt}${NC}}"
-    done < <(_pre_list_rows)
-    if [ "$i" -eq 0 ]; then
-        _warn "暂无前置节点"
-        _pause_relay; return
-    fi
-    echo ""
-    echo -e "    ${YELLOW}[0]${NC} 返回"
-    echo ""
-    read -p "  请输入要删除的前置序号 [1-$i]: " choice
-    if [[ "$choice" == "0" || -z "$choice" ]]; then return; fi
-    if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || [ "$choice" -gt "$i" ]; then
-        _error "无效序号"; sleep 2; return
-    fi
-    IFS='|' read -r pt pn pa <<< "${rows[$((choice-1))]}"
-
-    # SX: 引用检查 —— detour 指向已删除的出站, sing-box 不是跳过而是启动 FATAL,
-    #     整机所有节点一起失效。所以这里必须拒绝, 不能像删落地那样直接删。
-    local refs refnames
-    refs=$(_pre_refs "$pt")
-    refs=$(printf '%s' "$refs" | xargs 2>/dev/null)
-    if [ -n "$refs" ]; then
-        refnames=$(_relay_out_names "$refs")
-        _error "该前置仍被以下落地引用, 已拒绝删除: ${refnames}"
-        _warn "detour 指向已删除的出站会让 sing-box 启动直接失败 (全部节点一起挂)。"
-        _warn "请先到 [8] 中转分流管理 → [3] 给落地挂前置, 把这些落地解绑后再删。"
-        _pause_relay; return 1
-    fi
-
-    _warn "即将删除前置 ${pn} (${pa})。"
-    read -p "  确认删除? (y/N): " yn
-    [[ "$yn" =~ ^[Yy]$ ]] || return
-
-    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    local txn_dir failed="false"
-    _state_lock_acquire || return 1
-    txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
-    if ! _txn_snapshot_file "$txn_dir" relay "$RELAY_CONFIG_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" pre "$RELAY_PRE_FILE"; then
-        _txn_cleanup "$txn_dir"; _state_lock_release
-        _error "无法创建配置快照"; _pause_relay; return 1
-    fi
-    if ! _atomic_modify_json "$RELAY_CONFIG_FILE" '
-        .outbounds = [(.outbounds // [])[] | select((.tag? // "") != $pt)]
-    ' --arg pt "$pt"; then failed="true"; fi
-    if [ "$failed" != "true" ]; then
-        # 台账与挂载关系一并清掉 (挂载关系此时应为空, 兜底防御)
-        _atomic_modify_json "$RELAY_PRE_FILE" 'del(.[$pt])' --arg pt "$pt" >/dev/null 2>&1 || true
-        _atomic_modify_json "$LINKS_FILE" 'map_values(if (.pre? // "") == $pt then del(.pre) else . end)' \
-            --arg pt "$pt" >/dev/null 2>&1 || true
-    fi
-    if [ "$failed" = "true" ] || ! _restart_checked; then
-        _txn_restore_file "$txn_dir" relay "$RELAY_CONFIG_FILE"
-        _txn_restore_file "$txn_dir" links "$LINKS_FILE"
-        _txn_restore_file "$txn_dir" pre "$RELAY_PRE_FILE"
-        _manage_service restart >/dev/null 2>&1 || true
-        _txn_cleanup "$txn_dir"
-        _state_lock_release
-        _error "删除失败，已恢复原配置"
-        _pause_relay; return 1
-    fi
-    _txn_cleanup "$txn_dir"
-    _state_lock_release
-    _log_operation "DELETE_PRE" "Pre: $pt (${pn})"
-    _success "已删除前置节点: ${pn} (${pt}); 落地与入口不受影响"
-    _pause_relay
-}
-
-# [5] 删除前置/落地节点
-_delete_node_menu() {
-    while true; do
-        clear
-        echo -e "\n  ${CYAN}【删除节点】${NC}"
-        echo -e "    ${GREEN}[1]${NC} 删除落地节点 (连带其分流规则)"
-        echo -e "    ${GREEN}[2]${NC} 删除前置节点 (被引用时拒绝删除)"
-        echo -e "    ${YELLOW}[0]${NC} 返回"
-        echo ""
-        read -p "  请选择 [0-2]: " c
-        case "$c" in
-            1) _delete_landing; return ;;
-            2) _delete_pre; return ;;
-            0|"") return ;;
-            *) _error "无效输入"; sleep 1 ;;
-        esac
-    done
-}
-
 _relay_node_manage() {
     echo -e "\n  ${CYAN}【中转分流管理】${NC}"
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     if [ ! -f "$CONFIG_FILE" ]; then _error "配置文件不存在。"; return; fi
     echo -e "    ${GREEN}[1]${NC} 设置中转节点 (扫描入口→多选落地, 如: 1 3 = 该入口对接第1、3个落地)"
     echo -e "    ${GREEN}[2]${NC} 设置落地规则 (每个落地单独: 全局兜底/解锁AI/自定义URL)"
-    echo -e "    ${GREEN}[3]${NC} 给落地挂前置 (链路: 入口 → 前置 → 落地)"
     echo -e "    ${YELLOW}[0]${NC} 返回"
     echo ""
-    read -p "  请选择 [0-3]: " op
+    read -p "  请选择 [0-2]: " op
     case "$op" in
         1) _relay_bind_landing ;;
         2) _relay_landing_rule ;;
-        3) _attach_pre_menu ;;
         0|"") return ;;
         *) _error "无效选择"; sleep 1 ;;
     esac
 }
-
 
 # [8]→[1] 设置中转节点: 扫描本机入口 → 选一个 → 多选落地 (如 "1 3") 生成对接规则; 无规则时自动生成全量对接
 _relay_bind_landing() {
@@ -2811,7 +2489,6 @@ _clear_all_relays() {
     txn_dir=$(_txn_begin) || { _state_lock_release; return 1; }
     if ! _txn_snapshot_file "$txn_dir" relay "$CONFIG_FILE" \
         || ! _txn_snapshot_file "$txn_dir" links "$LINKS_FILE" \
-        || ! _txn_snapshot_file "$txn_dir" pre "$RELAY_PRE_FILE" \
         || ! _txn_snapshot_file "$txn_dir" clash "$RELAY_CLASH_YAML"; then
         _error "无法创建中转状态快照，已取消清空"
         _txn_cleanup "$txn_dir"
@@ -2860,7 +2537,7 @@ _clear_all_relays() {
         local clear_filter
         # SX: 末尾补 rule_set 定义清理 —— 只留仍被规则的 rule_set 引用的定义 (WARP 接管规则还在, 其定义保留);
         #     旧版只删 rules 不删定义, [8] 清空后 relay.json 里会残留 geosite-*/.srs 定义 (与 [5] 单删不一致)
-        clear_filter="$relay_tags as \$relay_in | [.route.rules[]? | select(((.outbound? // \"\") | startswith(\"relay-out-\"))) | .outbound] as \$relay_out | .inbounds = [(.inbounds // [])[] | select((.tag as \$tag | (\$relay_in | index(\$tag))) == null)] | .outbounds = [(.outbounds // [])[] | select((.tag as \$tag | (\$relay_out | index(\$tag))) == null and ((.tag? // \"\") | startswith(\"relay-out-\") | not) and ((.tag? // \"\") | startswith(\"relay-pre-\") | not))] | .outbounds = [(.outbounds // [])[] | del(.detour)] | .route.rules = [(.route.rules // [])[] | select((.inbound as \$tag | (\$relay_in | index(\$tag))) == null and (((.outbound? // \"\") | startswith(\"relay-out-\")) | not))] | ([.route.rules[]? | .rule_set[]?] as \$used | if ((.route.rule_set? // []) | length) > 0 then .route.rule_set = ((.route.rule_set // []) | map(select(.tag as \$t | (\$used | index(\$t)) != null))) else . end)"
+        clear_filter="$relay_tags as \$relay_in | [.route.rules[]? | select(((.outbound? // \"\") | startswith(\"relay-out-\"))) | .outbound] as \$relay_out | .inbounds = [(.inbounds // [])[] | select((.tag as \$tag | (\$relay_in | index(\$tag))) == null)] | .outbounds = [(.outbounds // [])[] | select((.tag as \$tag | (\$relay_out | index(\$tag))) == null and ((.tag? // \"\") | startswith(\"relay-out-\") | not))] | .route.rules = [(.route.rules // [])[] | select((.inbound as \$tag | (\$relay_in | index(\$tag))) == null and (((.outbound? // \"\") | startswith(\"relay-out-\")) | not))] | ([.route.rules[]? | .rule_set[]?] as \$used | if ((.route.rule_set? // []) | length) > 0 then .route.rule_set = ((.route.rule_set // []) | map(select(.tag as \$t | (\$used | index(\$t)) != null))) else . end)"
         # SX: _atomic_modify_json 对不存在的文件直接返回 1 —— 全新机器上没有 relay.json,
         #     不能把"本来就空"判成"清空失败"。改为: 有文件才改。
         #     注意只有 relay.json 被改写才需要重启校验 (links 单独写不需要, 否则空状态会因
@@ -2871,16 +2548,11 @@ _clear_all_relays() {
         if [ -f "$LINKS_FILE" ]; then
             _atomic_modify_json "$LINKS_FILE" '{}' || failed="true"
         fi
-        # 前置台账一并清空 —— 出站已被上面的 clear_filter 摘掉, 台账留着就是孤儿
-        if [ -f "$RELAY_PRE_FILE" ]; then
-            _atomic_modify_json "$RELAY_PRE_FILE" '{}' || failed="true"
-        fi
     fi
 
     if [ "$failed" = "true" ] || { [ "$_mutated" = "true" ] && ! _restart_checked; }; then
         _txn_restore_file "$txn_dir" relay "$CONFIG_FILE"
         _txn_restore_file "$txn_dir" links "$LINKS_FILE"
-        _txn_restore_file "$txn_dir" pre "$RELAY_PRE_FILE"
         _txn_restore_file "$txn_dir" clash "$RELAY_CLASH_YAML"
         _manage_service restart >/dev/null 2>&1 || true
         _txn_cleanup "$txn_dir"
@@ -2923,7 +2595,7 @@ _clear_all_relays() {
     local _sweep_port_warn
     _sweep_port_warn="$(_relay_report_residue_ports "$relay_ports")"
     if [ "$_mutated" = "true" ]; then
-        _success "全部中转已清空 (含前置节点与分流规则)；主节点、Xray、WARP 与端口转发配置均已保留${_sweep_port_warn}"
+        _success "全部中转已清空；主节点、Xray、WARP 与端口转发配置均已保留${_sweep_port_warn}"
     else
         _success "当前没有中转配置可清空；已顺带清扫残留 (证书/跳跃规则/事务临时目录)${_sweep_port_warn}"
     fi
@@ -5818,45 +5490,6 @@ _relay_troubleshoot_menu() {
     done
 }
 
-# [2] 添加前置 —— 来源与落地完全一致 (Token / 第三方节点), 只是导入后挂的位置不同
-_add_pre_menu() {
-    clear
-    echo -e "\n  ${CYAN}【添加前置】${NC}"
-    echo -e "  ${YELLOW}前置是「入口到落地」之间多绕的一跳: 客户端 → 入口 → 前置 → 落地 → 目标${NC}"
-    echo -e "  ${YELLOW}导入后还需要挂到某个落地才生效: [8] → [3]${NC}"
-    echo ""
-    echo -e "    ${GREEN}[1]${NC} 通过 Token 导入 (在前置机上用 [1] 生成)"
-    echo -e "    ${GREEN}[2]${NC} 导入第三方节点 (分享链接 / HTTP(S) / SOCKS5)"
-    echo -e "    ${YELLOW}[0]${NC} 返回"
-    echo ""
-    read -p "  请选择 [0-2]: " c
-    case "$c" in
-        1) _relay_config pre ;;
-        2) _import_link_config pre ;;
-        0|"") return ;;
-        *) _error "无效输入"; sleep 1 ;;
-    esac
-}
-
-# [3] 添加落地 —— 流量的最终出口
-_add_landing_menu() {
-    clear
-    echo -e "\n  ${CYAN}【添加落地】${NC}"
-    echo -e "  ${YELLOW}落地是流量的最终出口; 导入后需要对接入口才生效: [8] → [1]${NC}"
-    echo ""
-    echo -e "    ${GREEN}[1]${NC} 通过 Token 导入 (在落地机上用 [1] 生成)"
-    echo -e "    ${GREEN}[2]${NC} 导入第三方节点 (分享链接 / HTTP(S) / SOCKS5)"
-    echo -e "    ${YELLOW}[0]${NC} 返回"
-    echo ""
-    read -p "  请选择 [0-2]: " c
-    case "$c" in
-        1) _relay_config landing ;;
-        2) _import_link_config landing ;;
-        0|"") return ;;
-        *) _error "无效输入"; sleep 1 ;;
-    esac
-}
-
 _menu() {
     _check_root || return 1
     _check_deps || return 1
@@ -5908,24 +5541,17 @@ _menu() {
         echo -e "  本机 IP: ${CYAN}$(_local_ip_line)${NC}"
         echo ""
         echo -e "  ${CYAN}【基础配置】${NC}"
-        echo -e "    ${GREEN}[1]${NC} 前置机/落地机：生成全协议 Token"
-        echo -e "    ${GREEN}[2]${NC} 添加前置   ${YELLOW}(入口→前置→落地 的中间跳, 可选)${NC}"
-        echo -e "    ${GREEN}[3]${NC} 添加落地   ${YELLOW}(流量的最终出口)${NC}"
+        echo -e "    ${GREEN}[1]${NC} 落地机：生成全协议 Token"
+        echo -e "    ${GREEN}[2]${NC} 中转机：通过 Token 导入规则"
+        echo -e "    ${GREEN}[3]${NC} 中转机：导入第三方节点"
         echo ""
         echo -e "  ${CYAN}【链路管理】${NC}"
         echo -e "    ${GREEN}[4]${NC} 查看当前中转链路"
-        echo -e "    ${GREEN}[5]${NC} 删除前置/落地节点"
+        echo -e "    ${GREEN}[5]${NC} 删除落地节点"
         echo -e "    ${GREEN}[6]${NC} 解除入口对接 (仅删该入口的转发规则)"
         echo -e "    ${GREEN}[7]${NC} 修改入口监听端口 (仅本脚本创建的入口)"
-        echo -e "    ${GREEN}[8]${NC} 中转分流管理 (对接入口 / 落地规则 / 挂前置)"
+        echo -e "    ${GREEN}[8]${NC} 中转分流管理 (启用落地/设置规则)"
         echo -e "    ${RED}[R]${NC} 清空所有中转配置"
-        # SX: 链路规模一览 —— 前置/落地各几个, 有多少已挂/已对接
-        local _npre _npre_att _nland _nland_bind
-        _npre=$(jq -r '[.outbounds[]? | select((.tag // "") | startswith("relay-pre-"))] | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
-        _npre_att=$(jq -r '[to_entries[]? | .value.pre? // empty] | unique | length' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null)
-        _nland=$(jq -r '[.outbounds[]? | select((.tag // "") | startswith("relay-out-"))] | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
-        _nland_bind=$(jq -r '[.route.rules[]? | select(((.outbound? // "") | startswith("relay-out-")) and ((.network? // "") != "udp")) | .outbound] | unique | length' "$RELAY_CONFIG_FILE" 2>/dev/null)
-        echo -e "        ${YELLOW}当前: 前置 ${_npre:-0} (已挂 ${_npre_att:-0})  |  落地 ${_nland:-0} (已对接入口 ${_nland_bind:-0})${NC}"
         echo ""
         echo -e "  ${CYAN}【出口与网络优化】${NC}"
         echo -e "    ${GREEN}[9]${NC} WARP 出站管理 (Cloudflare 免费出口)"
@@ -5995,10 +5621,10 @@ _menu() {
         case $choice in
             1) _landing_config ;;
             # SX: 每次进入只添加一个 —— 不再套 while 循环连续追问, 加完停留一次即回菜单
-            2) _add_pre_menu ;;
-            3) _add_landing_menu ;;
+            2) _relay_config ;;
+            3) _import_link_config ;;
             4) _view_relays ;;
-            5) _delete_node_menu ;;
+            5) _delete_landing ;;
             6) _delete_forward ;;
             7) _modify_relay_port ;;
             8) _relay_node_manage ;;
