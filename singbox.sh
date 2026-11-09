@@ -22,6 +22,12 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.79.3: 修 CF-A 节点在 IPv6 源站下不通 (解析对但连不上):
+#           ① cfa-* 入站的 listen 由 0.0.0.0 改为 "::" —— 原来只绑 IPv4,
+#              CF 按 AAAA 回源时连不进来 (主脚本建节点一直用 "::", CF-A 是漏网的)
+#           ② [4] 修改配置 增加 [5]「重新应用本机入站 + 刷新 DNS」: 升级后跑一次
+#              即可把旧入站的监听地址改过来, 不必删节点重建
+#           ③ 自检失败且源站是 IPv6 时, 提示放行 ip6tables (安全组之外本机也可能拦)
 #     1.79.2: CF-A 跟随「入口地址探测」的地址族偏好 (纯 IPv6 下不再写错 DNS):
 #           ① cf_lite.sh 的公网 IP 探测改为按族探测 (curl -4 / -6), 读同一个
 #              /usr/local/etc/sing-box/node_ip_pref; 选 IPv6 优先时直接用 v6
@@ -160,7 +166,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79.2"
+export SCRIPT_VERSION="1.79.3"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"

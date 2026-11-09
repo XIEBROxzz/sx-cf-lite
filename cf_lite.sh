@@ -1,4 +1,6 @@
 #!/bin/bash
+# SX v1.2: cfa-* 入站 listen 改 "::" —— 原来 0.0.0.0 只绑 IPv4, IPv6 源站 (AAAA 回源)
+#          时 CF 边缘连不进来 ("解析对了但节点不通"); [4] 新增 [5] 重新应用入站 + 刷新 DNS。
 # SX v1.1: 公网 IP 探测跟随「入口地址探测」偏好 (读 /usr/local/etc/sing-box/node_ip_pref),
 #          支持 IPv6 源站并写 AAAA; v4 出口经 WARP 时自动改走 v6 —— 否则 A 记录会
 #          指向 104.28.x (Cloudflare 自家网段), CF 边缘回源必然失败。
@@ -21,7 +23,7 @@ ORIGIN_CERT_PATH="$STATE_DIR/origin.pem"
 ORIGIN_KEY_PATH="$STATE_DIR/origin.key"
 ORIGIN_CSR_PATH="$STATE_DIR/origin.csr"
 LAST_LINKS_PATH="$(pwd)/cf_lite_last_links.txt"
-export CF_LITE_VERSION="1.1"
+export CF_LITE_VERSION="1.2"
 
 CF_API="https://api.cloudflare.com/client/v4"
 MANAGED_PREFIX="sing-box-cf-lite "
@@ -762,12 +764,15 @@ gen_cfa_inbounds() {
     local tls_enabled="false"
     [[ "$ssl_mode" == "strict" ]] && tls_enabled="true"
     local inbounds
+    # SX: listen 必须是 "::" —— 原来写 0.0.0.0 只绑 IPv4, 纯 IPv6 源站 (AAAA 回源)
+    #     时 CF 边缘连不进来, 表现就是"解析对了但节点不通"。主脚本建节点一直用 "::",
+    #     Linux 默认 bindv6only=0, "::" 同时接 v4(映射) 与 v6, 双栈机器也安全。
     inbounds=$(echo "$routes_json" | jq --arg uid "$uid" --argjson tls "$tls_enabled" \
         --arg cert "$ORIGIN_CERT_PATH" --arg key "$ORIGIN_KEY_PATH" '[
         .[] | {
             type: "vless",
             tag: ("cfa-vless-" + (.listen_port|tostring)),
-            listen: "0.0.0.0",
+            listen: "::",
             listen_port: .listen_port,
             users: [{uuid: $uid, flow: ""}],
             transport: {type: "ws", path: .path},
@@ -1080,6 +1085,9 @@ net_mode=$(prompt_net_mode)
                 warn "自检失败 (HTTP ${_code}): CF 边缘回源 外部端口:${_cfp:-?} 不可达 —— NAT 排查三步: ① 服务商控制台确认端口映射 (外部 ${_cfp:-36000} -> 内部 443) ② 云防火墙/安全组放行该外部端口入站 ③ 映射面板外部端口改为其他端口后需跑 [5] 同步"
             else
                 warn "自检失败 (HTTP ${_code}): 该端口向 CF 回源不可达 —— 云防火墙放行 443/2053/2083/2087/2096/8443 后节点即刻可用"
+                if [[ "$public_ip" == *:* ]]; then
+                    warn "源站是 IPv6 (${public_ip}): 除安全组外还要放行本机 ip6tables, 例如: ip6tables -I INPUT -p tcp --dport ${_used} -j ACCEPT"
+                fi
             fi
         fi
     fi
@@ -1305,14 +1313,34 @@ do_modify() {
     echo "  2. 修改端口"
     echo "  3. 修改 WS 路径"
     echo "  4. 全部修改"
+    echo "  5. 重新应用本机入站 + 刷新 DNS (升级后/改了地址族时跑这个, 不改任何参数)"
     echo "  0. 返回"
     echo
-    read -rp "请选择 [0-4]: " mc
+    read -rp "请选择 [0-5]: " mc
 
     local new_uid="$uid" new_routes="$routes_json" changed=false
 
-    [[ "$mc" =~ ^[0-4]$ ]] || die "无效选项"
+    [[ "$mc" =~ ^[0-5]$ ]] || die "无效选项"
     [[ "$mc" == "0" ]] && return
+
+    # SX: 纯应用动作 —— 只按当前 state 重新生成入站并落盘, 顺带刷新 DNS。
+    #     旧版本 CF-A 入站写的是 listen 0.0.0.0 (只绑 v4), 纯 IPv6 源站连不进来;
+    #     升级到 1.79.3 后跑一次本项即可修好, 不用删节点重建。
+    if [[ "$mc" == "5" ]]; then
+        apply_cfa_inbounds "$(gen_cfa_inbounds "$new_routes" "$new_uid" "$(echo "$state" | jq -r '.ssl_mode // "flexible"')")"
+        if load_cf_account; then
+            local _zid _ip _rt="A"
+            _zid=$(echo "$state" | jq -r '.zone_id')
+            _ip=$(get_public_ip)
+            [[ "$_ip" == *:* ]] && _rt="AAAA"
+            cf_upsert_dns "$_zid" "$domain" "$_ip" >/dev/null
+            ok "DNS ${_rt} 记录已刷新: $domain -> $_ip"
+            apply_origin_rules "$_zid" "$domain" "$new_routes"
+            ok "Origin Rules 已同步"
+        fi
+        ok "本机入站已按当前配置重新应用 (listen: ::)"
+        return
+    fi
 
     if [[ "$mc" == "1" || "$mc" == "4" ]]; then
         read -rp "新 UUID(留空=重新生成): " iu
