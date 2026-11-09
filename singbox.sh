@@ -22,6 +22,15 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.79.6: 修「纯 IPv6 机器创建节点时服务器地址变成 127.0.0.1」:
+#           ① _probe_ip_family 由「2 源 + 2s 超时」改为「4 源 + 4s 超时」——
+#              2 秒跑完 DNS+TCP+TLS 在跨境链路上基本不够, v6 常常整族超时;
+#              并先看本机有无该族全局地址, 纯 v6 机器直接跳过 v4 探测, 避免卡 16 秒
+#           ② _get_public_ip 两族都失败时退回网卡全局地址 (VPS 上通常就是公网地址),
+#              不再把 127.0.0.1 一路传进分享链接
+#           ③ _resolve_server_ip / _init_server_ip 失败时不再把地址族标记成"已解析",
+#              网络恢复后本次会话还能重试; 127.0.0.1 不再当作有效值回灌
+#           ④ 菜单启动时直接打印 IPv4/IPv6 探测结果, 不用去翻 public_ip.cache
 #     1.79.5: 撤销 1.79.4 的依赖健壮性改动 (Debian EOL archive 源 / yq 多路兜底 /
 #           unzip 移出关键依赖) —— 该问题只在 Debian 11 这类已 EOL 的系统上出现,
 #           不值得为它扩大改动面。功能等同 1.79.3, 仅抬版本号, 避免已升到 1.79.4
@@ -170,7 +179,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79.5"
+export SCRIPT_VERSION="1.79.6"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -430,7 +439,20 @@ _public_ip_refresh() {
 _ensure_public_ip_cache() {
     _public_ip_cache_fresh && return 0
     _info "正在探测本机公网 IP (IPv4 / IPv6)..."
-    _public_ip_refresh || _warn "公网 IP 探测失败, 将显示网卡地址"
+    if ! _public_ip_refresh; then
+        _warn "公网 IP 探测失败, 将显示网卡地址"
+        return 0
+    fi
+    # SX 1.79.6: 把探测结果直接说出来 —— 建节点时默认地址是 127.0.0.1 的话,
+    #     用户在这里就能看出是哪一族没探到, 不用去翻 public_ip.cache
+    local v4 v6
+    v4=$(_public_ip_cached 4)
+    v6=$(_public_ip_cached 6)
+    if [ -z "$v4" ] && [ -z "$v6" ]; then
+        _warn "两族公网 IP 均未探到 (无外网出口 / DNS 不通 / 探测站点被墙)"
+    else
+        _info "公网 IP: IPv4 ${v4:-无}   IPv6 ${v6:-无}"
+    fi
     return 0
 }
 
@@ -463,16 +485,46 @@ _node_ip_pref() {
     case "$v" in ipv6) printf 'ipv6' ;; *) printf 'ipv4' ;; esac
 }
 
+# 探测某一族的公网地址 (强制走该族, 多源轮询)
+# SX 1.79.6: 原来只有 2 个源 + --max-time 2 —— 2 秒内要跑完 DNS + TCP + TLS,
+#     跨境链路基本不够, 纯 IPv6 机器上经常两源全部超时, 于是 server_ip 落到
+#     127.0.0.1, 建出来的节点链接里写着 127.0.0.1。现在 4 源 + 4s 超时。
+#     另外先看本机有没有该族全局地址: 纯 v6 机器没有 v4 地址时直接跳过 v4 探测,
+#     否则 4 个源各等 4 秒, 菜单启动能卡 16 秒。
 _probe_ip_family() {
-    local fam="$1" ip=""
-    ip=$(timeout 5 curl -fsS"$fam" --max-time 2 https://icanhazip.com 2>/dev/null)
-    [ -z "$ip" ] && ip=$(timeout 5 curl -fsS"$fam" --max-time 2 https://ipinfo.io/ip 2>/dev/null)
-    ip=$(printf '%s' "$ip" | tr -d '\r\n' | awk '{print $1}')
-    case "$fam" in
-        4) printf '%s' "$ip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' && printf '%s' "$ip" ;;
-        6) printf '%s' "$ip" | grep -qE '^[0-9a-fA-F:]+$'          && printf '%s' "$ip" ;;
-    esac
-    return 0
+    local fam="$1" ip="" url
+    local -a urls
+    # 没有 ip 命令时无法判断, 直接按原逻辑探测, 不能因此判定"该族不可用"
+    if command -v ip >/dev/null 2>&1 && [ -z "$(_local_iface_addr "$fam")" ]; then
+        return 1
+    fi
+    if [ "$fam" = "6" ]; then
+        urls=(https://icanhazip.com https://api64.ipify.org
+              https://ipinfo.io/ip   https://ifconfig.co/ip)
+    else
+        urls=(https://icanhazip.com https://api.ipify.org
+              https://ipv4.icanhazip.com https://ifconfig.me/ip)
+    fi
+    for url in "${urls[@]}"; do
+        ip=$(timeout 6 curl -fsS"$fam" --connect-timeout 3 --max-time 4 "$url" 2>/dev/null) || ip=""
+        ip=$(printf '%s' "$ip" | tr -d '\r\n' | awk '{print $1}')
+        case "$fam" in
+            4)
+                if printf '%s' "$ip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+                    printf '%s' "$ip"; return 0
+                fi
+                ;;
+            6)
+                # 必须含冒号 —— 有些站点出错时返回纯 hex, 会被这个正则误判成地址
+                if printf '%s' "$ip" | grep -qE '^[0-9a-fA-F:]+$' \
+                   && printf '%s' "$ip" | grep -q ':'; then
+                    printf '%s' "$ip"; return 0
+                fi
+                ;;
+        esac
+        ip=""
+    done
+    return 1
 }
 
 # 公网 IP 获取 —— 严格按节点地址偏好解析, 不复用 server_ip 旧值
@@ -489,8 +541,23 @@ _get_public_ip() {
     [ -z "$ip" ] && ip=$(_probe_ip_family "$first")
     [ -z "$ip" ] && ip=$(_public_ip_cached "$second")
     [ -z "$ip" ] && ip=$(_probe_ip_family "$second")
-    # 兜底: 两族都探不到时才沿用会话里已有的值 (可能已是 127.0.0.1)
-    [ -z "$ip" ] && [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && ip="$server_ip"
+    # SX 1.79.6: 公网探测全失败时先退回网卡全局地址 —— VPS 网卡上通常就是公网地址,
+    #     比沿用 127.0.0.1 有用得多 (NAT 机器会拿到内网地址, 但至少不是回环)。
+    #     只在首次回退时提示一次, 避免每次调用都刷屏。
+    if [ -z "$ip" ]; then
+        if [ "$pref" = "ipv6" ]; then
+            ip=$(_local_iface_addr 6); [ -z "$ip" ] && ip=$(_local_iface_addr 4)
+        else
+            ip=$(_local_iface_addr 4); [ -z "$ip" ] && ip=$(_local_iface_addr 6)
+        fi
+        if [ -n "$ip" ] && [ -z "$_PUB_IP_FALLBACK_WARNED" ]; then
+            _PUB_IP_FALLBACK_WARNED=1
+            _warn "公网 IP 探测失败, 已退回网卡地址: ${ip} (请确认它是公网可达地址)"
+        fi
+    fi
+    # 兜底: 会话里已有的值。127.0.0.1 是"上次也失败"的占位, 不能再往下传
+    [ -z "$ip" ] && [ -n "$server_ip" ] && [ "$server_ip" != "null" ] \
+        && [ "$server_ip" != "127.0.0.1" ] && ip="$server_ip"
     printf '%s' "$ip"
 }
 _get_ip() { _get_public_ip; } # 别名兼容
@@ -499,14 +566,22 @@ _get_ip() { _get_public_ip; } # 别名兼容
 #     偏好没变才复用, 这样改完 [16]→[B] 立刻生效, 不必重开脚本
 _server_ip_family=""
 _resolve_server_ip() {
-    local pref
+    local pref ip
     pref=$(_node_ip_pref)
-    if [ -n "$server_ip" ] && [ "$server_ip" != "null" ] \
+    # 127.0.0.1 是失败占位, 不能当成"已解析"而跳过重试
+    if [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && [ "$server_ip" != "127.0.0.1" ] \
        && [ "$_server_ip_family" = "$pref" ]; then
         return 0
     fi
-    server_ip=$(_get_public_ip)
-    _server_ip_family="$pref"
+    ip=$(_get_public_ip)
+    if [ -n "$ip" ] && [ "$ip" != "127.0.0.1" ]; then
+        server_ip="$ip"
+        _server_ip_family="$pref"
+    else
+        # SX 1.79.6: 探测失败时不要把族标记成"已解析" —— 原来失败也写 family,
+        #     导致本次会话再也不重试, 网络恢复后仍一直显示 127.0.0.1
+        _server_ip_family=""
+    fi
     return 0
 }
 
@@ -868,10 +943,12 @@ _remove_nftables_rules() {
 _init_server_ip() {
     _info "正在获取服务器公网 IP..."
     _resolve_server_ip
-    if [ -z "$server_ip" ] || [ "$server_ip" == "null" ]; then
+    if [ -z "$server_ip" ] || [ "$server_ip" == "null" ] || [ "$server_ip" == "127.0.0.1" ]; then
         _warn "自动获取 IP 失败，将回退到 127.0.0.1"
+        _warn "下一步可直接手动填写公网地址。排查: curl -6 -sS https://icanhazip.com / ip -6 addr show scope global"
         server_ip="127.0.0.1"
-        _server_ip_family=$(_node_ip_pref)
+        # SX 1.79.6: 失败不锁定地址族, 让后续 _resolve_server_ip 还能重试
+        _server_ip_family=""
     else
         _success "当前服务器公网 IP: ${server_ip}"
     fi
