@@ -1,6 +1,6 @@
 # SX-CF-lite
 
-sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.79.3**（CF-A 支持 IPv6 源站：AAAA + 双栈监听；1.79 的「前置层」已回滚）
+sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.79.4**（CF-A 支持 IPv6 源站；依赖安装适配 Debian 11 等 EOL 系统）
 
 > 基于 [0xdabiaoge/singbox-lite](https://github.com/0xdabiaoge/singbox-lite) 地基 + Joey [xray-cf-lite](https://github.com/byJoey/xray-cf-lite) 的 CF 套皮整合魔改。
 
