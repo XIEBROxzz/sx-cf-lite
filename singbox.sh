@@ -22,6 +22,15 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.79.2: CF-A 跟随「入口地址探测」的地址族偏好 (纯 IPv6 下不再写错 DNS):
+#           ① cf_lite.sh 的公网 IP 探测改为按族探测 (curl -4 / -6), 读同一个
+#              /usr/local/etc/sing-box/node_ip_pref; 选 IPv6 优先时直接用 v6
+#           ② IPv4 出口经 WARP 时 (纯 v6 机唯一的 v4 通路), 拿到的是 104.28.x
+#              (Cloudflare 自家网段), A 记录指向它 CF 回源必然失败 → 有原生 v6
+#              就自动改走 v6 并提示
+#           ③ DNS 记录按地址族写 A / AAAA (原来硬编码 A), 切换族时清理同名旧记录;
+#              cf_get_dns 同时认 A 与 AAAA; detect_nat 认 inet6
+#           ④ CF-B (Argo) 节点信息/创建页显示当前入口地址探测偏好与本机地址
 #     1.79.1: 回滚 1.79 —— 那一版加过一层「前置」(outbound.detour), 但方向与需求相反:
 #           实现的是「入口 → 前置 → 落地」, 需要的是「前置 → 本机 → 落地」(入口侧前置),
 #           而入口是客户端连的那一端, 本机无法把自己插到前置后面, 已整组撤销。
@@ -151,7 +160,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79.1"
+export SCRIPT_VERSION="1.79.2"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"

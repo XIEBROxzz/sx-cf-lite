@@ -121,6 +121,38 @@ _url_encode() {
     printf '%s' "$1" | jq -sRr @uri
 }
 
+# SX: 与主脚本 [16]→[B]「入口地址探测」共用同一状态文件 (内容 ipv4 / ipv6)
+_ip_pref() {
+    local v="" f="${SINGBOX_DIR}/node_ip_pref"
+    [[ -s "$f" ]] && v=$(head -n 1 "$f" 2>/dev/null | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+    if [[ "$v" == "ipv6" ]]; then printf 'ipv6'; else printf 'ipv4'; fi
+}
+
+# 本机按偏好取一个地址用于展示 (只读, 不发网络请求; 探测不到就退回网卡地址)
+_ip_local_addr() {
+    local fam="$1" a=""
+    if [[ "$fam" == "6" ]]; then
+        a=$(ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    else
+        a=$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    fi
+    printf '%s' "$a"
+}
+
+_ip_pref_line() {
+    local pref addr fam
+    pref=$(_ip_pref)
+    if [[ "$pref" == "ipv6" ]]; then fam=6; else fam=4; fi
+    addr=$(_ip_local_addr "$fam")
+    [[ -z "$addr" ]] && { fam=$((8 - fam)); addr=$(_ip_local_addr "$fam"); }
+    [[ -n "$addr" ]] || addr="未探测到"
+    if [[ "$pref" == "ipv6" ]]; then
+        printf '入口地址探测: IPv6 优先   本机地址: %s' "$addr"
+    else
+        printf '入口地址探测: IPv4 优先   本机地址: %s' "$addr"
+    fi
+}
+
 _ws_path_with_early_data() {
     local ws_path="${1:-/}"
     # SX: 输入是完整链接(上游路径污染)时原样返回且不再叠加 ed, 防止 path= 吞链嵌套
@@ -1755,6 +1787,8 @@ _add_argo_node() {
     esac
 
     _info "--- 创建 ${protocol_label} + Argo 隧道节点 ---"
+    # SX: Argo 全程走域名, 客户端不直连本机 IP; 这里只把入口地址探测偏好显示出来
+    echo -e "${CYAN}$(_ip_pref_line)${NC}"
 
     _install_cloudflared || return 1
 
@@ -2120,6 +2154,8 @@ _add_argo_trojan_ws() { _add_argo_node "trojan"; }
 
 _view_argo_nodes() {
     _info "--- Argo 隧道节点信息 ---"
+    # SX: 与主脚本入口地址探测偏好保持一致 (Argo 全程走域名, 客户端不直连本机 IP)
+    echo -e "${CYAN}$(_ip_pref_line)${NC}"
 
     if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
         _warning "没有 Argo 隧道节点。"

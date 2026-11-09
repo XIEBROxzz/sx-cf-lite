@@ -1,4 +1,7 @@
 #!/bin/bash
+# SX v1.1: 公网 IP 探测跟随「入口地址探测」偏好 (读 /usr/local/etc/sing-box/node_ip_pref),
+#          支持 IPv6 源站并写 AAAA; v4 出口经 WARP 时自动改走 v6 —— 否则 A 记录会
+#          指向 104.28.x (Cloudflare 自家网段), CF 边缘回源必然失败。
 # SX v1.0: 身份整合为 v1.0 —— CF-A 不再独立, 本文件只管「CF 云端资源 + state」;
 # 节点 inbound 以 cfa- 前缀原子并入主 sing-box (经主脚本无头入口 cfa-apply / cfa-remove);
 # 服务 = 主 sing-box.service, relay.json 全局规则 (WARP/中转/落地) 对 CF-A 天然生效。
@@ -18,7 +21,7 @@ ORIGIN_CERT_PATH="$STATE_DIR/origin.pem"
 ORIGIN_KEY_PATH="$STATE_DIR/origin.key"
 ORIGIN_CSR_PATH="$STATE_DIR/origin.csr"
 LAST_LINKS_PATH="$(pwd)/cf_lite_last_links.txt"
-export CF_LITE_VERSION="1.0"
+export CF_LITE_VERSION="1.1"
 
 CF_API="https://api.cloudflare.com/client/v4"
 MANAGED_PREFIX="sing-box-cf-lite "
@@ -150,12 +153,77 @@ svc_is_active() {
 }
 
 # ── 网络检测 ─────────────────────────────────────────
+# SX: 地址族偏好与主脚本共用同一个状态文件 —— [16]→[B]「入口地址探测」写
+#     /usr/local/etc/sing-box/node_ip_pref (内容 ipv4 / ipv6)。
+#     以前这里硬编码只探 IPv4, 纯 IPv6 机器上唯一的 v4 出口是 WARP,
+#     于是 A 记录被写成 104.28.x.x (Cloudflare 自家网段), CF 回源必失败。
+SINGBOX_DIR="${SINGBOX_DIR:-/usr/local/etc/sing-box}"
+NODE_IP_PREF_FILE="${SINGBOX_DIR}/node_ip_pref"
+
+ip_pref() {
+    local v=""
+    [[ -s "$NODE_IP_PREF_FILE" ]] && v=$(head -n 1 "$NODE_IP_PREF_FILE" 2>/dev/null | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+    if [[ "$v" == "ipv6" ]]; then printf 'ipv6'; else printf 'ipv4'; fi
+}
+
+# probe_ip_family <4|6> —— 强制按族探测出口 IP, 探不到输出空
+probe_ip_family() {
+    local fam="$1" ip="" url
+    if [[ "$fam" == "6" ]]; then
+        for url in https://icanhazip.com https://api64.ipify.org https://ipinfo.io/ip; do
+            ip=$(curl -fsS6 --max-time 6 "$url" 2>/dev/null) && break
+        done
+        ip=$(printf '%s' "$ip" | tr -d '\r\n' | awk '{print $1}')
+        [[ "$ip" == *:* ]] && printf '%s' "$ip"
+    else
+        for url in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
+            ip=$(curl -fsS4 --max-time 6 "$url" 2>/dev/null) && break
+        done
+        ip=$(printf '%s' "$ip" | tr -d '\r\n' | awk '{print $1}')
+        [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && printf '%s' "$ip"
+    fi
+    return 0
+}
+
+# 该地址是否绑在本机网卡上 (云厂商一对一路由会不匹配, 只作诊断用)
+ip_on_iface() {
+    [[ -n "$1" ]] || return 1
+    ip -o addr show 2>/dev/null | grep -qF " $1/"
+}
+
+# IPv4 默认路由是否落在 WARP / WireGuard 接口
+# (Linux warp-cli 的网卡名是 CloudflareWARP, wgcf/wg-quick 常见 warp0 / wg0 → 统一小写后判)
+v4_via_warp() {
+    local dev
+    dev=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}' | tr 'A-Z' 'a-z')
+    [[ "$dev" == *warp* || "$dev" == wg* ]]
+}
+
 get_public_ip() {
-    local ip
-    for url in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
-        ip=$(curl -sf --max-time 8 "$url" 2>/dev/null) && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$ip" && return
-    done
-    die "获取公网 IPv4 失败"
+    local pref first second ip v6
+    pref=$(ip_pref)
+    if [[ "$pref" == "ipv6" ]]; then first=6; second=4; else first=4; second=6; fi
+
+    ip=$(probe_ip_family "$first")
+
+    # SX: 首选 IPv4 但 v4 出口经 WARP 时, 拿到的 104.28.x 属于 Cloudflare 自己,
+    #     写进 A 记录后边缘会回源到 CF 网段而不是本机。有原生 v6 就直接改走 v6。
+    if [[ "$first" == "4" && -n "$ip" ]] && v4_via_warp && ! ip_on_iface "$ip"; then
+        v6=$(probe_ip_family 6)
+        if [[ -n "$v6" ]]; then
+            warn "IPv4 出口经 WARP (${ip})，该地址 CF 无法回源；已自动改用 IPv6: ${v6}"
+            printf '%s' "$v6"
+            return 0
+        fi
+        warn "IPv4 出口经 WARP (${ip})，CF 回源大概率失败；建议 [16]→[B] 改为「IPv6 优先」"
+    fi
+
+    if [[ -z "$ip" ]]; then
+        warn "未探测到 IPv${first} 出口，回退 IPv${second}"
+        ip=$(probe_ip_family "$second")
+    fi
+    [[ -n "$ip" ]] || die "获取公网 IP 失败 (IPv4 / IPv6 均不可达)"
+    printf '%s' "$ip"
 }
 
 # detect_nat 猜测本机是直连公网还是在 NAT 后面。
@@ -164,9 +232,10 @@ get_public_ip() {
 # 网卡上是内网地址，但公网端口其实直达。这类机器判成 NAT 会逼用户去填并不存在的端口映射。
 # 所以这里只作为默认建议，最终由用户确认（见 prompt_net_mode）。
 detect_nat() {
-    local public_ip
+    local public_ip fam="inet"
     public_ip=$(get_public_ip)
-    if ip addr show 2>/dev/null | grep -qE "inet ${public_ip}/"; then
+    [[ "$public_ip" == *:* ]] && fam="inet6"
+    if ip addr show 2>/dev/null | grep -qE "${fam} ${public_ip}/"; then
         echo "direct"
         return
     fi
@@ -322,41 +391,54 @@ cf_find_zone() {
 }
 
 cf_get_dns() {
-    cf_call GET "/zones/$1/dns_records?type=A&name=$2" | jq '.result[0] // empty'
+    local zone_id="$1" domain="$2" rec
+    # SX: 先查 A 再查 AAAA —— 纯 IPv6 源站只有 AAAA, 只查 A 会让 [5]/[7] 以为"没有记录"
+    rec=$(cf_call GET "/zones/${zone_id}/dns_records?type=A&name=${domain}" | jq '.result[0] // empty')
+    [[ -n "$rec" ]] || rec=$(cf_call GET "/zones/${zone_id}/dns_records?type=AAAA&name=${domain}" | jq '.result[0] // empty')
+    printf '%s' "$rec"
 }
 
 cf_upsert_dns() {
     local zone_id="$1" domain="$2" ip="$3"
-    local payload all resp rec rtype rid fcontent
-    payload=$(jq -n --arg n "$domain" --arg c "$ip" '{type:"A",name:$n,content:$c,proxied:true,ttl:1}')
+    local rtype="A" other="AAAA"
+    # SX: 地址族决定记录类型 —— IPv6 源站必须写 AAAA, 写 A 会让 CF 回源到 v4 而失败
+    if [[ "$ip" == *:* ]]; then rtype="AAAA"; other="A"; fi
+    local payload all resp rec _t rid fcontent proxied
+    payload=$(jq -n --arg t "$rtype" --arg n "$domain" --arg c "$ip" '{type:$t,name:$n,content:$c,proxied:true,ttl:1}')
 
     # 同名现有记录（不限类型都要检查）：直接 POST 在有同名 CNAME/AAAA 时会被 CF 静默拒绝
     all=$(cf_call_raw GET "/zones/${zone_id}/dns_records?name=${domain}&per_page=50" 2>/dev/null || true)
 
-    # 1) 已有 A 记录：更新内容即可
-    rec=$(echo "$all" | jq -r '.result[]? | select(.type=="A") | .id' 2>/dev/null | head -n1)
+    # 1) 已有同类型记录：更新内容即可
+    rec=$(echo "$all" | jq -r --arg t "$rtype" '.result[]? | select(.type==$t) | .id' 2>/dev/null | head -n1)
     if [[ -n "$rec" ]]; then
         resp=$(cf_call_raw PUT "/zones/${zone_id}/dns_records/${rec}" "$payload")
         if ! echo "$resp" | jq -e '.success' >/dev/null 2>&1; then
-            die "更新 DNS A 记录失败: $(echo "$resp" | jq -c '.errors')"
+            die "更新 DNS ${rtype} 记录失败: $(echo "$resp" | jq -c '.errors')"
         fi
         echo "$resp" | jq -r '.result.id'
         return 0
     fi
 
-    # 2) 同名非 A 记录：以前 Argo 固定隧道残留的 CNAME (*.cfargotunnel.com) 自动替换；
-    #    其他来源的记录绝不擅动，明确报错由用户处理
-    while IFS=$'\t' read -r rtype rid fcontent; do
+    # 2) 同名异类型：
+    #    a) A↔AAAA 是本脚本切换地址族后的残留（同为已代理）→ 直接替换, 否则会同时
+    #       留一条指向 WARP 网段的旧 A, 客户端随机命中导致时好时坏;
+    #    b) 以前 Argo 固定隧道残留的 CNAME (*.cfargotunnel.com) 自动替换;
+    #    c) 其他来源的记录绝不擅动，明确报错由用户处理
+    while IFS=$'\t' read -r _t rid fcontent proxied; do
         [[ -n "$rid" ]] || continue
-        if [[ "$rtype" == "CNAME" && "$fcontent" == *.cfargotunnel.com ]]; then
+        if [[ "$_t" == "$other" && "$proxied" == "true" ]]; then
+            cf_call_raw DELETE "/zones/${zone_id}/dns_records/${rid}" >/dev/null 2>&1 || true
+            info "已清理同名 ${_t} 记录: ${domain} -> ${fcontent} (切换为 ${rtype})"
+        elif [[ "$_t" == "CNAME" && "$fcontent" == *.cfargotunnel.com ]]; then
             cf_call_raw DELETE "/zones/${zone_id}/dns_records/${rid}" >/dev/null 2>&1 || true
             info "已清理残留隧道 CNAME: ${domain} -> ${fcontent}"
         else
-            die "无法创建 DNS 记录: ${domain} 已存在 ${rtype} 记录 (${fcontent})，请先到 CF 后台删除该同名记录后重试"
+            die "无法创建 DNS 记录: ${domain} 已存在 ${_t} 记录 (${fcontent})，请先到 CF 后台删除该同名记录后重试"
         fi
-    done < <(echo "$all" | jq -r '.result[]? | [.type, .id, .content] | @tsv' 2>/dev/null)
+    done < <(echo "$all" | jq -r '.result[]? | [.type, .id, .content, (.proxied|tostring)] | @tsv' 2>/dev/null)
 
-    # 3) 创建 A 记录（必须显式校验 success，失败明确报错退出）
+    # 3) 创建记录（必须显式校验 success，失败明确报错退出）
     resp=$(cf_call_raw POST "/zones/${zone_id}/dns_records" "$payload")
     if ! echo "$resp" | jq -e '.success' >/dev/null 2>&1; then
         die "创建 DNS 记录失败: $(echo "$resp" | jq -c '.errors')"
@@ -906,13 +988,18 @@ net_mode=$(prompt_net_mode)
     # CF
     local public_ip dns_before ssl_before origin_rules_before dns_record_id
     public_ip=$(get_public_ip)
+    local _ipfam="IPv4"
+    [[ "$public_ip" == *:* ]] && _ipfam="IPv6"
+    info "入口地址探测: $(ip_pref) → 使用 ${public_ip} (${_ipfam})"
     dns_before=$(cf_get_dns "$zone_id" "$domain" || echo "null")
     [[ "$dns_before" == "" ]] && dns_before="null"
     ssl_before=$(cf_get_ssl "$zone_id")
     origin_rules_before=$(cf_get_origin_rules "$zone_id")
 
     dns_record_id=$(cf_upsert_dns "$zone_id" "$domain" "$public_ip")
-    ok "DNS A 记录: $domain -> $public_ip (已代理)"
+    local _rtype="A"
+    [[ "$public_ip" == *:* ]] && _rtype="AAAA"
+    ok "DNS ${_rtype} 记录: $domain -> $public_ip (已代理)"
     cf_set_ssl "$zone_id" "$ssl_mode"
     ok "SSL 模式: $ssl_mode"
     apply_origin_rules "$zone_id" "$domain" "$routes_json"
