@@ -84,6 +84,7 @@ install_deps() {
     local missing=()
     command -v curl    &>/dev/null || missing+=(curl)
     command -v jq      &>/dev/null || missing+=(jq)
+    command -v unzip   &>/dev/null || missing+=(unzip)
     command -v openssl &>/dev/null || missing+=(openssl)
     [[ ${#missing[@]} -eq 0 ]] && return
 

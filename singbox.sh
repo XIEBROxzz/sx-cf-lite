@@ -22,13 +22,10 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
-#     1.79.4: 依赖安装健壮性 (Debian 11 等 EOL 系统装不上):
-#           ① apt 装失败时自动判定 Debian EOL 并临时切 archive.debian.org 重试
-#              (原 sources.list 备份为 .sx.bak, 关掉 Check-Valid-Until)
-#           ② yq 的 release tag 三路兜底: API → releases/latest 重定向 → 内置版本,
-#              下载 wget 失败自动改用 curl; 原来 api.github.com 不通就整条链失败
-#           ③ unzip 从关键依赖里摘掉 (脚本自身并不调用), 只作 best-effort 安装
-#           ④ CF-B (singbox-lite_tunnel.sh) 同步以上三项
+#     1.79.5: 撤销 1.79.4 的依赖健壮性改动 (Debian EOL archive 源 / yq 多路兜底 /
+#           unzip 移出关键依赖) —— 该问题只在 Debian 11 这类已 EOL 的系统上出现,
+#           不值得为它扩大改动面。功能等同 1.79.3, 仅抬版本号, 避免已升到 1.79.4
+#           的机器在 [13] 更新时被判成降级。
 #     1.79.3: 修 CF-A 节点在 IPv6 源站下不通 (解析对但连不上):
 #           ① cfa-* 入站的 listen 由 0.0.0.0 改为 "::" —— 原来只绑 IPv4,
 #              CF 按 AAAA 回源时连不进来 (主脚本建节点一直用 "::", CF-A 是漏网的)
@@ -173,7 +170,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79.4"
+export SCRIPT_VERSION="1.79.5"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -1129,42 +1126,6 @@ _service_action_menu() {
 }
 
 # 智能包管理
-# Debian 发行版 EOL 后官方源会被移出 deb.debian.org, 原 sources.list 直接 404:
-#   E: The repository 'http://deb.debian.org/debian bullseye Release' does not have a Release file
-# 表现就是 apt 装什么都说"装不上"。这里不改动系统 sources.list (避免留下副作用),
-# 只在本次安装里用一份临时 archive 源 + 关闭 Release 有效期校验 (archive 里的早已过期)。
-_apt_install_archive() {
-    local pkgs="$*"
-    [ -n "$pkgs" ] || return 1
-    [ -f /etc/os-release ] || return 1
-    local id codename
-    id=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")
-    codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")
-    [ "$id" = "debian" ] && [ -n "$codename" ] || return 1
-    local src rc=0
-    src=$(mktemp /tmp/sx-archive-src.XXXXXX) || return 1
-    {
-        printf 'deb https://archive.debian.org/debian %s main contrib non-free\n' "$codename"
-        printf 'deb https://archive.debian.org/debian-security %s-security main contrib non-free\n' "$codename"
-    } > "$src"
-    local -a opt=(
-        -o "Dir::Etc::sourcelist=$src"
-        -o "Dir::Etc::sourceparts=-"
-        -o "Acquire::Check-Valid-Until=false"
-        -o "APT::Get::List-Cleanup=0"
-    )
-    _warn "Debian ${codename} 官方源不可用 (该版本已 EOL), 改用 archive.debian.org 临时源重试"
-    apt-get "${opt[@]}" update -qq >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get "${opt[@]}" install -y $pkgs >/dev/null 2>&1 || rc=1
-    rm -f -- "$src"
-    if [ "$rc" = "0" ]; then
-        _info "已通过 archive 源装好:${pkgs}"
-    else
-        _warn "archive 源安装仍失败; 如长期使用建议手动把 /etc/apt/sources.list 指向 archive.debian.org"
-    fi
-    return $rc
-}
-
 _pkg_install() {
     local pkgs="$*"
     [ -z "$pkgs" ] && return 0
@@ -1186,22 +1147,17 @@ _pkg_install() {
                 fi
                 if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
                     -o Dpkg::Use-Pty=0 -o Acquire::Languages=none "$pkg" >/dev/null 2>&1; then
-                    apt-get update -qq -o Acquire::Languages=none >/dev/null 2>&1 || true
-                    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                        -o Dpkg::Use-Pty=0 -o Acquire::Languages=none "$pkg" >/dev/null 2>&1; then
-                        _apt_install_archive "$pkg" || return 1
-                    fi
+                    apt-get update -qq -o Acquire::Languages=none >/dev/null 2>&1 || return 1
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                        -o Dpkg::Use-Pty=0 -o Acquire::Languages=none "$pkg" >/dev/null 2>&1 || return 1
                 fi
             done
         else
-            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1; then
-                # 兜底 1: 强制刷新索引后重试
-                apt-get update -qq >/dev/null 2>&1 || true
-                if ! DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1; then
-                    # 兜底 2: 发行版 EOL, 换 archive 源再来一次
-                    _apt_install_archive $pkgs || return 1
-                fi
-            fi
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
+                # 兜底：如果安装失败，强制刷新索引后重试
+                apt-get update -qq >/dev/null 2>&1
+                DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
+            }
         fi
     elif command -v yum &>/dev/null; then yum install -y $pkgs >/dev/null 2>&1
     elif command -v dnf &>/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
@@ -1822,100 +1778,67 @@ _release_install_cache() {
     return 0
 }
 
-# 下载 + 校验 + 落位 一个 yq 版本; 成功返回 0
-# SX: 拆出来是为了让上层能按「API → latest 重定向 → 内置版本」依次重试,
-#     不再因为 api.github.com 不通 (或限流) 就整条依赖链失败。
-_yq_fetch() {
-    local tag="$1" asset="$2"
-    local base="https://github.com/mikefarah/yq/releases/download/${tag}"
-    local tmp_yq checksums_tmp order_tmp
-    tmp_yq=$(mktemp "$(dirname "$YQ_BINARY")/.yq.new.XXXXXX") || return 1
-    checksums_tmp=$(mktemp /tmp/singboxlite-yq-checksums.XXXXXX) || { rm -f -- "$tmp_yq"; return 1; }
-    order_tmp=$(mktemp /tmp/singboxlite-yq-order.XXXXXX) || { rm -f -- "$tmp_yq" "$checksums_tmp"; return 1; }
-
-    local got=0
-    if wget -qO "$tmp_yq" "${base}/${asset}" 2>/dev/null \
-        && wget -qO "$checksums_tmp" "${base}/checksums" 2>/dev/null \
-        && wget -qO "$order_tmp" "${base}/checksums_hashes_order" 2>/dev/null; then
-        got=1
-    elif curl -fsSL --max-time 60 -o "$tmp_yq" "${base}/${asset}" 2>/dev/null \
-        && curl -fsSL --max-time 30 -o "$checksums_tmp" "${base}/checksums" 2>/dev/null \
-        && curl -fsSL --max-time 30 -o "$order_tmp" "${base}/checksums_hashes_order" 2>/dev/null; then
-        got=1
-    fi
-    if [ "$got" != "1" ]; then
-        rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
-        return 1
-    fi
-
-    local sha_line sha_field expected_sha actual_sha
-    sha_line=$(grep -n -x -m 1 'SHA-256' "$order_tmp" | cut -d: -f1)
-    if ! [[ "$sha_line" =~ ^[0-9]+$ ]]; then
-        rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
-        return 1
-    fi
-    sha_field=$((sha_line + 1))
-    expected_sha=$(awk -v name="$asset" -v field="$sha_field" '
-        $1 == name { count++; value=$field }
-        END { if (count == 1) print tolower(value) }
-    ' "$checksums_tmp")
-    actual_sha=$(openssl dgst -sha256 "$tmp_yq" 2>/dev/null | awk '{print tolower($NF)}')
-    if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || [ "$actual_sha" != "$expected_sha" ]; then
-        rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
-        _error "yq SHA-256 校验失败, 已拒绝安装 (${tag})。"
-        return 1
-    fi
-    rm -f -- "$checksums_tmp" "$order_tmp"
-
-    if ! chmod 755 "$tmp_yq" || ! "$tmp_yq" --version >/dev/null 2>&1 \
-        || ! mv -f "$tmp_yq" "$YQ_BINARY"; then
-        rm -f -- "$tmp_yq"
-        return 1
-    fi
-    return 0
-}
-
 # 安装 yq
 _install_yq() {
-    if [ -x "$YQ_BINARY" ] && "$YQ_BINARY" --version >/dev/null 2>&1; then
-        return 0
-    fi
-    _info "安装 yq..."
-    local arch
-    arch=$(uname -m)
-    case $arch in
-        x86_64|amd64) arch='amd64' ;;
-        aarch64|arm64) arch='arm64' ;;
-        armv7l|armv7|armhf) arch='arm' ;;
-        *) _error "yq 不支持当前架构: $(uname -m)"; return 1 ;;
-    esac
-    local asset="yq_linux_${arch}"
-
-    # SX: tag 解析三路兜底 —— ① GitHub API ② releases/latest 的重定向地址 ③ 内置已知版本。
-    #     ② 不需要 api.github.com; ③ 保证 API 全挂时仍能装上 (纯网络问题也能过)。
-    local -a cands=()
-    local release_json release_tag loc rt
-    release_json=$(curl -fsSL --max-time 15 https://api.github.com/repos/mikefarah/yq/releases/latest 2>/dev/null) || true
-    release_tag=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' 2>/dev/null)
-    [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && cands+=("$release_tag")
-    loc=$(curl -sIL --max-time 15 -o /dev/null -w '%{url_effective}' https://github.com/mikefarah/yq/releases/latest 2>/dev/null)
-    if [[ "$loc" =~ /tag/(v[0-9]+\.[0-9]+\.[0-9]+)/?$ ]]; then
-        rt="${BASH_REMATCH[1]}"
-        [[ " ${cands[*]} " == *" ${rt} "* ]] || cands+=("$rt")
-    fi
-    cands+=("v4.44.3" "v4.45.1")
-
-    local tag
-    for tag in "${cands[@]}"; do
-        if _yq_fetch "$tag" "$asset"; then
-            _success "yq 已安装 (${tag})"
-            return 0
+    if [ ! -x "$YQ_BINARY" ] || ! "$YQ_BINARY" --version >/dev/null 2>&1; then
+        _info "安装 yq..."
+        local arch
+        arch=$(uname -m)
+        case $arch in
+            x86_64|amd64) arch='amd64' ;;
+            aarch64|arm64) arch='arm64' ;;
+            armv7l|armv7|armhf) arch='arm' ;;
+            *) _error "yq 不支持当前架构: $(uname -m)"; return 1 ;;
+        esac
+        local asset="yq_linux_${arch}"
+        local release_json release_tag release_base
+        release_json=$(curl -fsSL --max-time 15 https://api.github.com/repos/mikefarah/yq/releases/latest 2>/dev/null) || true
+        release_tag=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' 2>/dev/null)
+        if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            _error "无法解析 yq 官方 release tag。"
+            return 1
         fi
-        _warn "yq ${tag} 下载或校验失败, 尝试下一个来源..."
-    done
-    _error "yq 安装失败 (已尝试: ${cands[*]})"
-    _error "可手动装一个再重跑脚本: wget -O ${YQ_BINARY} https://github.com/mikefarah/yq/releases/latest/download/${asset} && chmod +x ${YQ_BINARY}"
-    return 1
+        release_base="https://github.com/mikefarah/yq/releases/download/${release_tag}"
+
+        local tmp_yq checksums_tmp order_tmp
+        tmp_yq=$(mktemp "$(dirname "$YQ_BINARY")/.yq.new.XXXXXX") || return 1
+        checksums_tmp=$(mktemp /tmp/singboxlite-yq-checksums.XXXXXX) || { rm -f -- "$tmp_yq"; return 1; }
+        order_tmp=$(mktemp /tmp/singboxlite-yq-order.XXXXXX) || { rm -f -- "$tmp_yq" "$checksums_tmp"; return 1; }
+        if ! wget -qO "$tmp_yq" "${release_base}/${asset}" \
+            || ! wget -qO "$checksums_tmp" "${release_base}/checksums" \
+            || ! wget -qO "$order_tmp" "${release_base}/checksums_hashes_order"; then
+            rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
+            _error "yq 或官方校验文件下载失败。"
+            return 1
+        fi
+
+        local sha_line sha_field expected_sha actual_sha
+        sha_line=$(grep -n -x -m 1 'SHA-256' "$order_tmp" | cut -d: -f1)
+        if ! [[ "$sha_line" =~ ^[0-9]+$ ]]; then
+            rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
+            _error "yq 官方校验文件缺少 SHA-256 定义。"
+            return 1
+        fi
+        sha_field=$((sha_line + 1))
+        expected_sha=$(awk -v name="$asset" -v field="$sha_field" '
+            $1 == name { count++; value=$field }
+            END { if (count == 1) print tolower(value) }
+        ' "$checksums_tmp")
+        actual_sha=$(openssl dgst -sha256 "$tmp_yq" 2>/dev/null | awk '{print tolower($NF)}')
+        if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || [ "$actual_sha" != "$expected_sha" ]; then
+            rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
+            _error "yq SHA-256 校验失败，拒绝安装。"
+            return 1
+        fi
+        rm -f -- "$checksums_tmp" "$order_tmp"
+
+        if ! chmod 755 "$tmp_yq" || ! "$tmp_yq" --version >/dev/null 2>&1 \
+            || ! mv -f "$tmp_yq" "$YQ_BINARY"; then
+            rm -f -- "$tmp_yq"
+            _error "yq 下载或完整性自检失败。"
+            return 1
+        fi
+    fi
 }
 
 # --- 核心变量定义 ---
@@ -1937,7 +1860,7 @@ export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 export XRAY_RUNTIME_DIR="${RUNTIME_DIR}"
 export XRAY_PID_FILE="${XRAY_RUNTIME_DIR}/xray.pid"
 export DEP_STATE_FILE="${SINGBOX_DIR}/dependencies.ok"
-export DEP_STATE_VERSION="20261109-eol-archive-1"
+export DEP_STATE_VERSION="20260831-lowmem-1"
 _detect_init_system
 case "$INIT_SYSTEM" in
     openrc) export SERVICE_FILE="/etc/init.d/sing-box" ;;
@@ -1962,7 +1885,7 @@ _install_dependencies() {
     local force="${1:-false}"
     if [ "$force" != "true" ] && [ -s "$DEP_STATE_FILE" ] && grep -qx "$DEP_STATE_VERSION" "$DEP_STATE_FILE" 2>/dev/null; then
         local missing_cached=""
-        for cmd in bash jq curl wget openssl tar flock; do
+        for cmd in bash jq curl wget openssl tar unzip flock; do
             if ! command -v "$cmd" &>/dev/null; then
                 missing_cached="$missing_cached $cmd"
             fi
@@ -1980,7 +1903,7 @@ _install_dependencies() {
     # 核心依赖：脚本运行的绝对前提，必须全部装上
     local lock_pkg="util-linux"
     command -v apk &>/dev/null && lock_pkg="util-linux-misc"
-    local core_pkgs="bash curl jq openssl wget tar ca-certificates ${lock_pkg}"
+    local core_pkgs="bash curl jq openssl wget tar unzip ca-certificates ${lock_pkg}"
     # 可选依赖：部分功能需要，即使装失败也不致命
     local optional_pkgs="procps nftables socat iproute2 cron lsof"
 
@@ -2000,8 +1923,6 @@ _install_dependencies() {
 
     _info "正在安装核心依赖..."
     _pkg_install $core_pkgs
-    # SX: unzip 脚本自身并不调用 (历史遗留), 装不上不该阻断整个安装
-    command -v unzip &>/dev/null || _pkg_install unzip >/dev/null 2>&1 || true
     if ! command -v flock &>/dev/null; then
         # Alpine 版本间拆包名称有差异；其余发行版均由 util-linux 提供。
         _pkg_install util-linux 2>/dev/null || true
@@ -2032,7 +1953,7 @@ _install_dependencies() {
 
     # 关键依赖验证：如果核心工具缺失则无法继续
     local missing=""
-    for cmd in bash jq curl wget openssl tar flock; do
+    for cmd in bash jq curl wget openssl tar unzip flock; do
         if ! command -v "$cmd" &>/dev/null; then
             missing="$missing $cmd"
         fi
@@ -2043,11 +1964,6 @@ _install_dependencies() {
     if [ -n "$missing" ]; then
         _error "以下关键依赖安装失败:${missing}"
         _error "请使用系统包管理器手动安装这些工具（如 apk add / apt-get install / yum install）"
-        if command -v apt-get &>/dev/null && [ -f /etc/os-release ]; then
-            local _cn
-            _cn=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")
-            [ -n "$_cn" ] && _warn "Debian ${_cn}: 若 apt 报 \"does not have a Release file\", 说明该版本已 EOL, 需换 archive 源 (脚本会自动尝试; 手动命令: sed -i 's|deb.debian.org|archive.debian.org|g' /etc/apt/sources.list && apt-get update -o Acquire::Check-Valid-Until=false)"
-        fi
         exit 1
     fi
 

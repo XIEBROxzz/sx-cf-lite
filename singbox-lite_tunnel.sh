@@ -390,55 +390,15 @@ _manage_service() {
 }
 
 # 智能包管理
-# Debian 发行版 EOL 后官方源会被移出 deb.debian.org, 原 sources.list 直接 404:
-#   E: The repository 'http://deb.debian.org/debian bullseye Release' does not have a Release file
-# 表现就是 apt 装什么都说"装不上"。这里不改动系统 sources.list (避免留下副作用),
-# 只在本次安装里用一份临时 archive 源 + 关闭 Release 有效期校验 (archive 里的早已过期)。
-_apt_install_archive() {
-    local pkgs="$*"
-    [ -n "$pkgs" ] || return 1
-    [ -f /etc/os-release ] || return 1
-    local id codename
-    id=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")
-    codename=$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}")
-    [ "$id" = "debian" ] && [ -n "$codename" ] || return 1
-    local src rc=0
-    src=$(mktemp /tmp/sx-archive-src.XXXXXX) || return 1
-    {
-        printf 'deb https://archive.debian.org/debian %s main contrib non-free\n' "$codename"
-        printf 'deb https://archive.debian.org/debian-security %s-security main contrib non-free\n' "$codename"
-    } > "$src"
-    local -a opt=(
-        -o "Dir::Etc::sourcelist=$src"
-        -o "Dir::Etc::sourceparts=-"
-        -o "Acquire::Check-Valid-Until=false"
-        -o "APT::Get::List-Cleanup=0"
-    )
-    _warn "Debian ${codename} 官方源不可用 (该版本已 EOL), 改用 archive.debian.org 临时源重试"
-    apt-get "${opt[@]}" update -qq >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get "${opt[@]}" install -y $pkgs >/dev/null 2>&1 || rc=1
-    rm -f -- "$src"
-    if [ "$rc" = "0" ]; then
-        _info "已通过 archive 源装好:${pkgs}"
-    else
-        _warn "archive 源安装仍失败; 如长期使用建议手动把 /etc/apt/sources.list 指向 archive.debian.org"
-    fi
-    return $rc
-}
-
 _pkg_install() {
     local pkgs="$*"
     [ -z "$pkgs" ] && return 0
     if command -v apk &>/dev/null; then
         apk add --no-cache $pkgs >/dev/null 2>&1
     elif command -v apt-get &>/dev/null; then
-        # 全新 LXC/容器上 apt 缓存可能为空，必须先 update
         if [ ! -d "/var/lib/apt/lists" ] || [ "$(ls -A /var/lib/apt/lists/ 2>/dev/null | wc -l)" -le 1 ]; then
             apt-get update -qq >/dev/null 2>&1
         fi
-        # 128M Podman 中一次解析/解包整批依赖会把 apt 推到 cgroup 上限，常见结果是
-        # 第一次 apt-get 被 OOM kill、第二次依靠部分安装状态侥幸成功。容器内改为逐包、
-        # 禁用 recommends 和 dpkg PTY，主动压低峰值内存；普通 LXC/KVM 仍保留批量安装。
         if _is_podman_environment; then
             local pkg
             for pkg in $pkgs; do
@@ -447,22 +407,16 @@ _pkg_install() {
                 fi
                 if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
                     -o Dpkg::Use-Pty=0 -o Acquire::Languages=none "$pkg" >/dev/null 2>&1; then
-                    apt-get update -qq -o Acquire::Languages=none >/dev/null 2>&1 || true
-                    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                        -o Dpkg::Use-Pty=0 -o Acquire::Languages=none "$pkg" >/dev/null 2>&1; then
-                        _apt_install_archive "$pkg" || return 1
-                    fi
+                    apt-get update -qq -o Acquire::Languages=none >/dev/null 2>&1 || return 1
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                        -o Dpkg::Use-Pty=0 -o Acquire::Languages=none "$pkg" >/dev/null 2>&1 || return 1
                 fi
             done
         else
-            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1; then
-                # 兜底 1: 强制刷新索引后重试
-                apt-get update -qq >/dev/null 2>&1 || true
-                if ! DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1; then
-                    # 兜底 2: 发行版 EOL, 换 archive 源再来一次
-                    _apt_install_archive $pkgs || return 1
-                fi
-            fi
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1 || {
+                apt-get update -qq >/dev/null 2>&1
+                DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs >/dev/null 2>&1
+            }
         fi
     elif command -v yum &>/dev/null; then yum install -y $pkgs >/dev/null 2>&1
     elif command -v dnf &>/dev/null; then dnf install -y $pkgs >/dev/null 2>&1
@@ -827,100 +781,67 @@ _release_install_cache() {
     return 0
 }
 
-# 下载 + 校验 + 落位 一个 yq 版本; 成功返回 0
-# SX: 拆出来是为了让上层能按「API → latest 重定向 → 内置版本」依次重试,
-#     不再因为 api.github.com 不通 (或限流) 就整条依赖链失败。
-_yq_fetch() {
-    local tag="$1" asset="$2"
-    local base="https://github.com/mikefarah/yq/releases/download/${tag}"
-    local tmp_yq checksums_tmp order_tmp
-    tmp_yq=$(mktemp "$(dirname "$YQ_BINARY")/.yq.new.XXXXXX") || return 1
-    checksums_tmp=$(mktemp /tmp/singboxlite-yq-checksums.XXXXXX) || { rm -f -- "$tmp_yq"; return 1; }
-    order_tmp=$(mktemp /tmp/singboxlite-yq-order.XXXXXX) || { rm -f -- "$tmp_yq" "$checksums_tmp"; return 1; }
-
-    local got=0
-    if wget -qO "$tmp_yq" "${base}/${asset}" 2>/dev/null \
-        && wget -qO "$checksums_tmp" "${base}/checksums" 2>/dev/null \
-        && wget -qO "$order_tmp" "${base}/checksums_hashes_order" 2>/dev/null; then
-        got=1
-    elif curl -fsSL --max-time 60 -o "$tmp_yq" "${base}/${asset}" 2>/dev/null \
-        && curl -fsSL --max-time 30 -o "$checksums_tmp" "${base}/checksums" 2>/dev/null \
-        && curl -fsSL --max-time 30 -o "$order_tmp" "${base}/checksums_hashes_order" 2>/dev/null; then
-        got=1
-    fi
-    if [ "$got" != "1" ]; then
-        rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
-        return 1
-    fi
-
-    local sha_line sha_field expected_sha actual_sha
-    sha_line=$(grep -n -x -m 1 'SHA-256' "$order_tmp" | cut -d: -f1)
-    if ! [[ "$sha_line" =~ ^[0-9]+$ ]]; then
-        rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
-        return 1
-    fi
-    sha_field=$((sha_line + 1))
-    expected_sha=$(awk -v name="$asset" -v field="$sha_field" '
-        $1 == name { count++; value=$field }
-        END { if (count == 1) print tolower(value) }
-    ' "$checksums_tmp")
-    actual_sha=$(openssl dgst -sha256 "$tmp_yq" 2>/dev/null | awk '{print tolower($NF)}')
-    if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || [ "$actual_sha" != "$expected_sha" ]; then
-        rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
-        _error "yq SHA-256 校验失败, 已拒绝安装 (${tag})。"
-        return 1
-    fi
-    rm -f -- "$checksums_tmp" "$order_tmp"
-
-    if ! chmod 755 "$tmp_yq" || ! "$tmp_yq" --version >/dev/null 2>&1 \
-        || ! mv -f "$tmp_yq" "$YQ_BINARY"; then
-        rm -f -- "$tmp_yq"
-        return 1
-    fi
-    return 0
-}
-
 # 安装 yq
 _install_yq() {
-    if [ -x "$YQ_BINARY" ] && "$YQ_BINARY" --version >/dev/null 2>&1; then
-        return 0
-    fi
-    _info "安装 yq..."
-    local arch
-    arch=$(uname -m)
-    case $arch in
-        x86_64|amd64) arch='amd64' ;;
-        aarch64|arm64) arch='arm64' ;;
-        armv7l|armv7|armhf) arch='arm' ;;
-        *) _error "yq 不支持当前架构: $(uname -m)"; return 1 ;;
-    esac
-    local asset="yq_linux_${arch}"
-
-    # SX: tag 解析三路兜底 —— ① GitHub API ② releases/latest 的重定向地址 ③ 内置已知版本。
-    #     ② 不需要 api.github.com; ③ 保证 API 全挂时仍能装上 (纯网络问题也能过)。
-    local -a cands=()
-    local release_json release_tag loc rt
-    release_json=$(curl -fsSL --max-time 15 https://api.github.com/repos/mikefarah/yq/releases/latest 2>/dev/null) || true
-    release_tag=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' 2>/dev/null)
-    [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && cands+=("$release_tag")
-    loc=$(curl -sIL --max-time 15 -o /dev/null -w '%{url_effective}' https://github.com/mikefarah/yq/releases/latest 2>/dev/null)
-    if [[ "$loc" =~ /tag/(v[0-9]+\.[0-9]+\.[0-9]+)/?$ ]]; then
-        rt="${BASH_REMATCH[1]}"
-        [[ " ${cands[*]} " == *" ${rt} "* ]] || cands+=("$rt")
-    fi
-    cands+=("v4.44.3" "v4.45.1")
-
-    local tag
-    for tag in "${cands[@]}"; do
-        if _yq_fetch "$tag" "$asset"; then
-            _success "yq 已安装 (${tag})"
-            return 0
+    if [ ! -x "$YQ_BINARY" ] || ! "$YQ_BINARY" --version >/dev/null 2>&1; then
+        _info "安装 yq..."
+        local arch
+        arch=$(uname -m)
+        case $arch in
+            x86_64|amd64) arch='amd64' ;;
+            aarch64|arm64) arch='arm64' ;;
+            armv7l|armv7|armhf) arch='arm' ;;
+            *) _error "yq 不支持当前架构: $(uname -m)"; return 1 ;;
+        esac
+        local asset="yq_linux_${arch}"
+        local release_json release_tag release_base
+        release_json=$(curl -fsSL --max-time 15 https://api.github.com/repos/mikefarah/yq/releases/latest 2>/dev/null) || true
+        release_tag=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' 2>/dev/null)
+        if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            _error "无法解析 yq 官方 release tag。"
+            return 1
         fi
-        _warn "yq ${tag} 下载或校验失败, 尝试下一个来源..."
-    done
-    _error "yq 安装失败 (已尝试: ${cands[*]})"
-    _error "可手动装一个再重跑脚本: wget -O ${YQ_BINARY} https://github.com/mikefarah/yq/releases/latest/download/${asset} && chmod +x ${YQ_BINARY}"
-    return 1
+        release_base="https://github.com/mikefarah/yq/releases/download/${release_tag}"
+
+        local tmp_yq checksums_tmp order_tmp
+        tmp_yq=$(mktemp "$(dirname "$YQ_BINARY")/.yq.new.XXXXXX") || return 1
+        checksums_tmp=$(mktemp /tmp/singboxlite-yq-checksums.XXXXXX) || { rm -f -- "$tmp_yq"; return 1; }
+        order_tmp=$(mktemp /tmp/singboxlite-yq-order.XXXXXX) || { rm -f -- "$tmp_yq" "$checksums_tmp"; return 1; }
+        if ! wget -qO "$tmp_yq" "${release_base}/${asset}" \
+            || ! wget -qO "$checksums_tmp" "${release_base}/checksums" \
+            || ! wget -qO "$order_tmp" "${release_base}/checksums_hashes_order"; then
+            rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
+            _error "yq 或官方校验文件下载失败。"
+            return 1
+        fi
+
+        local sha_line sha_field expected_sha actual_sha
+        sha_line=$(grep -n -x -m 1 'SHA-256' "$order_tmp" | cut -d: -f1)
+        if ! [[ "$sha_line" =~ ^[0-9]+$ ]]; then
+            rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
+            _error "yq 官方校验文件缺少 SHA-256 定义。"
+            return 1
+        fi
+        sha_field=$((sha_line + 1))
+        expected_sha=$(awk -v name="$asset" -v field="$sha_field" '
+            $1 == name { count++; value=$field }
+            END { if (count == 1) print tolower(value) }
+        ' "$checksums_tmp")
+        actual_sha=$(openssl dgst -sha256 "$tmp_yq" 2>/dev/null | awk '{print tolower($NF)}')
+        if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || [ "$actual_sha" != "$expected_sha" ]; then
+            rm -f -- "$tmp_yq" "$checksums_tmp" "$order_tmp"
+            _error "yq SHA-256 校验失败，拒绝安装。"
+            return 1
+        fi
+        rm -f -- "$checksums_tmp" "$order_tmp"
+
+        if ! chmod 755 "$tmp_yq" || ! "$tmp_yq" --version >/dev/null 2>&1 \
+            || ! mv -f "$tmp_yq" "$YQ_BINARY"; then
+            rm -f -- "$tmp_yq"
+            _error "yq 下载或完整性自检失败。"
+            return 1
+        fi
+    fi
 }
 
 # --- 核心变量定义 ---
@@ -972,7 +893,7 @@ _unique_node_name() {
 export CF_API_BASE="https://api.cloudflare.com/client/v4"
 export CF_ACCOUNT_FILE="${SINGBOX_DIR}/cf_account.json"
 export DEP_STATE_FILE="${SINGBOX_DIR}/dependencies.ok"
-export DEP_STATE_VERSION="20261109-eol-archive-1"
+export DEP_STATE_VERSION="20260831-lowmem-1"
 _detect_init_system
 case "$INIT_SYSTEM" in
     openrc) export SERVICE_FILE="/etc/init.d/sing-box" ;;
@@ -993,7 +914,7 @@ _install_dependencies() {
     local force="${1:-false}"
     if [ "$force" != "true" ] && [ -s "$DEP_STATE_FILE" ] && grep -qx "$DEP_STATE_VERSION" "$DEP_STATE_FILE" 2>/dev/null; then
         local missing_cached=""
-        for cmd in bash jq curl wget openssl tar flock; do
+        for cmd in bash jq curl wget openssl tar unzip flock; do
             if ! command -v "$cmd" &>/dev/null; then
                 missing_cached="$missing_cached $cmd"
             fi
@@ -1007,7 +928,7 @@ _install_dependencies() {
 
     local lock_pkg="util-linux"
     command -v apk &>/dev/null && lock_pkg="util-linux-misc"
-    local core_pkgs="bash curl jq openssl wget tar ca-certificates ${lock_pkg}"
+    local core_pkgs="bash curl jq openssl wget tar unzip ca-certificates ${lock_pkg}"
     local optional_pkgs="procps socat iproute2 cron lsof"
 
     if _is_podman_environment; then
@@ -1023,7 +944,6 @@ _install_dependencies() {
 
     _info "正在安装核心依赖..."
     _pkg_install $core_pkgs
-    command -v unzip &>/dev/null || _pkg_install unzip >/dev/null 2>&1 || true
     if ! command -v flock &>/dev/null; then
         _pkg_install util-linux 2>/dev/null || true
     fi
@@ -1048,7 +968,7 @@ _install_dependencies() {
     fi
 
     local missing=""
-    for cmd in bash jq curl wget openssl tar flock; do
+    for cmd in bash jq curl wget openssl tar unzip flock; do
         if ! command -v "$cmd" &>/dev/null; then
             missing="$missing $cmd"
         fi
