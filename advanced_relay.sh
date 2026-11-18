@@ -4928,40 +4928,58 @@ _nt_apply_key() {
     return 1
 }
 
-# 取两数较大者 —— 缓冲类参数只升不降, 否则会把供应商已经调好的大窗口砍小
-_nt_max2() {
-    local a="$1" b="$2"
-    [[ "$a" =~ ^[0-9]+$ ]] || a=0
-    [[ "$b" =~ ^[0-9]+$ ]] || b=0
-    if [ "$a" -ge "$b" ]; then printf '%s' "$a"; else printf '%s' "$b"; fi
-}
-
-# 合并 "min default max" 三元组 (tcp_rmem / tcp_wmem), 每段只升不降
-# 第三段是硬上限, 第二段不能超过它, 否则内核会拒绝整条写入
-_nt_triple_max() {
-    local cur="$1" want="$2" cm=0 cd=0 cx=0 wm=0 wd=0 wx=0 nm nd nx
-    read -r cm cd cx <<< "$cur"
-    read -r wm wd wx <<< "$want"
-    [[ "$cm" =~ ^[0-9]+$ ]] || cm=0
-    [[ "$cd" =~ ^[0-9]+$ ]] || cd=0
-    [[ "$cx" =~ ^[0-9]+$ ]] || cx=0
-    [[ "$wm" =~ ^[0-9]+$ ]] || wm=0
-    [[ "$wd" =~ ^[0-9]+$ ]] || wd=0
-    [[ "$wx" =~ ^[0-9]+$ ]] || wx=0
-    nm=$(_nt_max2 "$cm" "$wm")
-    nx=$(_nt_max2 "$cx" "$wx")
-    nd=$(_nt_max2 "$cd" "$wd")
-    [ "$nd" -gt "$nx" ] && nd=$nx
-    [ "$nd" -lt "$nm" ] && nd=$nm
-    printf '%s %s %s' "$nm" "$nd" "$nx"
-}
-
 # 纯数字校验, 非法值一律归零
 _nt_num() {
     case "$1" in
         ''|*[!0-9]*) printf '0' ;;
         *) printf '%s' "$1" ;;
     esac
+}
+
+# ---------- 手动指定缓冲上限 ----------
+# 自动档位按内存算, 但链路差别很大 (千兆对等 / 跨境高延迟 需要更大窗口),
+# 所以留一个手动口子: 写了手动值就用手动值, 没写就用自动档位。
+_nt_buf_manual_file() { printf '%s/buf.manual' "$_NT_DIR"; }
+
+_nt_buf_manual_get() {
+    local f v
+    f=$(_nt_buf_manual_file)
+    [ -s "$f" ] || return 0
+    v=$(tr -dc '0-9' < "$f" 2>/dev/null | cut -c1-4)
+    [ -n "$v" ] || return 0
+    [ "$v" -ge 1 ] 2>/dev/null || return 0
+    printf '%s' "$v"
+}
+
+_nt_buf_manual_set() {
+    mkdir -p "$_NT_DIR" 2>/dev/null || true
+    printf '%s\n' "$1" > "$(_nt_buf_manual_file)" 2>/dev/null || return 1
+    chmod 600 "$(_nt_buf_manual_file)" 2>/dev/null || true
+    return 0
+}
+
+_nt_buf_manual_clear() { rm -f "$(_nt_buf_manual_file)" 2>/dev/null || true; return 0; }
+
+# 手动值的允许范围: 1MB ~ max(内存/2, 32) 且不超过 512
+_nt_buf_manual_cap() {
+    local mem c
+    read -r mem _ _ <<< "$(_nt_buf_tier)"
+    c=$((mem / 2))
+    [ "$c" -lt 32 ] && c=32
+    [ "$c" -gt 512 ] && c=512
+    printf '%s' "$c"
+}
+
+# 当前生效的模式说明: "自动 8MB" / "手动 16MB"
+_nt_buf_mode_text() {
+    local man mem max def
+    man=$(_nt_buf_manual_get)
+    if [ -n "$man" ]; then
+        printf '手动 %sMB' "$man"
+    else
+        read -r mem max def <<< "$(_nt_buf_tier)"
+        printf '自动 %sMB' "$((max/1048576))"
+    fi
 }
 
 # 只做真实写探针 —— 不再用 [ -w /proc/sys ] 预判。
@@ -5208,55 +5226,33 @@ _nt_group_on() {
             fi
             ;;
         buffer)
-            read -r mem max def <<< "$(_nt_buf_tier)"
-            local k cmax wmax cdr cdw nr nw ndr ndw tr tw ntr ntw note="" a=() cap
-            # 已经启用过 -> 先把"上次真正改过的键"还原, 再按"只升不降"重算。
-            # 否则上次写小的值会被当成基线, 越调越小 (实测: 原 77MB 被 8MB 档砍成 1/9)
-            if [ "$(_nt_group_state buffer)" = "on" ]; then
-                _nt_conf_keys "$_NT_F_BUF" | while read -r k; do
-                    [ -n "$k" ] && _nt_restore "$k"
-                done
+            local mem amax adef max def man cur_rmax cur_wmax
+            read -r mem amax adef <<< "$(_nt_buf_tier)"
+            man=$(_nt_buf_manual_get)
+            if [ -n "$man" ]; then
+                # 手动指定优先: 千兆对等 / 跨境高延迟 的链路需要比档位更大的窗口
+                max=$((man * 1048576))
+                def=$((max / 32))
+                [ "$def" -lt 262144 ] && def=262144
+                [ "$def" -gt "$max" ] && def=$max
+            else
+                max=$amax
+                def=$adef
             fi
-            cmax=$(_nt_num "$(_nt_get net.core.rmem_max)")
-            wmax=$(_nt_num "$(_nt_get net.core.wmem_max)")
-            cdr=$(_nt_num "$(_nt_get net.core.rmem_default)")
-            cdw=$(_nt_num "$(_nt_get net.core.wmem_default)")
-            # 上限取"档位值"与"本机当前值"的较大者 —— 供应商常已调好大窗口, 不能砍小
-            nr=$(_nt_max2 "$max" "$cmax")
-            nw=$(_nt_max2 "$max" "$wmax")
-            ndr=$(_nt_max2 "$def" "$cdr"); [ "$ndr" -gt "$nr" ] && ndr=$nr
-            ndw=$(_nt_max2 "$def" "$cdw"); [ "$ndw" -gt "$nw" ] && ndw=$nw
-            tr=$(_nt_get net.ipv4.tcp_rmem)
-            tw=$(_nt_get net.ipv4.tcp_wmem)
-            [ -n "$tr" ] && ntr=$(_nt_triple_max "$tr" "4096 87380 $max")
-            [ -n "$tw" ] && ntw=$(_nt_triple_max "$tw" "4096 65536 $max")
-            # 只把"确实要变"的键写进文件: 没变化的键不写、也不记原值,
-            # 避免关闭时把本机原值改成内核默认值 (那才是真的负优化)
-            [ "$nr" != "$cmax" ] && a+=(net.core.rmem_max "$nr")
-            [ "$nw" != "$wmax" ] && a+=(net.core.wmem_max "$nw")
-            [ "$ndr" != "$cdr" ] && a+=(net.core.rmem_default "$ndr")
-            [ "$ndw" != "$cdw" ] && a+=(net.core.wmem_default "$ndw")
-            [ -n "$ntr" ] && [ "$ntr" != "$tr" ] && a+=(net.ipv4.tcp_rmem "$ntr")
-            [ -n "$ntw" ] && [ "$ntw" != "$tw" ] && a+=(net.ipv4.tcp_wmem "$ntw")
-            [ "$cmax" -gt "$max" ] && note+="rmem_max 原值 $((cmax/1048576))MB 更大已保留; "
-            [ "$wmax" -gt "$max" ] && note+="wmem_max 原值 $((wmax/1048576))MB 更大已保留; "
-            if [ "${#a[@]}" -eq 0 ]; then
-                # 一项都不用改 —— 只落一个说明文件, 让状态显示"已启用"。
-                # 不写任何键, 也就不会记原值, 关闭时不会把本机原值改成内核默认值
-                mkdir -p /etc/sysctl.d 2>/dev/null || true
-                {
-                    echo "# sx-cf-lite: 内存自适应读写缓冲 (本机 ${mem}MB)"
-                    echo "# 现有上限已大于 $((max/1048576))MB 档位, 按只升不降原则全部保留, 未做任何修改"
-                } > "$_NT_F_BUF" 2>/dev/null || return 1
-                _nt_sync_conf
-                _info "本机缓冲上限已优于 $((max/1048576))MB 档位, 保持原值不调整"
-                return 0
+            # 本机原值更大时只提示、不阻止 —— 按设定值执行;
+            # 想保留原值就用 [6] 手动指定 (以前的"只升不降"会让档位永远不生效)
+            cur_rmax=$(_nt_num "$(_nt_get net.core.rmem_max)")
+            cur_wmax=$(_nt_num "$(_nt_get net.core.wmem_max)")
+            if [ "$cur_rmax" -gt "$max" ] || [ "$cur_wmax" -gt "$max" ]; then
+                _warn "本机原上限 $((cur_rmax/1048576))MB 大于设定值 $((max/1048576))MB, 已按设定值下调 (想保留原值请用 [6] 手动指定)"
             fi
-            cap="上限 $((max/1048576))MB"
-            [ "$nr" -gt "$max" ] && cap="上限保持原值 $((nr/1048576))MB"
-            _nt_write_conf "$_NT_F_BUF" "内存自适应读写缓冲 (本机 ${mem}MB -> ${cap})" "${a[@]}" \
-                || { _nt_err_hint; return 1; }
-            [ -z "$note" ] || _warn "按只升不降原则保留: ${note}"
+            _nt_write_conf "$_NT_F_BUF" "内存自适应读写缓冲 ($(_nt_buf_mode_text), 本机 ${mem}MB)" \
+                net.core.rmem_default "$def" \
+                net.core.wmem_default "$def" \
+                net.core.rmem_max "$max" \
+                net.core.wmem_max "$max" \
+                net.ipv4.tcp_rmem "4096 87380 $max" \
+                net.ipv4.tcp_wmem "4096 65536 $max" || { _nt_err_hint; return 1; }
             ;;
         udp)
             _nt_write_conf "$_NT_F_UDP" "UDP/QUIC 队列 + 慢启动 + MTU 探测" \
@@ -5362,8 +5358,66 @@ _nt_toggle_all() {
     _pause_anykey
 }
 
+# 手动指定缓冲上限: 档位是"按内存猜的", 链路千差万别, 留一个直接填数的口子
+_nt_buf_manual_menu() {
+    local c mb mem amax adef cap
+    read -r mem amax adef <<< "$(_nt_buf_tier)"
+    cap=$(_nt_buf_manual_cap)
+    while true; do
+        clear
+        echo -e "\n  ${CYAN}==== 手动指定缓冲上限 ====${NC}"
+        echo -e "  本机内存: ${CYAN}${mem}MB${NC}    自动档位: ${CYAN}$((amax/1048576))MB${NC}"
+        echo -e "  当前设置: ${CYAN}$(_nt_buf_mode_text)${NC}    状态: $(_nt_state_tag buffer)"
+        echo ""
+        echo -e "  ${YELLOW}这个值是「单条连接」的缓冲上限, 不是预留内存;${NC}"
+        echo -e "  ${YELLOW}但多条连接同时吃满仍会占真实内存, 小机器别设太大。${NC}"
+        echo -e "  ${YELLOW}参考: 100Mbps / 200ms 的链路约需 5MB; 千兆 + 高延迟才需要 32MB 以上。${NC}"
+        echo ""
+        echo -e "    ${GREEN}[1]${NC} 输入上限 (MB, 范围 1-${cap})"
+        echo -e "    ${GREEN}[2]${NC} 恢复自动档位"
+        echo ""
+        echo -e "    ${YELLOW}[0]${NC} 返回"
+        echo ""
+        read -p "  请选择 [0-2]: " c
+        case "$c" in
+            1)
+                read -p "  请输入缓冲上限 MB 数 (1-${cap}): " mb
+                mb=$(printf '%s' "$mb" | tr -dc '0-9')
+                if [ -z "$mb" ] || [ "$mb" -lt 1 ] || [ "$mb" -gt "$cap" ]; then
+                    _error "无效数值, 需要 1-${cap} 之间的整数"
+                    _pause_anykey
+                    continue
+                fi
+                _nt_buf_manual_set "$mb" || { _error "保存失败"; _pause_anykey; continue; }
+                if _nt_group_on buffer; then
+                    _success "已设为手动 ${mb}MB, 立即生效并持久化"
+                else
+                    _error "参数写入失败, 请看上面的提示"
+                fi
+                _pause_anykey
+                ;;
+            2)
+                if [ -z "$(_nt_buf_manual_get)" ]; then
+                    _info "当前已经是自动档位"
+                    _pause_anykey
+                    continue
+                fi
+                _nt_buf_manual_clear
+                if [ "$(_nt_group_state buffer)" = "on" ]; then
+                    _nt_group_on buffer && _success "已恢复自动档位 ($((amax/1048576))MB)"
+                else
+                    _success "已恢复自动档位, 下次启用时生效"
+                fi
+                _pause_anykey
+                ;;
+            0|"") return 0 ;;
+            *) _error "无效输入"; sleep 1 ;;
+        esac
+    done
+}
+
 _nt_menu() {
-    local c mem max def g1 g2 g3 cc qd
+    local c mem max def g1 g2 g3 cc qd bmode
     while true; do
         clear
         read -r mem max def <<< "$(_nt_buf_tier)"
@@ -5372,29 +5426,33 @@ _nt_menu() {
         g3=$(_nt_state_tag udp)
         cc=$(_nt_get net.ipv4.tcp_congestion_control)
         qd=$(_nt_get net.core.default_qdisc)
+        bmode=$(_nt_buf_mode_text)
 
         echo -e "\n  ${CYAN}==== 内核网络调优 ====${NC}"
-        echo -e "  本机内存: ${CYAN}${mem}MB${NC}    缓冲档位: ${CYAN}$((max/1048576))MB${NC} ${YELLOW}(只升不降, 原值更大则保留)${NC}"
+        echo -e "  本机内存: ${CYAN}${mem}MB${NC}    自动档位: ${CYAN}$((max/1048576))MB${NC}"
         echo -e "  当前内核: 拥塞控制=${CYAN}${cc:-未知}${NC}   队列=${CYAN}${qd:-未知}${NC}"
         echo -e "  ${YELLOW}只影响 TCP 路径 (Reality / WS / AnyTLS / SS) 的吞吐与抗丢包;${NC}"
         echo -e "  ${YELLOW}HY2 / TUIC 走 QUIC, 拥塞控制由协议自身实现, 不受内核 BBR 影响。${NC}"
         echo ""
         echo -e "    ${GREEN}[1]${NC} 开启 FQ + BBR               ${g1}"
-        echo -e "    ${GREEN}[2]${NC} 内存自适应读写缓冲窗口       ${g2}"
+        echo -e "    ${GREEN}[2]${NC} 内存自适应读写缓冲窗口       ${g2} ${CYAN}(${bmode})${NC}"
         echo -e "    ${GREEN}[3]${NC} UDP/QUIC 队列 + 慢启动 + MTU ${g3}"
         echo ""
         echo -e "    ${GREEN}[4]${NC} 全部启用"
         echo -e "    ${GREEN}[5]${NC} 全部关闭 (还原原值)"
         echo ""
+        echo -e "    ${GREEN}[6]${NC} 手动指定缓冲上限           当前 ${CYAN}${bmode}${NC}"
+        echo ""
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
-        read -p "  请选择 [0-5]: " c
+        read -p "  请选择 [0-6]: " c
         case "$c" in
             1) _nt_toggle qdisc ;;
             2) _nt_toggle buffer ;;
             3) _nt_toggle udp ;;
             4) _nt_toggle_all on ;;
             5) _nt_toggle_all off ;;
+            6) _nt_buf_manual_menu ;;
             0|"") return 0 ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
