@@ -5417,7 +5417,7 @@ _nt_buf_manual_menu() {
 }
 
 _nt_menu() {
-    local c mem max def g1 g2 g3 cc qd bmode
+    local c mem max def g1 g2 g3 cc qd bmode btip man want_mb real_mb rt real_tcp
     while true; do
         clear
         read -r mem max def <<< "$(_nt_buf_tier)"
@@ -5426,22 +5426,39 @@ _nt_menu() {
         g3=$(_nt_state_tag udp)
         cc=$(_nt_get net.ipv4.tcp_congestion_control)
         qd=$(_nt_get net.core.default_qdisc)
+        man=$(_nt_buf_manual_get)
         bmode=$(_nt_buf_mode_text)
+        # 顶部显示"当前实际生效的值", 不能只显示档位 ——
+        # 手动设了 128MB 却还在顶上写"自动档位 32MB", 看着像没生效
+        btip=""
+        [ -n "$man" ] && btip=" ${YELLOW}(自动档位 $((max/1048576))MB)${NC}"
+        # 再给出内核里的真实值, 写入没成功时能一眼看出来
+        if [ -n "$man" ]; then want_mb=$man; else want_mb=$((max/1048576)); fi
+        real_tcp=$(_nt_get net.ipv4.tcp_rmem)
+        real_tcp=${real_tcp##* }
+        real_mb=$(( $(_nt_num "$real_tcp") / 1048576 ))
+        if [ -z "$real_tcp" ]; then
+            rt="${YELLOW}读不到${NC}"
+        elif [ "$real_mb" -eq "$want_mb" ]; then
+            rt="${GREEN}${real_mb}MB${NC}"
+        else
+            rt="${RED}${real_mb}MB (设定 ${want_mb}MB 未生效)${NC}"
+        fi
 
         echo -e "\n  ${CYAN}==== 内核网络调优 ====${NC}"
-        echo -e "  本机内存: ${CYAN}${mem}MB${NC}    自动档位: ${CYAN}$((max/1048576))MB${NC}"
-        echo -e "  当前内核: 拥塞控制=${CYAN}${cc:-未知}${NC}   队列=${CYAN}${qd:-未知}${NC}"
+        echo -e "  本机内存: ${CYAN}${mem}MB${NC}    缓冲上限: ${CYAN}${bmode}${NC}${btip}"
+        echo -e "  当前内核: 拥塞控制=${CYAN}${cc:-未知}${NC}   队列=${CYAN}${qd:-未知}${NC}   TCP 窗口=${rt}"
         echo -e "  ${YELLOW}只影响 TCP 路径 (Reality / WS / AnyTLS / SS) 的吞吐与抗丢包;${NC}"
         echo -e "  ${YELLOW}HY2 / TUIC 走 QUIC, 拥塞控制由协议自身实现, 不受内核 BBR 影响。${NC}"
         echo ""
         echo -e "    ${GREEN}[1]${NC} 开启 FQ + BBR               ${g1}"
-        echo -e "    ${GREEN}[2]${NC} 内存自适应读写缓冲窗口       ${g2} ${CYAN}(${bmode})${NC}"
+        echo -e "    ${GREEN}[2]${NC} 内存自适应读写缓冲窗口       ${g2}"
         echo -e "    ${GREEN}[3]${NC} UDP/QUIC 队列 + 慢启动 + MTU ${g3}"
         echo ""
         echo -e "    ${GREEN}[4]${NC} 全部启用"
         echo -e "    ${GREEN}[5]${NC} 全部关闭 (还原原值)"
         echo ""
-        echo -e "    ${GREEN}[6]${NC} 手动指定缓冲上限           当前 ${CYAN}${bmode}${NC}"
+        echo -e "    ${GREEN}[6]${NC} 手动指定缓冲上限"
         echo ""
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
