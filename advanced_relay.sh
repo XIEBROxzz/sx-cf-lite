@@ -4908,16 +4908,60 @@ _nt_get() {
 _nt_exists() { [ -n "$(_nt_get "$1")" ]; }
 
 # 写一个键: 先走 sysctl, 失败再直接写 /proc/sys (busybox sysctl 缺失/受限时兜底)
-# 返回 0 = 真的写进去了
+# 写完必须回读 —— 容器 (LXC/OpenVZ) 里 net.core.* 常常"返回 0 但值不变",
+# 只看退出码会把没生效的当成成功 (实测: rmem_max 写 8MB, 读回还是 77MB)
 _nt_apply_key() {
-    local key="$1" val="$2" p
+    local key="$1" val="$2" p after want
+    want=$(printf '%s' "$val" | tr -s ' ' | sed 's/^ //; s/ $//')
     if sysctl -w "${key}=${val}" >/dev/null 2>&1; then
-        return 0
+        after=$(_nt_get "$key")
+        [ -z "$after" ] && return 0
+        [ "$after" = "$want" ] && return 0
+        return 1
     fi
     p="/proc/sys/${key//./\/}"
     [ -e "$p" ] || return 1
     printf '%s\n' "$val" > "$p" 2>/dev/null || return 1
-    return 0
+    after=$(_nt_get "$key")
+    [ -z "$after" ] && return 0
+    [ "$after" = "$want" ] && return 0
+    return 1
+}
+
+# 取两数较大者 —— 缓冲类参数只升不降, 否则会把供应商已经调好的大窗口砍小
+_nt_max2() {
+    local a="$1" b="$2"
+    [[ "$a" =~ ^[0-9]+$ ]] || a=0
+    [[ "$b" =~ ^[0-9]+$ ]] || b=0
+    if [ "$a" -ge "$b" ]; then printf '%s' "$a"; else printf '%s' "$b"; fi
+}
+
+# 合并 "min default max" 三元组 (tcp_rmem / tcp_wmem), 每段只升不降
+# 第三段是硬上限, 第二段不能超过它, 否则内核会拒绝整条写入
+_nt_triple_max() {
+    local cur="$1" want="$2" cm=0 cd=0 cx=0 wm=0 wd=0 wx=0 nm nd nx
+    read -r cm cd cx <<< "$cur"
+    read -r wm wd wx <<< "$want"
+    [[ "$cm" =~ ^[0-9]+$ ]] || cm=0
+    [[ "$cd" =~ ^[0-9]+$ ]] || cd=0
+    [[ "$cx" =~ ^[0-9]+$ ]] || cx=0
+    [[ "$wm" =~ ^[0-9]+$ ]] || wm=0
+    [[ "$wd" =~ ^[0-9]+$ ]] || wd=0
+    [[ "$wx" =~ ^[0-9]+$ ]] || wx=0
+    nm=$(_nt_max2 "$cm" "$wm")
+    nx=$(_nt_max2 "$cx" "$wx")
+    nd=$(_nt_max2 "$cd" "$wd")
+    [ "$nd" -gt "$nx" ] && nd=$nx
+    [ "$nd" -lt "$nm" ] && nd=$nm
+    printf '%s %s %s' "$nm" "$nd" "$nx"
+}
+
+# 纯数字校验, 非法值一律归零
+_nt_num() {
+    case "$1" in
+        ''|*[!0-9]*) printf '0' ;;
+        *) printf '%s' "$1" ;;
+    esac
 }
 
 # 只做真实写探针 —— 不再用 [ -w /proc/sys ] 预判。
@@ -5054,13 +5098,17 @@ _nt_qdisc_ok() {
 # 返回 0 = 至少写进一项; 1 = 一项都没写进去 (容器 / 只读)
 _NT_OK=0
 _NT_FAILED=""
+_NT_SKIPPED=""
 _nt_write_conf() {
     local out="$1" header="$2"; shift 2
     local key val body=""
-    _NT_OK=0; _NT_FAILED=""
+    _NT_OK=0; _NT_FAILED=""; _NT_SKIPPED=""
     while [ $# -ge 2 ]; do
         key="$1"; val="$2"; shift 2
-        _nt_exists "$key" || continue
+        if ! _nt_exists "$key"; then
+            _NT_SKIPPED+="${key} "
+            continue
+        fi
         body+="${key} = ${val}"$'\n'
         # 必须在写入之前记原值, 否则会把调优后的值记成原值
         _nt_orig_remember "$key" "$val"
@@ -5078,7 +5126,8 @@ _nt_write_conf() {
         echo "# 由主脚本 [16] -> [K] 内核网络调优生成; 关闭时自动删除并还原原值"
         printf '%s' "$body"
     } > "$out" 2>/dev/null || return 1
-    [ -z "$_NT_FAILED" ] || _warn "以下参数未能生效 (可能被容器限制): ${_NT_FAILED}"
+    [ -z "$_NT_SKIPPED" ] || _warn "本机内核没有这些键, 已跳过: ${_NT_SKIPPED}"
+    [ -z "$_NT_FAILED" ] || _warn "以下参数写入无效 (容器里 net.core.* 常被宿主锁定): ${_NT_FAILED}"
     _nt_sync_conf
     return 0
 }
@@ -5125,37 +5174,89 @@ _nt_group_state() {
 _nt_group_on() {
     local g="$1" qd="" mem max def cc_ok=1
     # 已启用就直接返回: 重复写入会把"调优后的值"误记成原值, 之后关不掉
-    if [ "$(_nt_group_state "$g")" = "on" ]; then
+    # 缓冲组例外 —— 它要先还原原值再按"只升不降"重算, 见下面的 buffer 分支
+    if [ "$(_nt_group_state "$g")" = "on" ] && [ "$g" != "buffer" ]; then
         return 0
     fi
     # 不再预判可写性 —— 交给 _nt_write_conf 逐键真写, 一项都写不进才算失败
     case "$g" in
         qdisc)
+            local has_qd=1
+            # 容器/裁剪内核里可能连 net.core.default_qdisc 这个键都没有 (实测: Alpine LXC)
+            _nt_exists net.core.default_qdisc || has_qd=0
             if ! _nt_bbr_available; then
                 modprobe tcp_bbr >/dev/null 2>&1 || true
                 _nt_bbr_available || cc_ok=0
             fi
             qd="fq"
-            _nt_qdisc_ok || qd="fq_codel"
-            if [ "$cc_ok" = "1" ]; then
+            [ "$has_qd" = "1" ] && { _nt_qdisc_ok || qd="fq_codel"; }
+            if [ "$cc_ok" = "1" ] && [ "$has_qd" = "1" ]; then
                 _nt_write_conf "$_NT_F_QDISC" "FQ 队列调度 + BBR 拥塞控制" \
                     net.core.default_qdisc "$qd" \
                     net.ipv4.tcp_congestion_control bbr || { _nt_err_hint; return 1; }
-            else
+            elif [ "$cc_ok" = "1" ]; then
+                _nt_write_conf "$_NT_F_QDISC" "BBR 拥塞控制 (本内核无 default_qdisc 键, 跳过 FQ)" \
+                    net.ipv4.tcp_congestion_control bbr || { _nt_err_hint; return 1; }
+                _warn "本机内核没有 net.core.default_qdisc 键 (容器 / 裁剪内核), 已只启用 BBR"
+            elif [ "$has_qd" = "1" ]; then
                 _nt_write_conf "$_NT_F_QDISC" "FQ 队列调度 (本内核无 BBR, 拥塞控制保持原值)" \
                     net.core.default_qdisc "$qd" || { _nt_err_hint; return 1; }
                 _warn "内核不支持 BBR (tcp_bbr 不可用), 已只启用 ${qd} 队列调度"
+            else
+                _error "本机既无 BBR 也无 net.core.default_qdisc, 这一项无可调"
+                return 1
             fi
             ;;
         buffer)
             read -r mem max def <<< "$(_nt_buf_tier)"
-            _nt_write_conf "$_NT_F_BUF" "内存自适应读写缓冲 (本机 ${mem}MB -> 上限 $((max/1048576))MB)" \
-                net.core.rmem_default "$def" \
-                net.core.wmem_default "$def" \
-                net.core.rmem_max "$max" \
-                net.core.wmem_max "$max" \
-                net.ipv4.tcp_rmem "4096 87380 $max" \
-                net.ipv4.tcp_wmem "4096 65536 $max" || { _nt_err_hint; return 1; }
+            local k cmax wmax cdr cdw nr nw ndr ndw tr tw ntr ntw note="" a=() cap
+            # 已经启用过 -> 先把"上次真正改过的键"还原, 再按"只升不降"重算。
+            # 否则上次写小的值会被当成基线, 越调越小 (实测: 原 77MB 被 8MB 档砍成 1/9)
+            if [ "$(_nt_group_state buffer)" = "on" ]; then
+                _nt_conf_keys "$_NT_F_BUF" | while read -r k; do
+                    [ -n "$k" ] && _nt_restore "$k"
+                done
+            fi
+            cmax=$(_nt_num "$(_nt_get net.core.rmem_max)")
+            wmax=$(_nt_num "$(_nt_get net.core.wmem_max)")
+            cdr=$(_nt_num "$(_nt_get net.core.rmem_default)")
+            cdw=$(_nt_num "$(_nt_get net.core.wmem_default)")
+            # 上限取"档位值"与"本机当前值"的较大者 —— 供应商常已调好大窗口, 不能砍小
+            nr=$(_nt_max2 "$max" "$cmax")
+            nw=$(_nt_max2 "$max" "$wmax")
+            ndr=$(_nt_max2 "$def" "$cdr"); [ "$ndr" -gt "$nr" ] && ndr=$nr
+            ndw=$(_nt_max2 "$def" "$cdw"); [ "$ndw" -gt "$nw" ] && ndw=$nw
+            tr=$(_nt_get net.ipv4.tcp_rmem)
+            tw=$(_nt_get net.ipv4.tcp_wmem)
+            [ -n "$tr" ] && ntr=$(_nt_triple_max "$tr" "4096 87380 $max")
+            [ -n "$tw" ] && ntw=$(_nt_triple_max "$tw" "4096 65536 $max")
+            # 只把"确实要变"的键写进文件: 没变化的键不写、也不记原值,
+            # 避免关闭时把本机原值改成内核默认值 (那才是真的负优化)
+            [ "$nr" != "$cmax" ] && a+=(net.core.rmem_max "$nr")
+            [ "$nw" != "$wmax" ] && a+=(net.core.wmem_max "$nw")
+            [ "$ndr" != "$cdr" ] && a+=(net.core.rmem_default "$ndr")
+            [ "$ndw" != "$cdw" ] && a+=(net.core.wmem_default "$ndw")
+            [ -n "$ntr" ] && [ "$ntr" != "$tr" ] && a+=(net.ipv4.tcp_rmem "$ntr")
+            [ -n "$ntw" ] && [ "$ntw" != "$tw" ] && a+=(net.ipv4.tcp_wmem "$ntw")
+            [ "$cmax" -gt "$max" ] && note+="rmem_max 原值 $((cmax/1048576))MB 更大已保留; "
+            [ "$wmax" -gt "$max" ] && note+="wmem_max 原值 $((wmax/1048576))MB 更大已保留; "
+            if [ "${#a[@]}" -eq 0 ]; then
+                # 一项都不用改 —— 只落一个说明文件, 让状态显示"已启用"。
+                # 不写任何键, 也就不会记原值, 关闭时不会把本机原值改成内核默认值
+                mkdir -p /etc/sysctl.d 2>/dev/null || true
+                {
+                    echo "# sx-cf-lite: 内存自适应读写缓冲 (本机 ${mem}MB)"
+                    echo "# 现有上限已大于 $((max/1048576))MB 档位, 按只升不降原则全部保留, 未做任何修改"
+                } > "$_NT_F_BUF" 2>/dev/null || return 1
+                _nt_sync_conf
+                _info "本机缓冲上限已优于 $((max/1048576))MB 档位, 保持原值不调整"
+                return 0
+            fi
+            cap="上限 $((max/1048576))MB"
+            [ "$nr" -gt "$max" ] && cap="上限保持原值 $((nr/1048576))MB"
+            _nt_write_conf "$_NT_F_BUF" "内存自适应读写缓冲 (本机 ${mem}MB -> ${cap})" "${a[@]}" \
+                || { _nt_err_hint; return 1; }
+            [ -z "$note" ] || _warn "按只升不降原则保留: ${note}"
             ;;
         udp)
             _nt_write_conf "$_NT_F_UDP" "UDP/QUIC 队列 + 慢启动 + MTU 探测" \
@@ -5172,33 +5273,29 @@ _nt_group_on() {
     return 0
 }
 
+# 从 conf 文件里取出"真正写过"的键名
+_nt_conf_keys() {
+    [ -s "$1" ] || return 0
+    grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$1" 2>/dev/null \
+        | sed -n 's/^[[:space:]]*\([A-Za-z0-9_.]*\)[[:space:]]*=.*/\1/p'
+}
+
 _nt_group_off() {
     local g="$1" f="" k
     case "$g" in
-        qdisc)
-            f="$_NT_F_QDISC"
-            _nt_restore net.ipv4.tcp_congestion_control
-            _nt_restore net.core.default_qdisc
-            ;;
-        buffer)
-            f="$_NT_F_BUF"
-            for k in net.core.rmem_default net.core.wmem_default \
-                     net.core.rmem_max net.core.wmem_max \
-                     net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
-                _nt_restore "$k"
-            done
-            ;;
-        udp)
-            f="$_NT_F_UDP"
-            for k in net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min \
-                     net.core.netdev_max_backlog net.core.somaxconn \
-                     net.ipv4.tcp_max_syn_backlog \
-                     net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_mtu_probing; do
-                _nt_restore "$k"
-            done
-            ;;
+        qdisc)  f="$_NT_F_QDISC" ;;
+        buffer) f="$_NT_F_BUF" ;;
+        udp)    f="$_NT_F_UDP" ;;
         *) return 1 ;;
     esac
+    # 只还原"本组确实写过"的键 (从 conf 文件里读)。
+    # 没写过的键一律不碰 —— 否则"全部关闭"会把本机原值改成内核默认值, 那是真正的负优化。
+    # 文件不存在 = 本组没启用过, 直接什么都不做。
+    if [ -s "$f" ]; then
+        _nt_conf_keys "$f" | while read -r k; do
+            [ -n "$k" ] && _nt_restore "$k"
+        done
+    fi
     rm -f "$f" 2>/dev/null || true
     _nt_sync_conf
     return 0
@@ -5277,7 +5374,7 @@ _nt_menu() {
         qd=$(_nt_get net.core.default_qdisc)
 
         echo -e "\n  ${CYAN}==== 内核网络调优 ====${NC}"
-        echo -e "  本机内存: ${CYAN}${mem}MB${NC}    缓冲档位: ${CYAN}$((max/1048576))MB${NC}"
+        echo -e "  本机内存: ${CYAN}${mem}MB${NC}    缓冲档位: ${CYAN}$((max/1048576))MB${NC} ${YELLOW}(只升不降, 原值更大则保留)${NC}"
         echo -e "  当前内核: 拥塞控制=${CYAN}${cc:-未知}${NC}   队列=${CYAN}${qd:-未知}${NC}"
         echo -e "  ${YELLOW}只影响 TCP 路径 (Reality / WS / AnyTLS / SS) 的吞吐与抗丢包;${NC}"
         echo -e "  ${YELLOW}HY2 / TUIC 走 QUIC, 拥塞控制由协议自身实现, 不受内核 BBR 影响。${NC}"
