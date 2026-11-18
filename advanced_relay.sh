@@ -4881,6 +4881,346 @@ _tcp_ts_menu() {
 }
 
 
+# ============================================================
+# SX: 内核网络调优 (三组独立开关)
+#     [1] FQ + BBR              -> /etc/sysctl.d/99-sx-net-qdisc.conf
+#     [2] 内存自适应读写缓冲窗口 -> /etc/sysctl.d/99-sx-net-buffer.conf
+#     [3] UDP/QUIC 队列 + 慢启动 + MTU 探测 -> /etc/sysctl.d/99-sx-net-udp.conf
+#     关闭 = 删对应文件 + 按 /etc/sx-net-tune/orig.env 还原原值。
+#     原值只在首次启用某键时记录一次, 之后不覆盖, 保证能回到系统初始状态。
+#     注意: 内核 BBR 只作用于 TCP socket; Hysteria2 / TUIC 走 QUIC,
+#           拥塞控制由协议自身(用户态)实现, 不受内核 BBR 影响。
+# ============================================================
+_NT_DIR="/etc/sx-net-tune"
+_NT_ORIG="${_NT_DIR}/orig.env"
+_NT_F_QDISC="/etc/sysctl.d/99-sx-net-qdisc.conf"
+_NT_F_BUF="/etc/sysctl.d/99-sx-net-buffer.conf"
+_NT_F_UDP="/etc/sysctl.d/99-sx-net-udp.conf"
+
+_nt_get() {
+    sysctl -n "$1" 2>/dev/null | tr '\t' ' ' | tr -s ' ' | sed 's/^ //; s/ $//'
+}
+
+_nt_exists() { [ -n "$(_nt_get "$1")" ]; }
+
+# 容器 / 只读 /proc/sys 检测: 写一次同值做真实探针, 比 [ -w ] 可靠
+_nt_writable() {
+    local cur
+    [ -w /proc/sys ] || return 1
+    cur=$(_nt_get net.core.somaxconn)
+    [ -n "$cur" ] || return 1
+    sysctl -w "net.core.somaxconn=${cur}" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# 取真实可用内存 (cgroup v2 memory.max/high 与 v1 limit 都看, 取最小有效值)
+_nt_mem_mb() {
+    local total=0 cand=0 f v
+    total=$(awk '/^MemTotal:/{print int($2/1024); exit}' /proc/meminfo 2>/dev/null)
+    [[ "$total" =~ ^[0-9]+$ ]] || total=0
+    for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.high \
+             /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+        [ -r "$f" ] || continue
+        v=$(cat "$f" 2>/dev/null)
+        [[ "$v" =~ ^[0-9]+$ ]] || continue
+        [ "$v" -ge 9223372036854771712 ] 2>/dev/null && continue
+        cand=$((v / 1024 / 1024))
+        [ "$cand" -gt 0 ] || continue
+        if [ "$total" -eq 0 ] || [ "$cand" -lt "$total" ]; then total=$cand; fi
+    done
+    printf '%s' "$total"
+}
+
+# 三档: <256MB -> 8MB, 256~512MB -> 16MB, >=512MB -> 32MB
+_nt_buf_tier() {
+    local mem max def
+    mem=$(_nt_mem_mb)
+    [[ "$mem" =~ ^[0-9]+$ ]] || mem=0
+    if [ "$mem" -lt 256 ]; then
+        max=8388608;  def=262144
+    elif [ "$mem" -lt 512 ]; then
+        max=16777216; def=524288
+    else
+        max=33554432; def=1048576
+    fi
+    printf '%s %s %s' "$mem" "$max" "$def"
+}
+
+_nt_orig_remember() {
+    local key="$1" cur
+    mkdir -p "$_NT_DIR" 2>/dev/null || true
+    if [ -f "$_NT_ORIG" ] && grep -q "^${key}=" "$_NT_ORIG" 2>/dev/null; then
+        return 0
+    fi
+    cur=$(_nt_get "$key")
+    [ -n "$cur" ] || return 0
+    printf '%s=%s\n' "$key" "$cur" >> "$_NT_ORIG"
+    chmod 600 "$_NT_ORIG" 2>/dev/null || true
+    return 0
+}
+
+_nt_orig_get() {
+    [ -s "$_NT_ORIG" ] || return 1
+    sed -n "s/^$1=//p" "$_NT_ORIG" 2>/dev/null | head -n1
+}
+
+# 原值备份丢失时的兜底 (内核常见默认值) —— 否则"关闭"会把调优后的值当成原值,
+# 等于关不掉 (实测踩过: orig.env 被删后 tcp_congestion_control 仍是 bbr)
+_nt_default_of() {
+    case "$1" in
+        net.core.default_qdisc)            echo fq_codel ;;
+        net.ipv4.tcp_congestion_control)   echo cubic ;;
+        net.core.rmem_default|net.core.wmem_default) echo 212992 ;;
+        net.core.rmem_max|net.core.wmem_max)         echo 212992 ;;
+        net.ipv4.tcp_rmem)                 echo "4096 131072 6291456" ;;
+        net.ipv4.tcp_wmem)                 echo "4096 16384 4194304" ;;
+        net.ipv4.udp_rmem_min|net.ipv4.udp_wmem_min) echo 4096 ;;
+        net.core.netdev_max_backlog)       echo 1000 ;;
+        net.core.somaxconn)                echo 4096 ;;
+        net.ipv4.tcp_max_syn_backlog)      echo 1024 ;;
+        net.ipv4.tcp_slow_start_after_idle) echo 1 ;;
+        net.ipv4.tcp_mtu_probing)          echo 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_nt_restore() {
+    local key="$1" val
+    val=$(_nt_orig_get "$key" 2>/dev/null)
+    if [ -z "$val" ]; then
+        val=$(_nt_default_of "$key" 2>/dev/null)
+    fi
+    [ -n "$val" ] || return 0
+    sysctl -w "${key}=${val}" >/dev/null 2>&1 || true
+    return 0
+}
+
+_nt_bbr_available() {
+    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr
+}
+
+# sch_fq 可用性: 模块能加载 或 已编译进内核 (后者 modprobe 会失败但写入可用)
+_nt_qdisc_ok() {
+    modprobe sch_fq >/dev/null 2>&1 && return 0
+    [ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" = "fq" ] && return 0
+    return 1
+}
+
+# 写一份 sysctl.d 文件: 跳过本内核不存在的键, 并逐个记录原值
+_nt_write_conf() {
+    local out="$1" header="$2"; shift 2
+    local key val body=""
+    while [ $# -ge 2 ]; do
+        key="$1"; val="$2"; shift 2
+        _nt_exists "$key" || continue
+        _nt_orig_remember "$key"
+        body+="${key} = ${val}"$'\n'
+    done
+    [ -n "$body" ] || return 1
+    mkdir -p /etc/sysctl.d 2>/dev/null || true
+    {
+        echo "# sx-cf-lite: ${header}"
+        echo "# 由主脚本 [16] -> [K] 内核网络调优生成; 关闭时自动删除并还原原值"
+        printf '%s' "$body"
+    } > "$out" 2>/dev/null || return 1
+    sysctl -p "$out" >/dev/null 2>&1 || true
+    return 0
+}
+
+_nt_group_state() {
+    case "$1" in
+        qdisc)  [ -s "$_NT_F_QDISC" ] && printf 'on' || printf 'off' ;;
+        buffer) [ -s "$_NT_F_BUF" ]   && printf 'on' || printf 'off' ;;
+        udp)    [ -s "$_NT_F_UDP" ]   && printf 'on' || printf 'off' ;;
+        *) printf 'off' ;;
+    esac
+}
+
+_nt_group_on() {
+    local g="$1" qd="" mem max def cc_ok=1
+    # 已启用就直接返回: 重复写入会把"调优后的值"误记成原值, 之后关不掉
+    if [ "$(_nt_group_state "$g")" = "on" ]; then
+        return 0
+    fi
+    if ! _nt_writable; then
+        _error "当前环境不支持修改内核参数 (容器 / 只读 /proc/sys), 已跳过"
+        return 1
+    fi
+    case "$g" in
+        qdisc)
+            if ! _nt_bbr_available; then
+                modprobe tcp_bbr >/dev/null 2>&1 || true
+                _nt_bbr_available || cc_ok=0
+            fi
+            qd="fq"
+            _nt_qdisc_ok || qd="fq_codel"
+            if [ "$cc_ok" = "1" ]; then
+                _nt_write_conf "$_NT_F_QDISC" "FQ 队列调度 + BBR 拥塞控制" \
+                    net.core.default_qdisc "$qd" \
+                    net.ipv4.tcp_congestion_control bbr || return 1
+            else
+                _nt_write_conf "$_NT_F_QDISC" "FQ 队列调度 (本内核无 BBR, 拥塞控制保持原值)" \
+                    net.core.default_qdisc "$qd" || return 1
+                _warn "内核不支持 BBR (tcp_bbr 不可用), 已只启用 ${qd} 队列调度"
+            fi
+            ;;
+        buffer)
+            read -r mem max def <<< "$(_nt_buf_tier)"
+            _nt_write_conf "$_NT_F_BUF" "内存自适应读写缓冲 (本机 ${mem}MB -> 上限 $((max/1048576))MB)" \
+                net.core.rmem_default "$def" \
+                net.core.wmem_default "$def" \
+                net.core.rmem_max "$max" \
+                net.core.wmem_max "$max" \
+                net.ipv4.tcp_rmem "4096 87380 $max" \
+                net.ipv4.tcp_wmem "4096 65536 $max" || return 1
+            ;;
+        udp)
+            _nt_write_conf "$_NT_F_UDP" "UDP/QUIC 队列 + 慢启动 + MTU 探测" \
+                net.ipv4.udp_rmem_min 16384 \
+                net.ipv4.udp_wmem_min 16384 \
+                net.core.netdev_max_backlog 16384 \
+                net.core.somaxconn 8192 \
+                net.ipv4.tcp_max_syn_backlog 8192 \
+                net.ipv4.tcp_slow_start_after_idle 0 \
+                net.ipv4.tcp_mtu_probing 1 || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+_nt_group_off() {
+    local g="$1" f="" k
+    case "$g" in
+        qdisc)
+            f="$_NT_F_QDISC"
+            _nt_restore net.ipv4.tcp_congestion_control
+            _nt_restore net.core.default_qdisc
+            ;;
+        buffer)
+            f="$_NT_F_BUF"
+            for k in net.core.rmem_default net.core.wmem_default \
+                     net.core.rmem_max net.core.wmem_max \
+                     net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
+                _nt_restore "$k"
+            done
+            ;;
+        udp)
+            f="$_NT_F_UDP"
+            for k in net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min \
+                     net.core.netdev_max_backlog net.core.somaxconn \
+                     net.ipv4.tcp_max_syn_backlog \
+                     net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_mtu_probing; do
+                _nt_restore "$k"
+            done
+            ;;
+        *) return 1 ;;
+    esac
+    rm -f "$f" 2>/dev/null || true
+    return 0
+}
+
+_nt_state_tag() {
+    if [ "$(_nt_group_state "$1")" = "on" ]; then
+        printf '%s' "${GREEN}已启用${NC}"
+    else
+        printf '%s' "${YELLOW}未启用${NC}"
+    fi
+}
+
+_nt_toggle() {
+    local g="$1" name=""
+    case "$g" in
+        qdisc)  name="FQ + BBR" ;;
+        buffer) name="内存自适应读写缓冲" ;;
+        udp)    name="UDP/QUIC 队列优化" ;;
+    esac
+    if [ "$(_nt_group_state "$g")" = "on" ]; then
+        if _nt_group_off "$g"; then
+            _success "已关闭 ${name} (内核参数已还原)"
+        else
+            _error "关闭 ${name} 失败"
+        fi
+    else
+        if _nt_group_on "$g"; then
+            _success "已启用 ${name} (立即生效, 已持久化)"
+        else
+            _error "启用 ${name} 失败"
+        fi
+    fi
+    _pause_anykey
+}
+
+_nt_toggle_all() {
+    local want="$1" g rc=0
+    if [ "$want" = "on" ] && ! _nt_writable; then
+        _error "当前环境不支持修改内核参数 (容器 / 只读 /proc/sys)"
+        _pause_anykey
+        return 1
+    fi
+    for g in qdisc buffer udp; do
+        if [ "$want" = "on" ]; then
+            _nt_group_on "$g" || rc=1
+        else
+            _nt_group_off "$g" || rc=1
+        fi
+    done
+    if [ "$want" = "on" ]; then
+        if [ "$rc" -eq 0 ]; then
+            _success "三组调优已全部启用"
+        else
+            _warn "部分组启用失败, 请查看上面的提示"
+        fi
+    else
+        if [ "$rc" -eq 0 ]; then
+            _success "三组调优已全部关闭, 内核参数已还原"
+        else
+            _warn "部分组关闭失败"
+        fi
+    fi
+    _pause_anykey
+}
+
+_nt_menu() {
+    local c mem max def g1 g2 g3 cc qd
+    while true; do
+        clear
+        read -r mem max def <<< "$(_nt_buf_tier)"
+        g1=$(_nt_state_tag qdisc)
+        g2=$(_nt_state_tag buffer)
+        g3=$(_nt_state_tag udp)
+        cc=$(_nt_get net.ipv4.tcp_congestion_control)
+        qd=$(_nt_get net.core.default_qdisc)
+
+        echo -e "\n  ${CYAN}==== 内核网络调优 ====${NC}"
+        echo -e "  本机内存: ${CYAN}${mem}MB${NC}    缓冲档位: ${CYAN}$((max/1048576))MB${NC}"
+        echo -e "  当前内核: 拥塞控制=${CYAN}${cc:-未知}${NC}   队列=${CYAN}${qd:-未知}${NC}"
+        echo -e "  ${YELLOW}只影响 TCP 路径 (Reality / WS / AnyTLS / SS) 的吞吐与抗丢包;${NC}"
+        echo -e "  ${YELLOW}HY2 / TUIC 走 QUIC, 拥塞控制由协议自身实现, 不受内核 BBR 影响。${NC}"
+        echo ""
+        echo -e "    ${GREEN}[1]${NC} 开启 FQ + BBR               ${g1}"
+        echo -e "    ${GREEN}[2]${NC} 内存自适应读写缓冲窗口       ${g2}"
+        echo -e "    ${GREEN}[3]${NC} UDP/QUIC 队列 + 慢启动 + MTU ${g3}"
+        echo ""
+        echo -e "    ${GREEN}[4]${NC} 全部启用"
+        echo -e "    ${GREEN}[5]${NC} 全部关闭 (还原原值)"
+        echo ""
+        echo -e "    ${YELLOW}[0]${NC} 返回"
+        echo ""
+        read -p "  请选择 [0-5]: " c
+        case "$c" in
+            1) _nt_toggle qdisc ;;
+            2) _nt_toggle buffer ;;
+            3) _nt_toggle udp ;;
+            4) _nt_toggle_all on ;;
+            5) _nt_toggle_all off ;;
+            0|"") return 0 ;;
+            *) _error "无效输入"; sleep 1 ;;
+        esac
+    done
+}
+
+
 _warp_menu() {
     while true; do
         clear
@@ -5596,6 +5936,17 @@ _menu() {
         _ts_st=$(_tcp_ts_state)
         if [ "$_ts_st" = "0" ]; then _ts_disp="${YELLOW}已关闭${NC}"; else _ts_disp="${GREEN}开启 (默认)${NC}"; fi
         echo -e "    ${GREEN}[S]${NC} TCP 时间戳: ${_ts_disp}   ${YELLOW}(手机 5G 连不上时关掉试试)${NC}"
+        # SX: 内核网络调优 (FQ+BBR / 读写缓冲 / UDP 队列), 三组独立开关
+        local _nt_n=0 _nt_g _nt_disp
+        for _nt_g in qdisc buffer udp; do
+            [ "$(_nt_group_state "$_nt_g")" = "on" ] && _nt_n=$((_nt_n+1))
+        done
+        if [ "$_nt_n" -gt 0 ]; then
+            _nt_disp="${GREEN}已启用 ${_nt_n}/3${NC}"
+        else
+            _nt_disp="${YELLOW}未启用${NC}"
+        fi
+        echo -e "    ${GREEN}[K]${NC} 内核网络调优: ${_nt_disp}   ${YELLOW}(FQ+BBR / 缓冲 / UDP 队列)${NC}"
         # SX: 落地与 WARP 同时启用时给一句口径说明 —— 顺序是 落地→WARP→final
         #     全量接管(带 domain_regex [".*"] 的 catch-all) 才会"未命中走 WARP";
         #     自定义规则模式只把命中的送去 WARP, 其余仍按 final=direct 走直连。
@@ -5617,7 +5968,7 @@ _menu() {
         echo -e "  ─────────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
         echo ""
-        read -p "  请输入选项 [0-10 或 R/B/T/S]: " choice
+        read -p "  请输入选项 [0-10 或 R/B/T/S/K]: " choice
         case $choice in
             1) _landing_config ;;
             # SX: 每次进入只添加一个 —— 不再套 while 循环连续追问, 加完停留一次即回菜单
@@ -5639,6 +5990,7 @@ _menu() {
             B|b) _direct_fam_menu ;;
             T|t) _relay_troubleshoot_menu ;;
             S|s) _tcp_ts_menu ;;
+            K|k) _nt_menu ;;
             V|v) _ipfam_menu ;;
             10) _port_forward_menu ;;
             0) break ;;

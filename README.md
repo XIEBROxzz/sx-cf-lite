@@ -1,6 +1,6 @@
 # SX-CF-lite
 
-sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.79.6**（节点地址探测更稳：多源 + 网卡兜底，纯 IPv6 不再回落 127.0.0.1）
+sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.79.7**（[16] → [K] 新增内核网络调优：FQ+BBR / 内存自适应缓冲 / UDP 队列，三组独立开关，可一键还原）
 
 > 基于 [0xdabiaoge/singbox-lite](https://github.com/0xdabiaoge/singbox-lite) 地基 + Joey [xray-cf-lite](https://github.com/byJoey/xray-cf-lite) 的 CF 套皮整合魔改。
 

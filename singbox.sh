@@ -22,6 +22,14 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.79.7: 进阶功能 [16] 新增 [K] 内核网络调优 (三组独立开关):
+#           ① FQ + BBR 队列/拥塞控制 (内核无 BBR 时只启用 fq/fq_codel 并提示)
+#           ② 内存自适应读写缓冲窗口 (<256MB→8MB / 256~512MB→16MB / ≥512MB→32MB,
+#              按 cgroup memory.max/high 取真实可用内存, 容器里不会误判)
+#           ③ UDP/QUIC 队列 + netdev_max_backlog + tcp_slow_start_after_idle=0
+#              + tcp_mtu_probing=1
+#           关闭即删对应 sysctl.d 文件并按 /etc/sx-net-tune/orig.env 还原原值;
+#           容器 / 只读 /proc/sys 环境直接拒绝, 不假装成功; 卸载时一并清理。
 #     1.79.6: 修「纯 IPv6 机器创建节点时服务器地址变成 127.0.0.1」:
 #           ① _probe_ip_family 由「2 源 + 2s 超时」改为「4 源 + 4s 超时」——
 #              2 秒跑完 DNS+TCP+TLS 在跨境链路上基本不够, v6 常常整族超时;
@@ -179,7 +187,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79.6"
+export SCRIPT_VERSION="1.79.7"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -3973,6 +3981,47 @@ _uninstall() {
                 && mv -f /tmp/sx_sysctl_uninstall.$$ /etc/sysctl.conf
         fi
         sysctl -w net.ipv4.tcp_timestamps=1 >/dev/null 2>&1 || true
+    fi
+
+    # SX: 还原 [K] 内核网络调优做过的改动 (三份 sysctl.d + 按原值备份还原)
+    if [ -f /etc/sysctl.d/99-sx-net-qdisc.conf ] \
+        || [ -f /etc/sysctl.d/99-sx-net-buffer.conf ] \
+        || [ -f /etc/sysctl.d/99-sx-net-udp.conf ] \
+        || [ -d /etc/sx-net-tune ]; then
+        _info "还原内核网络调优 (sysctl) 改动..."
+        # 优先用启用时记录的原值; 备份丢了就退回内核常见默认值, 免得卸载后 BBR 还挂着
+        for _nt_k in net.core.default_qdisc net.ipv4.tcp_congestion_control \
+                     net.core.rmem_default net.core.wmem_default \
+                     net.core.rmem_max net.core.wmem_max \
+                     net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
+                     net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min \
+                     net.core.netdev_max_backlog net.core.somaxconn \
+                     net.ipv4.tcp_max_syn_backlog \
+                     net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_mtu_probing; do
+            _nt_v=$(sed -n "s/^${_nt_k}=//p" /etc/sx-net-tune/orig.env 2>/dev/null | head -n1)
+            if [ -z "$_nt_v" ]; then
+                case "$_nt_k" in
+                    net.core.default_qdisc)              _nt_v=fq_codel ;;
+                    net.ipv4.tcp_congestion_control)     _nt_v=cubic ;;
+                    net.core.rmem_default|net.core.wmem_default|net.core.rmem_max|net.core.wmem_max) _nt_v=212992 ;;
+                    net.ipv4.tcp_rmem)                   _nt_v="4096 131072 6291456" ;;
+                    net.ipv4.tcp_wmem)                   _nt_v="4096 16384 4194304" ;;
+                    net.ipv4.udp_rmem_min|net.ipv4.udp_wmem_min) _nt_v=4096 ;;
+                    net.core.netdev_max_backlog)         _nt_v=1000 ;;
+                    net.core.somaxconn)                  _nt_v=4096 ;;
+                    net.ipv4.tcp_max_syn_backlog)        _nt_v=1024 ;;
+                    net.ipv4.tcp_slow_start_after_idle)  _nt_v=1 ;;
+                    net.ipv4.tcp_mtu_probing)            _nt_v=0 ;;
+                    *)                                   _nt_v="" ;;
+                esac
+            fi
+            [ -n "$_nt_v" ] || continue
+            sysctl -w "${_nt_k}=${_nt_v}" >/dev/null 2>&1 || true
+        done
+        rm -f /etc/sysctl.d/99-sx-net-qdisc.conf \
+              /etc/sysctl.d/99-sx-net-buffer.conf \
+              /etc/sysctl.d/99-sx-net-udp.conf
+        rm -rf /etc/sx-net-tune
     fi
 
     rm -f "${CLOUDFLARED_BIN}" "$RUNTIME_DIR"/argo-*.pid "$RUNTIME_DIR"/argo-keepalive.lock
