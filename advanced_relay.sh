@@ -4896,6 +4896,10 @@ _NT_ORIG="${_NT_DIR}/orig.env"
 _NT_F_QDISC="/etc/sysctl.d/99-sx-net-qdisc.conf"
 _NT_F_BUF="/etc/sysctl.d/99-sx-net-buffer.conf"
 _NT_F_UDP="/etc/sysctl.d/99-sx-net-udp.conf"
+# Alpine 的 openrc sysctl 服务只读 /etc/sysctl.conf, 不读 /etc/sysctl.d
+# 所以除了 .d 文件, 再往 sysctl.conf 写一个标记块 (与 [S] TCP 时间戳同一套做法)
+_NT_TAG="net-tuning"
+_NT_CONF="/etc/sysctl.conf"
 
 _nt_get() {
     sysctl -n "$1" 2>/dev/null | tr '\t' ' ' | tr -s ' ' | sed 's/^ //; s/ $//'
@@ -4903,14 +4907,47 @@ _nt_get() {
 
 _nt_exists() { [ -n "$(_nt_get "$1")" ]; }
 
-# 容器 / 只读 /proc/sys 检测: 写一次同值做真实探针, 比 [ -w ] 可靠
+# 写一个键: 先走 sysctl, 失败再直接写 /proc/sys (busybox sysctl 缺失/受限时兜底)
+# 返回 0 = 真的写进去了
+_nt_apply_key() {
+    local key="$1" val="$2" p
+    if sysctl -w "${key}=${val}" >/dev/null 2>&1; then
+        return 0
+    fi
+    p="/proc/sys/${key//./\/}"
+    [ -e "$p" ] || return 1
+    printf '%s\n' "$val" > "$p" 2>/dev/null || return 1
+    return 0
+}
+
+# 只做真实写探针 —— 不再用 [ -w /proc/sys ] 预判。
+# procfs 目录权限位是 dr-xr-xr-x, 那个预判在 Debian / Alpine 上会误判成"不可写",
+# 导致后面的真实写入测试根本没跑到, 表现为"明明能改却报容器不支持"。
 _nt_writable() {
     local cur
-    [ -w /proc/sys ] || return 1
     cur=$(_nt_get net.core.somaxconn)
     [ -n "$cur" ] || return 1
-    sysctl -w "net.core.somaxconn=${cur}" >/dev/null 2>&1 || return 1
-    return 0
+    _nt_apply_key net.core.somaxconn "$cur"
+}
+
+# 失败原因自述, 让报错能直接定位到底是哪一种
+_nt_diag() {
+    local cur
+    cur=$(_nt_get net.core.somaxconn)
+    if [ -z "$cur" ]; then
+        printf '读不到 net.core.somaxconn (sysctl 命令缺失或 /proc 未挂载)'
+        return 0
+    fi
+    if _nt_apply_key net.core.somaxconn "$cur"; then
+        printf '实际可写, 请重试'
+    else
+        printf '写入 /proc/sys/net/core/somaxconn 被拒绝 (容器 LXC/OpenVZ 或只读 /proc)'
+    fi
+}
+
+_nt_err_hint() {
+    _error "内核参数一项都没写进去: $(_nt_diag)"
+    _error "自查: cat /proc/1/cgroup ; ls -ld /proc/sys/net/core"
 }
 
 # 取真实可用内存 (cgroup v2 memory.max/high 与 v1 limit 都看, 取最小有效值)
@@ -4947,13 +4984,19 @@ _nt_buf_tier() {
 }
 
 _nt_orig_remember() {
-    local key="$1" cur
+    local key="$1" cur def
     mkdir -p "$_NT_DIR" 2>/dev/null || true
     if [ -f "$_NT_ORIG" ] && grep -q "^${key}=" "$_NT_ORIG" 2>/dev/null; then
         return 0
     fi
     cur=$(_nt_get "$key")
     [ -n "$cur" ] || return 0
+    # 当前值已经等于"即将写入的值" => 原值已不可知 (备份被删过 / 上次没关干净),
+    # 此时记内核默认值更安全, 否则"关闭"会把调优值当成原值写回去, 等于关不掉
+    if [ -n "${2:-}" ] && [ "$cur" = "$2" ]; then
+        def=$(_nt_default_of "$key" 2>/dev/null)
+        [ -n "$def" ] && cur="$def"
+    fi
     printf '%s=%s\n' "$key" "$cur" >> "$_NT_ORIG"
     chmod 600 "$_NT_ORIG" 2>/dev/null || true
     return 0
@@ -4991,7 +5034,7 @@ _nt_restore() {
         val=$(_nt_default_of "$key" 2>/dev/null)
     fi
     [ -n "$val" ] || return 0
-    sysctl -w "${key}=${val}" >/dev/null 2>&1 || true
+    _nt_apply_key "$key" "$val" >/dev/null 2>&1 || true
     return 0
 }
 
@@ -5006,24 +5049,67 @@ _nt_qdisc_ok() {
     return 1
 }
 
-# 写一份 sysctl.d 文件: 跳过本内核不存在的键, 并逐个记录原值
+# 写一份 sysctl.d 文件: 跳过本内核不存在的键, 逐个记录原值并立即生效
+# 不再依赖 sysctl -p (busybox 对 "key = value" 的解析不一定兼容), 改成逐键写
+# 返回 0 = 至少写进一项; 1 = 一项都没写进去 (容器 / 只读)
+_NT_OK=0
+_NT_FAILED=""
 _nt_write_conf() {
     local out="$1" header="$2"; shift 2
     local key val body=""
+    _NT_OK=0; _NT_FAILED=""
     while [ $# -ge 2 ]; do
         key="$1"; val="$2"; shift 2
         _nt_exists "$key" || continue
-        _nt_orig_remember "$key"
         body+="${key} = ${val}"$'\n'
+        # 必须在写入之前记原值, 否则会把调优后的值记成原值
+        _nt_orig_remember "$key" "$val"
+        if _nt_apply_key "$key" "$val"; then
+            _NT_OK=$((_NT_OK+1))
+        else
+            _NT_FAILED+="${key} "
+        fi
     done
     [ -n "$body" ] || return 1
+    [ "$_NT_OK" -gt 0 ] || return 1
     mkdir -p /etc/sysctl.d 2>/dev/null || true
     {
         echo "# sx-cf-lite: ${header}"
         echo "# 由主脚本 [16] -> [K] 内核网络调优生成; 关闭时自动删除并还原原值"
         printf '%s' "$body"
     } > "$out" 2>/dev/null || return 1
-    sysctl -p "$out" >/dev/null 2>&1 || true
+    [ -z "$_NT_FAILED" ] || _warn "以下参数未能生效 (可能被容器限制): ${_NT_FAILED}"
+    _nt_sync_conf
+    return 0
+}
+
+# 把三组里"已启用"的键汇总成一个标记块写进 /etc/sysctl.conf (Alpine/openrc 用)
+# 全关时把块整段删掉
+_nt_sync_conf() {
+    local f="$_NT_CONF" x tmp body=""
+    [ -f "$f" ] || : > "$f" 2>/dev/null || return 0
+    tmp="${f}.sxnt.$$"
+    awk -v b="# >>> sx-cf-lite ${_NT_TAG} >>>" -v e="# <<< sx-cf-lite ${_NT_TAG} <<<" '
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        skip != 1' "$f" > "$tmp" 2>/dev/null || return 0
+    for x in "$_NT_F_QDISC" "$_NT_F_BUF" "$_NT_F_UDP"; do
+        [ -s "$x" ] || continue
+        body+=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$x" 2>/dev/null)$'\n'
+    done
+    if [ -n "$body" ]; then
+        {
+            cat "$tmp"
+            echo ""
+            echo "# >>> sx-cf-lite ${_NT_TAG} >>>"
+            printf '%s' "$body"
+            echo "# <<< sx-cf-lite ${_NT_TAG} <<<"
+        } > "$f" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    else
+        mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
     return 0
 }
 
@@ -5042,10 +5128,7 @@ _nt_group_on() {
     if [ "$(_nt_group_state "$g")" = "on" ]; then
         return 0
     fi
-    if ! _nt_writable; then
-        _error "当前环境不支持修改内核参数 (容器 / 只读 /proc/sys), 已跳过"
-        return 1
-    fi
+    # 不再预判可写性 —— 交给 _nt_write_conf 逐键真写, 一项都写不进才算失败
     case "$g" in
         qdisc)
             if ! _nt_bbr_available; then
@@ -5057,10 +5140,10 @@ _nt_group_on() {
             if [ "$cc_ok" = "1" ]; then
                 _nt_write_conf "$_NT_F_QDISC" "FQ 队列调度 + BBR 拥塞控制" \
                     net.core.default_qdisc "$qd" \
-                    net.ipv4.tcp_congestion_control bbr || return 1
+                    net.ipv4.tcp_congestion_control bbr || { _nt_err_hint; return 1; }
             else
                 _nt_write_conf "$_NT_F_QDISC" "FQ 队列调度 (本内核无 BBR, 拥塞控制保持原值)" \
-                    net.core.default_qdisc "$qd" || return 1
+                    net.core.default_qdisc "$qd" || { _nt_err_hint; return 1; }
                 _warn "内核不支持 BBR (tcp_bbr 不可用), 已只启用 ${qd} 队列调度"
             fi
             ;;
@@ -5072,7 +5155,7 @@ _nt_group_on() {
                 net.core.rmem_max "$max" \
                 net.core.wmem_max "$max" \
                 net.ipv4.tcp_rmem "4096 87380 $max" \
-                net.ipv4.tcp_wmem "4096 65536 $max" || return 1
+                net.ipv4.tcp_wmem "4096 65536 $max" || { _nt_err_hint; return 1; }
             ;;
         udp)
             _nt_write_conf "$_NT_F_UDP" "UDP/QUIC 队列 + 慢启动 + MTU 探测" \
@@ -5082,7 +5165,7 @@ _nt_group_on() {
                 net.core.somaxconn 8192 \
                 net.ipv4.tcp_max_syn_backlog 8192 \
                 net.ipv4.tcp_slow_start_after_idle 0 \
-                net.ipv4.tcp_mtu_probing 1 || return 1
+                net.ipv4.tcp_mtu_probing 1 || { _nt_err_hint; return 1; }
             ;;
         *) return 1 ;;
     esac
@@ -5117,6 +5200,7 @@ _nt_group_off() {
         *) return 1 ;;
     esac
     rm -f "$f" 2>/dev/null || true
+    _nt_sync_conf
     return 0
 }
 
@@ -5154,7 +5238,7 @@ _nt_toggle() {
 _nt_toggle_all() {
     local want="$1" g rc=0
     if [ "$want" = "on" ] && ! _nt_writable; then
-        _error "当前环境不支持修改内核参数 (容器 / 只读 /proc/sys)"
+        _error "当前环境不支持修改内核参数: $(_nt_diag)"
         _pause_anykey
         return 1
     fi

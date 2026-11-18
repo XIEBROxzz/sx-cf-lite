@@ -22,6 +22,14 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.79.8: 修 [K] 内核网络调优在 Debian / Alpine 上误报「当前环境不支持修改内核参数」:
+#           ① 去掉 [ -w /proc/sys ] 预判 —— procfs 目录权限位是 dr-xr-xr-x,
+#              这个判断在正常 root 环境下也会假阴性, 真实写入测试根本没跑到
+#           ② 改为逐键真写 (sysctl -w 失败再直接写 /proc/sys/xxx), 一项都写不进才算失败
+#           ③ 不再依赖 sysctl -p (busybox 对 "key = value" 解析不保证), 逐键立即生效
+#           ④ 补写 /etc/sysctl.conf 标记块 —— Alpine openrc 只读这个文件, 不读 sysctl.d,
+#              否则重启后调优会丢失 (与 [S] TCP 时间戳同一套做法)
+#           ⑤ 失败时输出具体原因 (sysctl 缺失 / 写入被拒) 与自查命令
 #     1.79.7: 进阶功能 [16] 新增 [K] 内核网络调优 (三组独立开关):
 #           ① FQ + BBR 队列/拥塞控制 (内核无 BBR 时只启用 fq/fq_codel 并提示)
 #           ② 内存自适应读写缓冲窗口 (<256MB→8MB / 256~512MB→16MB / ≥512MB→32MB,
@@ -187,7 +195,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79.7"
+export SCRIPT_VERSION="1.79.8"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -3987,7 +3995,8 @@ _uninstall() {
     if [ -f /etc/sysctl.d/99-sx-net-qdisc.conf ] \
         || [ -f /etc/sysctl.d/99-sx-net-buffer.conf ] \
         || [ -f /etc/sysctl.d/99-sx-net-udp.conf ] \
-        || [ -d /etc/sx-net-tune ]; then
+        || [ -d /etc/sx-net-tune ] \
+        || grep -qF '# >>> sx-cf-lite net-tuning >>>' /etc/sysctl.conf 2>/dev/null; then
         _info "还原内核网络调优 (sysctl) 改动..."
         # 优先用启用时记录的原值; 备份丢了就退回内核常见默认值, 免得卸载后 BBR 还挂着
         for _nt_k in net.core.default_qdisc net.ipv4.tcp_congestion_control \
@@ -4021,6 +4030,13 @@ _uninstall() {
         rm -f /etc/sysctl.d/99-sx-net-qdisc.conf \
               /etc/sysctl.d/99-sx-net-buffer.conf \
               /etc/sysctl.d/99-sx-net-udp.conf
+        # Alpine/openrc 只读 /etc/sysctl.conf, 标记块也要一起删
+        if [ -f /etc/sysctl.conf ] && grep -qF '# >>> sx-cf-lite net-tuning >>>' /etc/sysctl.conf 2>/dev/null; then
+            awk '/# >>> sx-cf-lite net-tuning >>>/{skip=1;next}
+                 /# <<< sx-cf-lite net-tuning <<</{skip=0;next}
+                 skip!=1' /etc/sysctl.conf > /tmp/sx_net_uninstall.$$ 2>/dev/null \
+                && mv -f /tmp/sx_net_uninstall.$$ /etc/sysctl.conf
+        fi
         rm -rf /etc/sx-net-tune
     fi
 
