@@ -4900,9 +4900,19 @@ _NT_F_UDP="/etc/sysctl.d/99-sx-net-udp.conf"
 # 所以除了 .d 文件, 再往 sysctl.conf 写一个标记块 (与 [S] TCP 时间戳同一套做法)
 _NT_TAG="net-tuning"
 _NT_CONF="/etc/sysctl.conf"
+# procfs 根目录, 抽成变量是为了能桩测 (生产环境恒为 /proc/sys)
+_NT_PROC="/proc/sys"
 
 _nt_get() {
-    sysctl -n "$1" 2>/dev/null | tr '\t' ' ' | tr -s ' ' | sed 's/^ //; s/ $//'
+    local v p
+    v=$(sysctl -n "$1" 2>/dev/null)
+    if [ -z "$v" ]; then
+        # 极简系统 (Alpine 精简镜像 / 自定义 rootfs) 可能根本没装 sysctl,
+        # 直接读 /proc/sys 兜底 —— 否则整套调优会被判成"环境不支持"
+        p="${_NT_PROC}/${1//./\/}"
+        [ -r "$p" ] && v=$(cat "$p" 2>/dev/null)
+    fi
+    printf '%s' "$v" | tr '\t' ' ' | tr -s ' ' | sed 's/^ //; s/ $//'
 }
 
 _nt_exists() { [ -n "$(_nt_get "$1")" ]; }
@@ -4919,7 +4929,7 @@ _nt_apply_key() {
         [ "$after" = "$want" ] && return 0
         return 1
     fi
-    p="/proc/sys/${key//./\/}"
+    p="${_NT_PROC}/${key//./\/}"
     [ -e "$p" ] || return 1
     printf '%s\n' "$val" > "$p" 2>/dev/null || return 1
     after=$(_nt_get "$key")
@@ -4985,25 +4995,38 @@ _nt_buf_mode_text() {
 # 只做真实写探针 —— 不再用 [ -w /proc/sys ] 预判。
 # procfs 目录权限位是 dr-xr-xr-x, 那个预判在 Debian / Alpine 上会误判成"不可写",
 # 导致后面的真实写入测试根本没跑到, 表现为"明明能改却报容器不支持"。
+# 探测键要挨个试: 容器里 somaxconn 可能整个不存在, 但别的键照样能写
+_nt_probe_keys() {
+    printf '%s\n' net.ipv4.tcp_congestion_control net.core.somaxconn \
+        net.ipv4.tcp_mtu_probing net.ipv4.tcp_rmem net.core.rmem_max
+}
+
 _nt_writable() {
-    local cur
-    cur=$(_nt_get net.core.somaxconn)
-    [ -n "$cur" ] || return 1
-    _nt_apply_key net.core.somaxconn "$cur"
+    local k cur
+    for k in $(_nt_probe_keys); do
+        cur=$(_nt_get "$k")
+        [ -n "$cur" ] || continue
+        _nt_apply_key "$k" "$cur" && return 0
+    done
+    return 1
 }
 
 # 失败原因自述, 让报错能直接定位到底是哪一种
 _nt_diag() {
-    local cur
-    cur=$(_nt_get net.core.somaxconn)
-    if [ -z "$cur" ]; then
-        printf '读不到 net.core.somaxconn (sysctl 命令缺失或 /proc 未挂载)'
-        return 0
-    fi
-    if _nt_apply_key net.core.somaxconn "$cur"; then
-        printf '实际可写, 请重试'
+    local k cur readable=0
+    for k in $(_nt_probe_keys); do
+        cur=$(_nt_get "$k")
+        [ -n "$cur" ] || continue
+        readable=1
+        if _nt_apply_key "$k" "$cur"; then
+            printf '实际可写 (%s), 请重试' "$k"
+            return 0
+        fi
+    done
+    if [ "$readable" = "0" ]; then
+        printf '读不到任何网络参数 (/proc/sys 未挂载, 或内核把 net 相关项全裁了)'
     else
-        printf '写入 /proc/sys/net/core/somaxconn 被拒绝 (容器 LXC/OpenVZ 或只读 /proc)'
+        printf '参数能读到但写不进去 (容器 LXC/OpenVZ 宿主锁定, 或 /proc/sys 只读挂载)'
     fi
 }
 
@@ -5101,13 +5124,13 @@ _nt_restore() {
 }
 
 _nt_bbr_available() {
-    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr
+    _nt_get net.ipv4.tcp_available_congestion_control | grep -qw bbr
 }
 
 # sch_fq 可用性: 模块能加载 或 已编译进内核 (后者 modprobe 会失败但写入可用)
 _nt_qdisc_ok() {
     modprobe sch_fq >/dev/null 2>&1 && return 0
-    [ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" = "fq" ] && return 0
+    [ "$(_nt_get net.core.default_qdisc)" = "fq" ] && return 0
     return 1
 }
 
@@ -5437,8 +5460,11 @@ _nt_menu() {
         real_tcp=$(_nt_get net.ipv4.tcp_rmem)
         real_tcp=${real_tcp##* }
         real_mb=$(( $(_nt_num "$real_tcp") / 1048576 ))
+        # 只有缓冲组真的启用过, 才谈得上"未生效"; 没启用就中性显示, 免得吓人
         if [ -z "$real_tcp" ]; then
             rt="${YELLOW}读不到${NC}"
+        elif [ "$(_nt_group_state buffer)" != "on" ]; then
+            rt="${CYAN}${real_mb}MB${NC} ${YELLOW}(未启用)${NC}"
         elif [ "$real_mb" -eq "$want_mb" ]; then
             rt="${GREEN}${real_mb}MB${NC}"
         else

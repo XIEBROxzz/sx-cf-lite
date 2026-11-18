@@ -22,6 +22,14 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.79.12: 修 [K] 在「没装 sysctl 命令」的系统上直接报"环境不支持":
+#           ① _nt_get 先用 sysctl, 取不到就退回读 /proc/sys/xxx —— 极简系统
+#              (Alpine 精简镜像 / 自定义 rootfs) 常常根本没装 procps,
+#              原来所有读取都走 sysctl, 于是整个 [K] 被误判成不可用
+#           ② 可写性探针改为多键轮询 (tcp_congestion_control / somaxconn /
+#              tcp_mtu_probing / tcp_rmem / rmem_max), 某个键不存在不再直接判失败
+#           ③ 报错区分"一个键都读不到"(/proc/sys 未挂载) 与"能读不能写"(宿主锁定)
+#           ④ 菜单: 缓冲组未启用时不再显示"设定 XMB 未生效", 改为中性 (未启用)
 #     1.79.11: [K] 菜单顶部改为显示「当前生效的缓冲上限」, 并给出内核真实值:
 #           原来顶部固定写"自动档位 32MB", 手动设成 128MB 后顶上还是 32MB, 看着像没生效。
 #           现在顶部写"缓冲上限: 手动 128MB (自动档位 32MB)",
@@ -221,7 +229,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79.11"
+export SCRIPT_VERSION="1.79.12"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
