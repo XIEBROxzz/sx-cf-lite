@@ -664,6 +664,22 @@ _atomic_modify_yaml() {
     return "$rc"
 }
 
+# Snell 出站/入站都要 sing-box >= 1.14.0; 低版本导入后 _restart_checked 必失败,
+# 那时只会看到"落地导入失败, 已恢复原配置" —— 提前判掉, 报错才说得清原因。
+_relay_snell_supported() {
+    local v maj min
+    [ -x "$SINGBOX_BIN" ] || return 1
+    v=$("$SINGBOX_BIN" version 2>/dev/null | head -n 1 | awk '{print $3}')
+    [ -n "$v" ] || return 1
+    maj="${v%%.*}"
+    min="${v#*.}"; min="${min%%.*}"
+    case "$maj" in ''|*[!0-9]*) return 1 ;; esac
+    case "$min" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$maj" -gt 1 ] && return 0
+    [ "$maj" -eq 1 ] && [ "$min" -ge 14 ] && return 0
+    return 1
+}
+
 _check_combined_config() {
     if [ ! -x "$SINGBOX_BIN" ]; then
         _error "sing-box 不存在或不可执行: $SINGBOX_BIN"
@@ -1197,6 +1213,17 @@ _validate_imported_outbound() {
             and (.tls.server_name | type == "string" and length > 0)
             and (.tls.insecure | type == "boolean")
             and (.tls.alpn | type == "array" and length > 0)
+        elif $mode == "snell" then
+            # SX: version 只允许 4 / 6 —— sing-box 出站不支持 v5 的 QUIC 代理模式, 写 5 必失败
+            only_keys(["type","tag","server","server_port","version","psk","reuse","network","obfs_mode","obfs_host","mode"])
+            and .type == "snell"
+            and (.version as $v | [4,6] | index($v) != null)
+            and (.psk | type == "string" and length >= 12 and length <= 255)
+            and (.reuse? == null or (.reuse | type == "boolean"))
+            and (.network? == null or (.network as $n | ["tcp","udp"] | index($n) != null))
+            and (.mode? == null or (.mode as $m | ["default","unshaped","unsafe-raw"] | index($m) != null))
+            and (.obfs_mode? == null or (.obfs_mode as $o | ["none","http"] | index($o) != null))
+            and (.obfs_host? == null or (.obfs_host | type == "string" and length > 0))
         elif $mode == "trojan" then
             (only_keys(["type","tag","server","server_port","password","tls"]) or only_keys(["type","tag","server","server_port","password","tls","transport"]))
             and .type == "trojan"
@@ -1339,7 +1366,7 @@ _import_link_config() {
     echo '  ╚═══════════════════════════════════════╝'
     echo -e "${NC}"
     echo -e "    ${GREEN}[1]${NC} ${YELLOW}自动导入 (推荐 - 粘贴任意链接, 自动识别协议)${NC}"
-    echo -e "        支持: VLESS(Reality/TCP/WS+TLS) · Trojan · Hysteria2(hy2) · TUIC · AnyTLS · Shadowsocks · HTTP(S)"
+    echo -e "        支持: VLESS(Reality/TCP/WS+TLS) · Trojan · Hysteria2(hy2) · TUIC · AnyTLS · Shadowsocks · Snell · HTTP(S)"
     echo ""
     echo -e "    ${GREEN}[2]${NC} HTTPS / HTTP 代理（手动输入）"
     echo -e "    ${GREEN}[3]${NC} SOCKS5 无认证（手动输入）"
@@ -1375,7 +1402,7 @@ _import_link_config() {
         _check_parser || { _pause_relay; return; }
         local PARSER_BIN="$_PARSER_PATH"
         if [ "$parser_mode" == "auto" ]; then
-            read -r -p "  请粘贴节点分享链接 (支持: VLESS/Trojan/Hysteria2(hy2)/TUIC/AnyTLS/Shadowsocks/HTTP(S)): " share_link
+            read -r -p "  请粘贴节点分享链接 (支持: VLESS/Trojan/Hysteria2(hy2)/TUIC/AnyTLS/Shadowsocks/Snell/HTTP(S)): " share_link
             # 去首尾空白 (实测: 末尾空格会让解析器认不出协议前缀)
             share_link="${share_link#"${share_link%%[![:space:]]*}"}"
             share_link="${share_link%"${share_link##*[![:space:]]}"}"
@@ -1774,6 +1801,31 @@ _landing_config() {
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
                 '{"type":"anytls","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"password":$pw,"tls":{"enabled":true,"server_name":$sni,"insecure":true}}')
             ;;
+
+        "snell")
+            # Snell 无 TLS / 无 Reality: 凭据只有 psk + 协议版本。
+            # SX 版本映射(必须): 入站 v5 的线路层等价 v4 —— sing-box 不支持 v5 的 QUIC 代理模式,
+            #   所以 sing-box 出站只接受 version 4 / 6, 写 5 会直接 check 失败。
+            #   即"落地 v5 → 出站 v4", "落地 v6 → 出站 v6"。客户端的 version=5 是 mihomo 口径, 与此无关。
+            local psk ver mode obfs
+            IFS=$'\t' read -r psk ver mode obfs <<< "$(echo "$selected_node" | jq -r '[.psk // "", (.version // 5 | tostring), (.mode // ""), (.obfs_mode // "")] | @tsv')"
+            if [ -z "$psk" ]; then
+                _error "该 Snell 节点入站配置里没有 psk, 无法生成 Token。"
+                read -n 1 -s -r -p "$(echo -e ${YELLOW}"按任意键返回..."${NC})"   # SX: 特例 —— 落地配置报错需按键确认, 防止没看清
+                return
+            fi
+            if [ "$ver" == "6" ]; then
+                [ -z "$mode" ] && mode="default"
+                outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg k "$psk" --arg m "$mode" \
+                    '{"type":"snell","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"version":6,"psk":$k,"mode":$m}')
+            elif [ -n "$obfs" ] && [ "$obfs" != "none" ] && [ "$obfs" != "null" ]; then
+                outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg k "$psk" --arg o "$obfs" \
+                    '{"type":"snell","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"version":4,"psk":$k,"obfs_mode":$o}')
+            else
+                outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg k "$psk" \
+                    '{"type":"snell","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"version":4,"psk":$k}')
+            fi
+            ;;
             
         *)
             _error "暂不支持对协议 [$type] 自动生成 Token。"
@@ -1835,7 +1887,7 @@ _list_reusable_inbounds() {
     fi
     jq -r --argjson excl "$_excl" '
         .inbounds[]
-        | select(.type == "vless" or .type == "vmess" or .type == "trojan" or .type == "hysteria2" or .type == "tuic" or .type == "anytls" or .type == "shadowsocks")
+        | select(.type == "vless" or .type == "vmess" or .type == "trojan" or .type == "hysteria2" or .type == "tuic" or .type == "anytls" or .type == "shadowsocks" or .type == "snell")
         | select((.tag as $t | ($excl | index($t))) == null)
         | [(.tag // ""), (.type // ""), ((.listen_port // 0) | tostring), (.transport.type // "tcp"), (.users[0].uuid // .users[0].password // "")] | join("|")
     ' "$_cfg" 2>/dev/null | while IFS='|' read -r rt rty rpo rtr ruu; do
@@ -1899,6 +1951,14 @@ _finalize_relay_setup() {
     ' >/dev/null 2>&1; then
         _error "落地 outbound JSON 不完整或端口越界"
         sleep 2
+        return 1
+    fi
+
+    # Snell 出站要求本机内核 >= 1.14.0 —— [2] Token 与 [3] 分享链接两条路都汇到这里, 一处判掉
+    if [ "$dest_type" == "snell" ] && ! _relay_snell_supported; then
+        _error "本机 sing-box 版本过低, 不支持 Snell 出站 (需 1.14.0+)"
+        _warn "请先升级内核 (主菜单 [15] 核心管理), 再重新导入。"
+        sleep 3
         return 1
     fi
 
@@ -2207,6 +2267,7 @@ _relay_bind_landing() {
             trojan|anytls) _fhint="${GREEN}← 可用${NC}" ;;
             hysteria2|tuic) _fhint="${YELLOW}← 需 UDP 通路${NC}" ;;
             shadowsocks)   _fhint="${RED}← 不建议前端 (无 TLS 伪装)${NC}" ;;
+            snell)         _fhint="${RED}← 不建议前端 (无 TLS 伪装)${NC}" ;;
             vmess)         _fhint="${RED}← 不建议前端 (无 TLS)${NC}" ;;
             *)             _fhint="" ;;
         esac

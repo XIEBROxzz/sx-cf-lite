@@ -989,6 +989,105 @@ _parse_anytls_uri() {
     printf '%s\n' "$output"
 }
 
+# SX: Snell 链接解析 (snell://psk@host:port?version=5&reuse=true&mode=default#name)
+# 版本映射(必须): sing-box 出站只接受 version 4 / 6 —— 它不支持 v5 的 QUIC 代理模式,
+#   v5 的线路层等价 v4。所以链接里的 version=5 (Surge/mihomo 口径) 要落成出站 version=4,
+#   写成 5 会让 sing-box check 直接失败。
+_parse_snell_uri() {
+    local link body authority query userinfo psk endpoint server port
+    local version reuse mode obfs_mode obfs_host output
+    link="$1"
+    [[ "$link" == snell://* ]] || _fatal "链接必须以 snell:// 开头"
+    body="${link#snell://}"
+    body="${body%%#*}"
+    [[ -n "$body" ]] || _fatal "Snell 链接为空"
+
+    if [[ "$body" == *\?* ]]; then
+        authority="${body%%\?*}"
+        query="${body#*\?}"
+    else
+        authority="$body"
+        query=""
+    fi
+    authority="${authority%/}"   # 兼容 snell://psk@host:443/?version=5
+
+    [[ "$authority" == *@* ]] || _fatal "Snell 链接缺少 psk 或服务器地址"
+    userinfo="${authority%%@*}"
+    endpoint="${authority#*@}"
+    [[ "$endpoint" != *@* ]] || _fatal "Snell 链接的服务器地址格式错误"
+
+    _url_decode "$userinfo" 0 || _fatal "Snell psk 包含无效 URL 编码"
+    psk="$DECODED_VALUE"
+    [[ -n "$psk" ]] || _fatal "Snell psk 为空"
+    [[ "$psk" != *$'\r'* && "$psk" != *$'\n'* ]] || _fatal "Snell psk 包含无效控制字符"
+    [[ ${#psk} -ge 12 && ${#psk} -le 255 ]] || _fatal "Snell psk 长度必须在 12-255 字节之间"
+
+    _split_host_port "$endpoint" || _fatal "Snell 服务器地址或端口无效"
+    server="$PARSED_SERVER"
+    port="$PARSED_PORT"
+
+    _parse_query "$query" || _fatal "Snell 查询参数格式无效或包含重复参数"
+    _require_query_keys version reuse mode obfs-mode obfs_mode obfs-host obfs_host
+
+    version="${QUERY_PARAMS[version]-5}"
+    reuse="${QUERY_PARAMS[reuse]-}"
+    mode="${QUERY_PARAMS[mode]-}"
+    obfs_mode="${QUERY_PARAMS[obfs-mode]-${QUERY_PARAMS[obfs_mode]-}}"
+    obfs_host="${QUERY_PARAMS[obfs-host]-${QUERY_PARAMS[obfs_host]-}}"
+
+    case "$version" in
+        4|5) version=4 ;;   # v5 线路层等价 v4, sing-box 出站无 5
+        6)   version=6 ;;
+        *)   _fatal "Snell version 仅支持 4 / 5 / 6" ;;
+    esac
+
+    case "$reuse" in
+        ""|0|false) reuse="false" ;;
+        1|true)     reuse="true" ;;
+        *) _fatal "Snell reuse 参数仅允许 true / false" ;;
+    esac
+
+    if [ "$version" = "6" ]; then
+        case "$mode" in
+            ""|default) mode="default" ;;
+            unshaped|unsafe-raw) ;;
+            *) _fatal "Snell v6 mode 仅支持 default / unshaped / unsafe-raw" ;;
+        esac
+        # obfs-mode=none 等价于不设 (v6 里没有混淆), 只对其余取值报错
+        case "$obfs_mode" in
+            ""|none) obfs_mode="" ;;
+            *) _fatal "Snell v6 不支持 obfs 混淆 (那是 v4 的字段)" ;;
+        esac
+        [ -n "$obfs_host" ] && _fatal "Snell v6 不支持 obfs-host (那是 v4 的字段)"
+    else
+        case "$obfs_mode" in
+            ""|none) obfs_mode="" ;;
+            http) ;;
+            *) _fatal "Snell obfs-mode 仅支持 none / http" ;;
+        esac
+        [ -n "$mode" ] && [ "$mode" != "default" ] && _fatal "Snell mode 仅 v6 可用"
+        [ -n "$obfs_host" ] && [ "$obfs_mode" != "http" ] && _fatal "Snell obfs-host 只在 obfs-mode=http 时可用"
+    fi
+
+    if ! output=$(jq -nc \
+        --arg server "$server" \
+        --argjson port "$port" \
+        --argjson version "$version" \
+        --arg psk "$psk" \
+        --argjson reuse "$reuse" \
+        --arg mode "$mode" \
+        --arg obfs_mode "$obfs_mode" \
+        --arg obfs_host "$obfs_host" \
+        '{type:"snell",tag:"proxy",server:$server,server_port:$port,version:$version,psk:$psk}
+          + (if $reuse then {reuse:true} else {} end)
+          + (if $version == 6 then {mode:$mode} else {} end)
+          + (if $obfs_mode == "http" then {obfs_mode:"http"} else {} end)
+          + (if $obfs_mode == "http" and $obfs_host != "" then {obfs_host:$obfs_host} else {} end)'); then
+        _fatal "生成 Snell outbound 失败"
+    fi
+    printf '%s\n' "$output"
+}
+
 _emit_auto() {
     local mode="$1" json="$2"
     if ! printf '%s' "$json" | jq -e '.error == null' >/dev/null 2>&1; then
@@ -1027,6 +1126,9 @@ _parse_auto() {
         anytls)
             _emit_auto "anytls" "$(_parse_anytls_uri "$link")"
             ;;
+        snell)
+            _emit_auto "snell" "$(_parse_snell_uri "$link")"
+            ;;
         ss)
             userinfo="${link#ss://}"
             userinfo="${userinfo%%#*}"
@@ -1057,7 +1159,7 @@ _parse_auto() {
         socks5|socks)
             _fatal "SOCKS5 链接导入请使用手动输入 [8][9]"
             ;;
-        *) _fatal "暂不支持自动识别协议: $scheme:// (支持 vless/hysteria2/tuic/trojan/anytls/ss/http)"
+        *) _fatal "暂不支持自动识别协议: $scheme:// (支持 vless/hysteria2/tuic/trojan/anytls/snell/ss/http)"
             ;;
     esac
 }
@@ -1095,7 +1197,7 @@ _read_link() {
 
 MODE="$1"
 case "$MODE" in
-    vless-reality-vision|vless-tcp|vless-ws-tls|ss-aes-128-gcm|ss-aes-256-gcm|ss-2022-aes-128-gcm|ss-2022-aes-256-gcm|https-proxy|hysteria2|tuic|trojan|anytls|auto) ;;
+    vless-reality-vision|vless-tcp|vless-ws-tls|ss-aes-128-gcm|ss-aes-256-gcm|ss-2022-aes-128-gcm|ss-2022-aes-256-gcm|https-proxy|hysteria2|tuic|trojan|anytls|snell|auto) ;;
     *) _fatal "不支持的解析模式" ;;
 esac
 
@@ -1121,5 +1223,6 @@ case "$MODE" in
     tuic) _parse_tuic_uri "$LINK_INPUT" ;;
     trojan) _parse_trojan_uri "$LINK_INPUT" ;;
     anytls) _parse_anytls_uri "$LINK_INPUT" ;;
+    snell) _parse_snell_uri "$LINK_INPUT" ;;
     auto) _parse_auto "$LINK_INPUT" ;;
 esac

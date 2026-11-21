@@ -22,6 +22,15 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.79.16: Snell 贯通进阶转发 —— [1] 落地机生成 Token / [3] 中转机导入链接都认 snell 了。
+#           1) 落地机出站构造器新增 snell 分支: 入站 v5 → 出站 version 4
+#              (sing-box 出站只接受 4 / 6, 不支持 v5 的 QUIC 代理模式, 写 5 必 check 失败),
+#              入站 v6 → 出站 version 6 + mode; 有 obfs 时一并带过去。
+#           2) parser.sh 新增 snell:// 解析 (version/reuse/mode/obfs-mode/obfs-host),
+#              同样做 5→4 映射, 并在 psk 长度 (12-255) 与 v4/v6 字段互斥上做严格校验。
+#           3) 导入 schema 加 snell 模式; 导入前先判中转机内核是否 >= 1.14,
+#              否则会等 _restart_checked 失败后才回滚, 报错原因说不清。
+#           4) 中转入口扫描 (_list_reusable_inbounds) 收录 snell, 前端提示标"不建议前端 (无 TLS)"。
 #     1.79.15: [4] 更多协议 新增 Snell (v5 / v6), 放在第一位, 原 1-5 顺延为 2-6:
 #           用 sing-box 原生 snell 入站 (1.14.0 起才有), 不额外起进程、不需要证书。
 #           v5 线路层等价 v4 (sing-box 不支持 v5 的 QUIC 代理模式), 兼容 Surge 5 /
@@ -254,7 +263,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79.15"
+export SCRIPT_VERSION="1.79.16"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
