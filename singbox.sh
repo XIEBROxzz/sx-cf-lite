@@ -22,6 +22,13 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.79.17: Snell 节点接入 [5] 修改节点配置 —— 之前 variant 判定为 unsupported,
+#           名称/连接地址/认证信息全被拒 (只有端口能改, 因为改端口走独立的 _modify_port)。
+#           现在能改: 名称 / 客户端连接地址 / 端口 / PSK / 协议版本 v5<->v6。
+#           PSK 可改是重点: 泄露后不用删节点重建 (重建会换端口, 链接/Token/客户端全废)。
+#           版本切换会同时清掉另一版本的互斥字段 (v6 用 mode, v5 用 obfs_mode),
+#           切 v6 前校验 psk >= 12 字节, 免得切完启动失败。
+#           改完后同步重建 clash.yaml 的 psk/version/mode 并重新输出链接。
 #     1.79.16: Snell 贯通进阶转发 —— [1] 落地机生成 Token / [3] 中转机导入链接都认 snell 了。
 #           1) 落地机出站构造器新增 snell 分支: 入站 v5 → 出站 version 4
 #              (sing-box 出站只接受 4 / 6, 不支持 v5 的 QUIC 代理模式, 写 5 必 check 失败),
@@ -263,7 +270,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79.16"
+export SCRIPT_VERSION="1.79.17"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -8256,6 +8263,7 @@ _detect_main_node_variant() {
         elif .type == "shadowtls" then "shadowsocks-shadowtls"
         elif .type == "shadowsocks" then "shadowsocks"
         elif .type == "socks" then "socks"
+        elif .type == "snell" then "snell"
         else "unsupported"
         end
     ' "$CONFIG_FILE" 2>/dev/null | head -n 1
@@ -8475,6 +8483,24 @@ _refresh_modified_node_artifacts() {
             export NODE_USERNAME="$username" NODE_PASSWORD="$password"
             _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.username = env(NODE_USERNAME) | .password = env(NODE_PASSWORD))' || return 1
             _show_node_link "$variant" "$name" "$client_server" "$port" "$tag" "$username" "$password" || return 1
+            ;;
+        snell)
+            # Snell 只有 psk + 版本: 入站 v5 / v6 与 mihomo 的 version 口径一致, 直接透传。
+            # 客户端链接走 _show_node_link 的 snell 分支 (snell://psk@ip:port?version=N)。
+            local psk ver snell_mode
+            psk=$(printf '%s' "$node" | jq -r '.psk // empty')
+            ver=$(printf '%s' "$node" | jq -r '.version // 5 | tostring')
+            [ -n "$psk" ] || { _error "Snell 节点缺少 psk，无法重建客户端配置。"; return 1; }
+            export NODE_PSK="$psk" NODE_SNELL_VER="$ver"
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))) |= (.psk = env(NODE_PSK) | .version = (env(NODE_SNELL_VER) | tonumber))' || return 1
+            if [ "$ver" = "6" ]; then
+                snell_mode=$(printf '%s' "$node" | jq -r '.mode // "default"')
+                export NODE_SNELL_MODE="$snell_mode"
+                _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME))).mode = env(NODE_SNELL_MODE)' || return 1
+            else
+                _atomic_modify_yaml "$CLASH_YAML_FILE" 'del(.proxies[] | select(.name == env(NEW_NAME)) | .mode)' || return 1
+            fi
+            _show_node_link "snell" "$name" "$client_server" "$port" "$tag" "$psk" "$ver" || return 1
             ;;
     esac
 
@@ -9139,6 +9165,8 @@ _modify_node_apply() (
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .users[0]) |= (.uuid = $uuid | .password = $password)' --arg tag "$tag" --arg uuid "$arg1" --arg password "$arg2" || return 1 ;;
                 shadowsocks)
                     _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .password) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
+                snell)
+                    _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag) | .psk) = $value' --arg tag "$tag" --arg value "$arg1" || return 1 ;;
                 shadowsocks-shadowtls)
                     local inner_tag
                     inner_tag=$(printf '%s' "$current_node" | jq -r '.detour // empty')
@@ -9276,6 +9304,24 @@ _modify_node_apply() (
             fi
             restart_needed=1
             ;;
+        snell_version)
+            [ "$variant" = "snell" ] || return 1
+            case "$arg1" in
+                5|6) ;;
+                *) _error "Snell 版本仅支持 5 / 6。"; return 1 ;;
+            esac
+            # v6 要求 psk 12-255 字节; 手动改过短 psk 的节点切过去会启动失败, 先挡住
+            if [ "$arg1" = "6" ]; then
+                local snell_psk_len
+                snell_psk_len=$(printf '%s' "$(printf '%s' "$current_node" | jq -r '.psk // empty')" | wc -c | tr -d ' ')
+                [ "${snell_psk_len:-0}" -ge 12 ] || { _error "当前 psk 只有 ${snell_psk_len} 字节, 切到 v6 需要 12 字节以上, 请先修改认证信息。"; return 1; }
+                # v6 用 mode 取代 v5 的 obfs_mode, 两个字段互斥
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag)) |= (.version = 6 | .mode = "default" | del(.obfs_mode))' --arg tag "$tag" || return 1
+            else
+                _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select(.tag == $tag)) |= (.version = 5 | .obfs_mode = "none" | del(.mode))' --arg tag "$tag" || return 1
+            fi
+            restart_needed=1
+            ;;
         *) _error "未知节点修改动作。"; return 1 ;;
     esac
 
@@ -9362,11 +9408,13 @@ _modify_node() {
         tuic) echo "  4) 修改 UUID 和密码" ;;
         shadowsocks-shadowtls) echo "  4) 修改 ShadowTLS 与内部 SS 密码" ;;
         socks) echo "  4) 修改用户名和密码" ;;
+        snell) echo "  4) 修改 PSK (预共享密钥)" ;;
         *) echo "  4) 修改认证信息" ;;
     esac
     case "$variant" in
         vless-reality|any-reality|shadowsocks-shadowtls) echo "  5) 修改伪装域名/SNI" ;;
         vless-ws-tls|vless-grpc-tls|trojan-ws-tls|anytls|hysteria2|tuic) echo "  5) 修改 SNI 与证书" ;;
+        snell) echo "  5) 切换协议版本 (v5 / v6)" ;;
     esac
     case "$variant" in
         vless-reality|any-reality) echo "  6) 重新生成 Reality 密钥和 Short ID" ;;
@@ -9417,6 +9465,11 @@ _modify_node() {
                 shadowsocks-shadowtls)
                     read -r -s -p "请输入新 ShadowTLS 密码 (回车随机生成): " value; echo ""; value=${value:-$(${SINGBOX_BIN} generate rand --hex 16)}
                     read -r -s -p "请输入新内部 SS 密钥 (回车随机生成): " value2; echo ""; value2=${value2:-$(${SINGBOX_BIN} generate rand --base64 32)}
+                    ;;
+                snell)
+                    read -r -s -p "请输入新 PSK (回车随机生成 32 位十六进制): " value; echo ""
+                    value=${value:-$(${SINGBOX_BIN} generate rand --hex 16)}
+                    [[ ${#value} -ge 12 && ${#value} -le 255 ]] || { _error "PSK 长度必须在 12-255 字节之间。"; return 1; }
                     ;;
                 socks)
                     read -r -p "请输入新用户名 (回车随机生成): " value; value=${value:-$(${SINGBOX_BIN} generate rand --hex 8)}
@@ -9469,6 +9522,22 @@ _modify_node() {
                     else
                         _error "无效选择。"; return 1
                     fi
+                    ;;
+                snell)
+                    current=$(printf '%s' "$expected_node" | jq -r '.version // 5 | tostring')
+                    echo "  当前版本: v${current}"
+                    echo "  1) v5  (线路层等价 v4, Surge / 小火箭 / Stash / mihomo 都支持)"
+                    echo "  2) v6  (新版, 客户端要求高, 与 v5 不互通)"
+                    read -r -p "请选择 [1-2] (回车保持不变): " value2
+                    case "$value2" in
+                        1) value=5 ;;
+                        2) value=6 ;;
+                        "") value="$current" ;;
+                        *) _error "无效选择。"; return 1 ;;
+                    esac
+                    if [ "$value" = "$current" ]; then _info "协议版本未变化 (v${current})。"; sleep 1; return 0; fi
+                    _info "协议版本: v${current} -> v${value} (客户端需同步更新)"
+                    _confirm_node_change "$tag" "$expected_node" "$expected_metadata" "$proxy_name" snell_version "$value"
                     ;;
                 *) _error "该节点没有 SNI/证书修改项。"; return 1 ;;
             esac
