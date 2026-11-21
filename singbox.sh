@@ -22,6 +22,16 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.79.13: [3] 查看节点 的聚合订阅一次出两份 —— Base64 和 Clash 一起给:
+#           原来只出聚合 Base64 (v2rayN / 小火箭那套格式), Clash 系客户端
+#           (FlClash / Clash Verge / mihomo) 不认 base64 URI 列表, 导入必失败。
+#           现在 y 之后除了 Base64, 还会生成 /usr/local/etc/sing-box/clash-client.yaml:
+#           从服务端自用的 clash.yaml 删掉 port / socks-port / mixed-port /
+#           external-controller / secret / dns / tun 这七组客户端用不到的字段
+#           (留着会和客户端自己的 TUN、端口打架), 只保留 proxies / proxy-groups / rules,
+#           并打印 scp 下载命令 —— FlClash 里「配置 → 添加 → 从文件导入」即可。
+#           覆盖 普通 + Argo 节点; CF-A 由 cf_lite.sh 单独管理, 不在 clash.yaml 里, 会提示。
+#           没 clash.yaml / 缺 yq / 0 个节点 三种情况都只提示不报错, 不留半成品文件。
 #     1.79.12: 修 [K] 在「没装 sysctl 命令」的系统上直接报"环境不支持":
 #           ① _nt_get 先用 sysctl, 取不到就退回读 /proc/sys/xxx —— 极简系统
 #              (Alpine 精简镜像 / 自定义 rootfs) 常常根本没装 procps,
@@ -229,7 +239,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79.12"
+export SCRIPT_VERSION="1.79.13"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -7123,6 +7133,59 @@ _add_socks() {
     _show_node_link "socks" "$name" "$display_ip" "$port" "$tag" "$username" "$password" || return 1
 }
 
+# --- SX: 生成客户端版 Clash 配置 (FlClash / Clash Verge / mihomo 直接导入) ---
+# 服务器上的 clash.yaml 带 port / dns / tun 三组「服务端自用」字段,
+# 客户端导进去会和它自己的 TUN / 端口打架 (表现为导入后起不来或流量不接管),
+# 所以这里删掉这三组, 只保留 proxies / proxy-groups / rules —— 一份"纯节点"的客户端配置。
+# 覆盖范围: 普通 + Argo 节点 (两者都写在 clash.yaml 里);
+# CF-A 节点由 cf_lite.sh 单独管理, 不在 clash.yaml 中, 需要单独导出。
+_gen_clash_client_yaml() {
+    local src="$CLASH_YAML_FILE"
+    local out="${SINGBOX_DIR}/clash-client.yaml"
+    local n=0
+    if [ ! -s "$src" ]; then
+        _warning "没有 clash.yaml, 跳过 Clash 订阅"
+        return 1
+    fi
+    if [ ! -x "$YQ_BINARY" ]; then
+        _warning "缺少 yq, 无法生成 Clash 订阅 (请先运行 [13] 更新脚本)"
+        return 1
+    fi
+    if ! "$YQ_BINARY" eval '
+        del(.port, .["socks-port"], .["mixed-port"], .["redir-port"], .["tproxy-port"],
+            .["external-controller"], .["external-ui"], .secret, .dns, .tun)
+        | .proxies = (.proxies // [])
+        | .["proxy-groups"] = (.["proxy-groups"] // [])
+    ' "$src" > "${out}.tmp" 2>/dev/null; then
+        rm -f -- "${out}.tmp"
+        _warning "Clash 配置生成失败 (yq 处理出错)"
+        return 1
+    fi
+    n=$("$YQ_BINARY" eval '.proxies | length' "${out}.tmp" 2>/dev/null || echo 0)
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    if [ "$n" -lt 1 ]; then
+        rm -f -- "${out}.tmp"
+        _warning "clash.yaml 里没有可用节点, 跳过 Clash 订阅"
+        return 1
+    fi
+    if ! mv -f "${out}.tmp" "$out" 2>/dev/null; then
+        rm -f -- "${out}.tmp"
+        _warning "Clash 配置写入失败: ${out}"
+        return 1
+    fi
+    chmod 600 "$out" 2>/dev/null || true
+    _info "=== Clash 客户端配置 (${n} 个节点) ==="
+    echo -e "  文件: ${CYAN}${out}${NC}"
+    echo -e "  下载: ${YELLOW}scp root@${server_ip}:${out} .${NC}"
+    echo -e "  ${YELLOW}FlClash: 配置 → 添加 → 从文件导入${NC}"
+    echo ""
+    _success "已生成 Clash 配置 (普通 + Argo), 可直接导入 FlClash / Clash Verge。"
+    if [ -s /etc/sing-box-cf-lite/state.json ]; then
+        _warning "CF-A 节点不在 Clash 配置里 (由 cf_lite.sh 单独管理), 需要的话单独导出。"
+    fi
+    return 0
+}
+
 # --- SX: 查看节点统一入口 (普通 / CF-B Argo / CF-A OriginRules 三家汇总) ---
 _view_nodes_dispatch() {
     local has_argo=false cf_present=false shown_normal=false cf_links_raw="" cf_script=""
@@ -7185,14 +7248,16 @@ _view_nodes_dispatch() {
     fi
     if [ -s "$agg_tmp" ]; then
         echo ""
-        read -p "是否生成聚合 Base64 订阅 (全局: 普通+Argo+CF-A)? (y/N): " gen_base64
-        if [[ "$gen_base64" == "y" || "$gen_base64" == "Y" ]]; then
+        read -p "是否生成聚合 Base64/Clash 订阅 (全局: 普通+Argo+CF-A)? (y/N): " gen_sub
+        if [[ "$gen_sub" == "y" || "$gen_sub" == "Y" ]]; then
             echo ""
             _info "=== 聚合 Base64 订阅 (全局) ==="
             local base64_result=$(base64 < "$agg_tmp" | tr -d '\n')
             echo -e "${CYAN}${base64_result}${NC}"
             echo ""
-            _success "已打包全部可读取节点 (普通 + Argo + CF-A), 可直接复制导入 v2rayN 等客户端。"
+            _success "已打包全部可读取节点 (普通 + Argo + CF-A), 可直接复制导入 v2rayN / 小火箭 / v2rayNG。"
+            echo ""
+            _gen_clash_client_yaml || true
         fi
     fi
     rm -f -- "$agg_tmp"
