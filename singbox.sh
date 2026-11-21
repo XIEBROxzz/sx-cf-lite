@@ -22,6 +22,15 @@ umask 077
 #     1.3: 进阶转发添加完成后按任意键返回菜单 (方向键不会串到下一次菜单输入)
 #     1.4: 修复 [5] 删除落地节点永远失败 (jq 过滤器少引号 → relay/0 is not defined);
 #          落地关系/对接列表改显示自定义节点名; 校验失败时打印 sing-box 原话
+#     1.79.15: [4] 更多协议 新增 Snell (v5 / v6), 放在第一位, 原 1-5 顺延为 2-6:
+#           用 sing-box 原生 snell 入站 (1.14.0 起才有), 不额外起进程、不需要证书。
+#           v5 线路层等价 v4 (sing-box 不支持 v5 的 QUIC 代理模式), 兼容 Surge 5 /
+#           小火箭 / Stash / mihomo; v6 是新版, 客户端要求高且与 v5 不互通。
+#           内核低于 1.14 时菜单该行标红提示, 选中后直接拒绝并指路 [15] 升级内核
+#           (而不是等 sing-box check 报错再回滚)。
+#           输出: snell:// 链接 (Surge / 小火箭 / sing-box 1.14+) + Clash/mihomo YAML 片段。
+#           Snell 没有通用分享链接、v2rayN 不支持, 界面上明确写了这点。
+#           注意: Snell 无 TLS / 无 Reality, 抗封锁弱于 Reality, 定位是「Surge 系补充协议」。
 #     1.79.14: 回滚 1.79.13 的「聚合订阅出 Clash」—— 恢复成只出 Base64 聚合订阅。
 #           回滚原因: 实际使用时打印的 scp 命令行里 server_ip 为空, 显示成
 #           `scp root@:/usr/local/etc/sing-box/clash-client.yaml .`, 没有实用价值;
@@ -245,7 +254,7 @@ umask 077
 #     1.6: 规则整理时 reject 规则恒排第一 (供"拒绝 QUIC"这类动作规则常驻); 绑定入口不再删 reject 规则
 #     1.5: 进阶转发菜单重排 (8=分流管理 / R=清空 / 9=WARP / 10=端口转发, 四组分区);
 #          中转规则与 WARP 接管规则顺序规范化 + 仅分流入入口补直连兜底, 两套互不抢占
-export SCRIPT_VERSION="1.79.14"
+export SCRIPT_VERSION="1.79.15"
 export DEFAULT_SNI="www.amd.com"
 export WS_EARLY_DATA_SIZE="2560"
 export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
@@ -5503,6 +5512,27 @@ _show_node_link() {
             local password="$1" sni="${2:-$DEFAULT_SNI}" public_key="$3" short_id="$4"
             url="anytls://${password}@${link_ip}:${port}?security=reality&sni=${sni}&fp=chrome&pbk=$(_url_encode "${public_key}")&sid=${short_id}&type=tcp&headerType=none#$(_url_encode "$name")"
             ;;
+        "snell")
+            # 参数: psk, version
+            # Snell 没有通用分享链接 (v2rayN 不支持), 但 snell:// 已被 Surge / 小火箭 /
+            # sing-box 1.14+ 接受; Clash 系还得用下面这段 YAML。
+            local psk="$1" ver="${2:-5}"
+            url="snell://${psk}@${link_ip}:${port}?version=${ver}&reuse=true"
+            [ "$ver" = "6" ] && url="${url}&mode=default"
+            url="${url}#$(_url_encode "$name")"
+            echo -e "${YELLOW}====== [Clash / mihomo 配置片段] ======${NC}"
+            echo -e "  - name: \"${name}\""
+            echo -e "    type: snell"
+            echo -e "    server: ${link_ip}"
+            echo -e "    port: ${port}"
+            echo -e "    psk: \"${psk}\""
+            echo -e "    version: ${ver}"
+            [ "$ver" = "6" ] && echo -e "    mode: default"
+            echo -e "    udp: true"
+            echo -e "    reuse: true"
+            echo -e "${YELLOW}======================================${NC}"
+            echo -e "${CYAN}[说明] Snell 没有通用分享链接, v2rayN 不支持; Clash 系请复制上面的片段。${NC}"
+            ;;
         "shadowsocks")
             # 参数: method, password
             local method="$1" password="$2"
@@ -6824,6 +6854,105 @@ _add_tuic() {
     _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
     _success "TUICv5 节点 [${name}] 添加成功!"
     _show_node_link "tuic" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$password" "$server_name" "$skip_verify" || return 1
+}
+
+# --- SX: Snell (sing-box 1.14+ 原生入站) ---
+# Snell 是 Surge 团队的私有协议: 无 TLS / 无 Reality, 只有 PSK + 可选 HTTP 混淆。
+# 优势: 握手开销极小, Surge / Shadowrocket / Stash / mihomo 原生支持;
+# 劣势: 抗封锁弱于 Reality; v2rayN 不支持; 没有通用分享链接 (只能给 snell:// 或 YAML 片段)。
+# 版本: v5 线路层等价 v4 (sing-box 不支持 v5 的 QUIC 代理模式), 兼容面最广;
+#       v6 是新版, 客户端要求高, 且与 v5 不互通。
+_sx_core_version() {
+    ${SINGBOX_BIN} version 2>/dev/null | head -n 1 | awk '{print $3}'
+}
+
+# sing-box 从 1.14.0 起才有 snell 入站, 低于此版本加了会启动失败
+_sx_snell_supported() {
+    local v maj min
+    v=$(_sx_core_version)
+    [ -n "$v" ] || return 1
+    maj="${v%%.*}"
+    min="${v#*.}"; min="${min%%.*}"
+    case "$maj" in ''|*[!0-9]*) return 1 ;; esac
+    case "$min" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$maj" -gt 1 ] && return 0
+    [ "$maj" -eq 1 ] && [ "$min" -ge 14 ] && return 0
+    return 1
+}
+
+_add_snell() {
+    local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
+    local port="" link_port="" ver=5
+
+    if ! _sx_snell_supported; then
+        _error "当前内核 v$(_sx_core_version) 不支持 Snell 入站 (需 sing-box 1.14.0+)"
+        _info "请先到 [15] 核心管理 升级内核, 或改用其它协议。"
+        return 1
+    fi
+
+    if [ "$BATCH_MODE" = "true" ]; then
+        port="$BATCH_PORT"
+    else
+        read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+        node_ip=${custom_ip:-$server_ip}
+        while true; do
+            link_port=""
+            read -p "填端口 (内部:暴露, 单填=内外一致, 回车=随机 30000-50000): " _port_raw
+            if [ -z "$(printf "%s" "$_port_raw" | tr -d "[:space:]")" ]; then
+                port=$(_sx_pick_free_port) || { _error "随机分配失败 (200 次均被占用), 请手动指定端口。"; continue; }
+                link_port="$port"
+                _info "已随机分配统一端口: ${port}"
+            else
+                if ! _pl=$(_sx_split_port_input "$_port_raw"); then
+                    _error "格式不对: 填 端口 或 内部:暴露 (如 443 或 443:31000)。收到: [${_port_raw}]"
+                    continue
+                fi
+                port="${_pl%% *}"; link_port="${_pl#* }"
+            fi
+            [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _check_port_conflict "$port" "tcp" && continue
+            break
+        done
+        echo ""
+        echo -e "  ${CYAN}Snell 协议版本${NC}"
+        echo -e "    ${GREEN}[1]${NC} v5  ${YELLOW}(推荐: Surge / 小火箭 / Stash / mihomo 都支持, 线路层等价 v4)${NC}"
+        echo -e "    ${GREEN}[2]${NC} v6  ${YELLOW}(新版; 客户端要求高, 与 v5 不互通)${NC}"
+        read -p "  请选择 [1-2, 回车=v5]: " _ver_choice
+        case "$_ver_choice" in
+            2) ver=6 ;;
+            *) ver=5 ;;
+        esac
+    fi
+
+    local client_port="${link_port:-$port}"
+    local tag="snell-in-${port}"
+    local psk=$(${SINGBOX_BIN} generate rand --hex 16)
+
+    local name=$(_unique_node_name "Snell-v${ver}-${link_port:-$port}")
+
+    local yaml_ip="$node_ip"
+    local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
+
+    local inbound_json proxy_json
+    if [ "$ver" = "6" ]; then
+        inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg k "$psk" \
+            '{"type":"snell","tag":$t,"listen":"::","listen_port":($p|tonumber),"version":6,"psk":$k,"mode":"default"}')
+        proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$client_port" --arg k "$psk" \
+            '{"name":$n,"type":"snell","server":$s,"port":($p|tonumber),"psk":$k,"version":6,"mode":"default","udp":true,"reuse":true}')
+    else
+        inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg k "$psk" \
+            '{"type":"snell","tag":$t,"listen":"::","listen_port":($p|tonumber),"version":5,"psk":$k,"obfs_mode":"none"}')
+        proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$client_port" --arg k "$psk" \
+            '{"name":$n,"type":"snell","server":$s,"port":($p|tonumber),"psk":$k,"version":5,"udp":true,"reuse":true}')
+    fi
+
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
+    _add_node_to_yaml "$proxy_json" || { _rollback_main_node_creation "$tag"; return 1; }
+
+    _success "Snell v${ver} 节点 [${name}] 添加成功!"
+    _info "Snell 无 TLS / 无伪装, 抗封锁弱于 Reality; 适合 Surge / 小火箭 这类客户端。"
+    _show_node_link "snell" "$name" "$link_ip" "$client_port" "$tag" "$psk" "$ver" || return 1
 }
 
 _generate_shadowsocks_password() {
@@ -10947,31 +11076,38 @@ _show_more_protocols_menu() {
         echo -e "  ╚═══════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${CYAN}【可选协议】${NC}"
-        echo -e "    ${GREEN}[1]${NC} AnyTLS / Any-Reality (Any-Reality 免证书, AnyTLS 需证书)"
-        echo -e "    ${GREEN}[2]${NC} TUIC (自签 / 已申请证书, 需 UDP 可用)"
-        echo -e "    ${YELLOW}[3]${NC} VLESS + WS + TLS (自签 / 已申请证书)"
-        echo -e "    ${YELLOW}[4]${NC} Trojan + WS + TLS (自签 / 已申请证书)"
-        echo -e "    ${YELLOW}[5]${NC} Shadowsocks-2022 (含 ShadowTLS v3, 免证书)"
+        if _sx_snell_supported; then
+            echo -e "    ${GREEN}[1]${NC} Snell v5 / v6 (Surge 系首选; 免证书, 无 TLS)"
+        else
+            echo -e "    ${YELLOW}[1]${NC} Snell ${RED}(当前内核 v$(_sx_core_version) 不支持, 需 1.14.0+)${NC}"
+        fi
+        echo -e "    ${GREEN}[2]${NC} AnyTLS / Any-Reality (Any-Reality 免证书, AnyTLS 需证书)"
+        echo -e "    ${GREEN}[3]${NC} TUIC (自签 / 已申请证书, 需 UDP 可用)"
+        echo -e "    ${YELLOW}[4]${NC} VLESS + WS + TLS (自签 / 已申请证书)"
+        echo -e "    ${YELLOW}[5]${NC} Trojan + WS + TLS (自签 / 已申请证书)"
+        echo -e "    ${YELLOW}[6]${NC} Shadowsocks-2022 (含 ShadowTLS v3, 免证书)"
         echo ""
         # SX: 证书入口已上移到 [1] 添加节点菜单, 这里只留一行指路, 不重复列菜单
         echo -e "  ${YELLOW}证书: 申请/管理请返回上级 → [7] 一键申请 / [8] 证书管理${NC}"
         echo ""
         echo -e "  ${YELLOW}提示: 直连首选仍是主菜单 [1] VLESS + Reality;${NC}"
-        echo -e "  ${YELLOW}      本页 [1] 的 Any-Reality 同属 Reality 系, 也可直连。${NC}"
-        echo -e "  ${YELLOW}      [2] TUIC 走 UDP (需放行 UDP); [5] SS-2022 靠 ShadowTLS 伪装, 不依赖证书。${NC}"
+        echo -e "  ${YELLOW}      本页 [2] 的 Any-Reality 同属 Reality 系, 也可直连。${NC}"
+        echo -e "  ${YELLOW}      [3] TUIC 走 UDP (需放行 UDP); [6] SS-2022 靠 ShadowTLS 伪装, 不依赖证书。${NC}"
+        echo -e "  ${YELLOW}      [1] Snell 免证书、握手开销最小, 但抗封锁弱于 Reality, 且 v2rayN 不支持。${NC}"
         echo -e "  ${YELLOW}      套 CF / CDN 请用主菜单 [2] 一键套 CF —— CF-A 橙云 / CF-B Argo 均只建 VLESS。${NC}"
         echo ""
         echo -e "  ───────────────────────────────────────"
         echo -e "    ${YELLOW}[0]${NC} 返回"
         echo ""
         local c
-        read -p "  请输入选项 [0-5]: " c
+        read -p "  请输入选项 [0-6]: " c
         case $c in
-            1) _run_main_create_transaction _add_anytls; _pause_back ;;
-            2) _run_main_create_transaction _add_tuic; _pause_back ;;
-            3) _run_main_create_transaction _add_vless_ws_tls; _pause_back ;;
-            4) _run_main_create_transaction _add_trojan_ws_tls; _pause_back ;;
-            5) _run_main_create_transaction _add_shadowsocks_menu; _pause_back ;;
+            1) _run_main_create_transaction _add_snell; _pause_back ;;
+            2) _run_main_create_transaction _add_anytls; _pause_back ;;
+            3) _run_main_create_transaction _add_tuic; _pause_back ;;
+            4) _run_main_create_transaction _add_vless_ws_tls; _pause_back ;;
+            5) _run_main_create_transaction _add_trojan_ws_tls; _pause_back ;;
+            6) _run_main_create_transaction _add_shadowsocks_menu; _pause_back ;;
             0) return ;;
             *) _error "无效输入，请重试。"; _pause_back ;;
         esac
@@ -11264,7 +11400,7 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[1]${NC} VLESS + TCP + Reality + Vision (免证书, 推荐)"
     echo -e "    ${GREEN}[2]${NC} Hysteria2 (自签 / 已申请证书, 需 UDP 可用)"
     echo -e "    ${GREEN}[3]${NC} 一键临时argo (全自动)"
-    echo -e "    ${GREEN}[4]${NC} 更多协议 (AnyTLS / TUIC / WS+TLS / Trojan / SS-2022)"
+    echo -e "    ${GREEN}[4]${NC} 更多协议 (Snell / AnyTLS / TUIC / WS+TLS / Trojan / SS-2022)"
     echo ""
     
     echo -e "  ${CYAN}【快捷功能】${NC}"

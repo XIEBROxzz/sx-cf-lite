@@ -1,6 +1,6 @@
 # SX-CF-lite
 
-sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.79.14**（[16] → [K] 内核网络调优：FQ+BBR / 内存自适应缓冲 / UDP 队列，三组独立开关；缓冲按内存档位直设，另可 `[6]` 手动指定上限）
+sing-box 一键管理脚本（虫虫版）· 主脚本 **v1.79.15**（[16] → [K] 内核网络调优：FQ+BBR / 内存自适应缓冲 / UDP 队列，三组独立开关；缓冲按内存档位直设，另可 `[6]` 手动指定上限。[4] 更多协议新增 `[1] Snell v5 / v6`，用 sing-box 1.14+ 原生入站，免证书、免额外进程）
 
 > 基于 [0xdabiaoge/singbox-lite](https://github.com/0xdabiaoge/singbox-lite) 地基 + Joey [xray-cf-lite](https://github.com/byJoey/xray-cf-lite) 的 CF 套皮整合魔改。
 
